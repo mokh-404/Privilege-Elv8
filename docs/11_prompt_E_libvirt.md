@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Superseded:** The transient-domain (`virsh create`) and Windows 10 design described below is superseded by [12_operator_decisions.md](12_operator_decisions.md) (`win11` persistent libvirt domain on `qemu:///system`, Windows 11 guest, UEFI Secure Boot `win11_VARS.fd` + TPM 2.0 `tpm-crb`, read-only `win11_base.qcow2` + disposable `win11_overlay.qcow2`).
+
 # 11. Prompt E: libvirt lab automation (operator-supplied, 2026-11-21)
 
 Context: use the guardrail block and the kickoff prompt. Implement lab_automation/ for an Omarchy (Arch Linux) host with libvirt/QEMU/KVM

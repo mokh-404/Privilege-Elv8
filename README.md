@@ -2,7 +2,7 @@
 
 Learned artifact prioritisation layer for local, read-only Windows forensic triage (**rules prove, the model ranks, the human decides**).
 
-- **Track A (core)**: generated host-artifact dataset from an isolated Windows 10 lab VM, grouped strictly by `technique_id` with hash-bucketed benign keys.
+- **Track A (core)**: generated host-artifact dataset from an isolated Windows 11 lab VM, grouped strictly by `technique_id` with hash-bucketed benign keys.
 - **Track B (benchmark)**: `CIC-MalMem-2022` (`Obfuscated-MalMem2022.csv`) evaluated under both a leaky stratified 80/20 reproduction split (`LEAKY`) and a family-grouped holdout split.
 - **Mandatory model families**: Random Forest, XGBoost, Isolation Forest (benign-only), PyTorch Tabular MLP, and PyTorch Deep Autoencoder (benign-only), plus optional Logistic Regression sanity baseline.
 

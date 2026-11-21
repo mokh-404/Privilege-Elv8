@@ -26,11 +26,11 @@
   - Full test suite: `172 passed in 25.04s`.
 
 ## In progress
-- **Step 5 (live VM verification)**: operator finishing `sshd` setup and running `collector/Test-Collector.ps1` inside the running `win11` VM.
+- **Step 5 (live VM verification)**: ready to run `collector/Test-Collector.ps1` over SSH on the provisioned `win11` guest (`192.168.150.50`, user `mokh`).
+- **Step 6 (unblocked, pending dry run)**: `Q-S6-2` answered (`win11` persistent domain on `qemu:///system`, `win11-isolated`, `192.168.150.50`, `mokh`, `use_sudo_for_libvirt_files: true`, `nvram_live` + `nvram_base`, `post_ssh_settle_seconds: 20`); implementing exact reset sequence and running the 3-run dry run.
 
 ## Blocked
-- **Step 6 dry run & 51-run batch**: waiting for operator's live collector output, frozen `win11_base.qcow2` + `win11_VARS.fd.base`, and `lab_automation/lab_config.yaml` (`Q-S6-2`).
-- **Steps 7–8 on real Track A data**: waiting for completed VM runs (`data/raw/runs/`), dataset freeze confirmation, and `--final` sign-off.
+- **51-run batch & Steps 7–8 on real Track A data**: waiting on live collector smoke test, 3-run dry run, dry-run labeling sanity check, and operator go-ahead.
 
-## Questions for the operator
-- **Q-S6-2 (`lab_config.yaml` missing host values)**: Once `win11_base.qcow2` + `win11_VARS.fd.base` are frozen, supply `network_name`, `guest_ip`, `ssh_user`, `ssh_key_path`, and whether `use_sudo_for_libvirt_files: true` is needed for `/var/lib/libvirt/{images,qemu/nvram}` (plus `Test-Collector.ps1` output from the live VM).
+## Resolved Questions
+- **`Q-S6-2` (`lab_config.yaml` host values)**: Resolved — `libvirt_uri: qemu:///system`, `domain_name: win11`, `network_name: win11-isolated`, `guest_ip: 192.168.150.50`, `ssh_user: mokh`, `ssh_key_path: /home/fsociety/.ssh/id_ed25519`, `base_image: /var/lib/libvirt/images/win11_base.qcow2`, `overlay_image: /var/lib/libvirt/images/win11_overlay.qcow2`, `nvram_live: /var/lib/libvirt/qemu/nvram/win11_VARS.fd`, `nvram_base: /var/lib/libvirt/qemu/nvram/win11_VARS.fd.base`, `use_sudo_for_libvirt_files: true`, `post_ssh_settle_seconds: 20`.
