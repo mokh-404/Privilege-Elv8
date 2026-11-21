@@ -170,7 +170,7 @@ RUNNER_EXCLUDE_PATHS = [
     r"c:\collector_out",
     r"c:\programdata\ssh",
 ]
-RUNNER_EXCLUDE_PROCESS_NAMES = ["sshd.exe", "sshd-session.exe", "ssh-agent.exe"]
+RUNNER_EXCLUDE_PROCESS_NAMES = ["sshd.exe", "sshd-session.exe", "ssh-agent.exe", "sftp-server.exe"]
 RUNNER_EXCLUDE_PIDS: list[int] = []   # static list is empty; per-run PIDs come from provenance
 
 # --------------------------------------------------------------------------------------

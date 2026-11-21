@@ -64,14 +64,18 @@ def test_drop_runner_footprint(tmp_path):
         {"artifact_key": "e", "artifact_type": "file", "name": "x.exe", "path": "C:\\Users\\Public\\x.exe"},
         {"artifact_key": "f", "artifact_type": "prefetch", "name": "SSHD.EXE-2B5F0E53.pf", "path": "C:\\WINDOWS\\Prefetch\\SSHD.EXE-2B5F0E53.pf"},
         {"artifact_key": "g", "artifact_type": "prefetch", "name": "CMD.EXE-0BD30981.pf", "path": "C:\\WINDOWS\\Prefetch\\CMD.EXE-0BD30981.pf"},
+        {"artifact_key": "h", "artifact_type": "prefetch", "name": "SFTP-SERVER.EXE-ED22A4DE.pf", "path": "C:\\WINDOWS\\Prefetch\\SFTP-SERVER.EXE-ED22A4DE.pf"},
+        {"artifact_key": "i", "artifact_type": "process", "name": "sftp-server.exe", "path": "C:\\Windows\\System32\\OpenSSH\\sftp-server.exe", "pid": 13},
     ])
     log = tmp_path / "drop.csv"
     kept, dropped = drop_runner_footprint(df, exclude_pids=[11], log_path=log)
     assert list(kept["artifact_key"]) == ["c", "e", "g"]
-    assert set(dropped["artifact_key"]) == {"a", "b", "d", "f"}
+    assert set(dropped["artifact_key"]) == {"a", "b", "d", "f", "h", "i"}
     assert "prefetch_runner:sshd.exe" in set(dropped["drop_reason"])
+    assert "prefetch_runner:sftp-server.exe" in set(dropped["drop_reason"])
+    assert "process_name:sftp-server.exe" in set(dropped["drop_reason"])
     assert log.exists()
-    assert len(pd.read_csv(log)) == 4
+    assert len(pd.read_csv(log)) == 6
 
 
 def test_patterns_are_the_spec_patterns():

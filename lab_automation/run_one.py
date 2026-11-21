@@ -283,7 +283,7 @@ def _query_sshd_pids(runner: GuestRunner) -> list[int]:
     try:
         res = runner.run_powershell(
             "$p = @(Get-CimInstance Win32_Process | "
-            "Where-Object { $_.Name -in @('sshd.exe','sshd-session.exe','ssh-agent.exe') } | "
+            "Where-Object { $_.Name -in @('sshd.exe','sshd-session.exe','ssh-agent.exe','sftp-server.exe') } | "
             "Select-Object -ExpandProperty ProcessId); "
             "Write-Output ('SSHD_PIDS=' + ($p -join ','))",
             timeout_s=30,

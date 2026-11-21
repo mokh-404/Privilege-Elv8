@@ -90,6 +90,8 @@ function Extract-TargetPath([string]$CmdLine) {
     if ($norm -notmatch '\\' -and $norm -match '\.(exe|dll|com|msc|cpl)$') {
         $sysPath = Join-Path "$env:SystemRoot\System32" $norm
         if ([System.IO.File]::Exists($sysPath)) { return $sysPath }
+        $psPath = Join-Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0" $norm
+        if ([System.IO.File]::Exists($psPath)) { return $psPath }
     }
     return $norm
 }
@@ -669,7 +671,7 @@ Run-Stage "process" {
     }
 
     $sshdNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($sn in @("sshd.exe", "sshd-session.exe", "ssh-agent.exe")) { [void]$sshdNames.Add($sn) }
+    foreach ($sn in @("sshd.exe", "sshd-session.exe", "ssh-agent.exe", "sftp-server.exe")) { [void]$sshdNames.Add($sn) }
 
     $selfTree = [System.Collections.Generic.HashSet[int]]::new()
     $queue = [System.Collections.Generic.Queue[int]]::new()
