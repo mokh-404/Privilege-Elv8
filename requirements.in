@@ -1,0 +1,14 @@
+# Top-level dependencies. The pinned, fully resolved set is requirements.txt
+# (generated with `pip freeze` from a clean Python 3.12 venv). Install from requirements.txt.
+numpy
+pandas
+scipy
+scikit-learn
+xgboost
+torch
+shap
+matplotlib
+pyarrow
+pyyaml
+joblib
+pytest

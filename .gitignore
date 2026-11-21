@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data is never committed (raw guest output, external datasets, processed parquet)
+data/raw/runs/*
+!data/raw/runs/.gitkeep
+data/external/**/*.csv
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*.parquet
+
+# Large model artefacts
+results/models/*
+!results/models/.gitkeep
+
+# Host-side provenance logs stay on the host (they are committed only if the operator decides)
+lab_automation/provenance/*.jsonl
+lab_automation/lab_config.yaml
