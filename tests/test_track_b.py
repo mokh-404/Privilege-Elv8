@@ -28,9 +28,19 @@ def test_artifact_key_bucket_deterministic_and_disjoint():
 
 
 # ---------------- Track B loader & EV-04 guards ----------------
-def test_parse_category_raises_stop_and_ask_guard():
-    with pytest.raises(NotImplementedError):
-        cic_malmem.parse_category(pd.Series(["Benign", "Ransomware-Conti"]))
+def test_parse_category_canonical_format():
+    s = pd.Series([
+        "Benign",
+        "Ransomware-Ako-00a14062c268b951b940b11b724f84f05547cd024a2ee24a2d0518cddd53e59d-1.raw",
+        "Spyware-CWS-00a3e344d657b3c621dc0ec72c020aee8a295b3995e57d3e3992f373a7e31f61-10.raw",
+        "Trojan-Zeus-002cca7042594c69350454f780c3b58527f2ade1ffa38b561179e71582d62f8f-2.raw",
+    ])
+    cats, fams = cic_malmem.parse_category(s)
+    assert list(cats) == ["Benign", "Ransomware", "Spyware", "Trojan"]
+    assert list(fams) == ["Benign", "Ako", "CWS", "Zeus"]
+
+    with pytest.raises(ValueError):
+        cic_malmem.parse_category(pd.Series(["Ransomware-Conti"]))
 
 
 def test_load_raw_rejects_wrong_shape_and_drops_category_class(tmp_path):

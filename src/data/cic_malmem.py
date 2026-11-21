@@ -10,6 +10,7 @@ Non-negotiable rules (EV-04, doc 07 section 3, doc 10 section 3):
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -114,18 +115,40 @@ def load_raw(
     return X, y, raw_category, feature_cols
 
 
+def csv_hashes(path: str | Path = config.CIC_MALMEM_CSV, chunk: int = 1 << 20) -> dict[str, str]:
+    """Return observed MD5 and SHA-256 hex digests for the CSV file."""
+    md5 = hashlib.md5()
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            md5.update(block)
+            sha.update(block)
+    return {"md5": md5.hexdigest(), "sha256": sha.hexdigest()}
+
+
 def parse_category(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     """Parse raw `Category` strings into `(malware_category, family)` Series.
 
-    Intentionally NOT implemented until the real `Category` values from
-    `Obfuscated-MalMem2022.csv` have been printed (`--inspect`) and confirmed by the
-    operator (stop-and-ask rule, doc 07 section 3).
+    Canonical format observed via `--inspect` (approved by operator Q-S4-1):
+      - `"Benign"` -> `("Benign", "Benign")`
+      - `"<category>-<family>-<sample_hash>-<dump_idx>.raw"` -> `(parts[0], parts[1])`
     """
-    raise NotImplementedError(
-        "Category parser is not implemented yet (stop-and-ask guard). "
-        "Place Obfuscated-MalMem2022.csv at data/external/cic_malmem_2022/Obfuscated-MalMem2022.csv, "
-        "run `python -m src.data.cic_malmem --inspect`, and confirm the Category format with the operator."
-    )
+    cats: list[str] = []
+    fams: list[str] = []
+    for raw_val in series.astype(str):
+        val = raw_val.strip()
+        if val == "Benign":
+            cats.append("Benign")
+            fams.append("Benign")
+        else:
+            parts = val.split("-")
+            if len(parts) != 4 or not parts[0] or not parts[1]:
+                raise ValueError(
+                    f"Unexpected Category format {raw_val!r}; expected 'Benign' or 4 dash-separated parts."
+                )
+            cats.append(parts[0])
+            fams.append(parts[1])
+    return pd.Series(cats, index=series.index), pd.Series(fams, index=series.index)
 
 
 def validate_parsed_families(categories: pd.Series, families: pd.Series, y: np.ndarray) -> None:

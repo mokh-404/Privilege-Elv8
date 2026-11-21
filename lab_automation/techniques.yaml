@@ -8,11 +8,11 @@
 #   execution:            T1059.003
 #   persistence:          T1543.003
 #   privilege_escalation: T1548.002
-# Operator sign-off required before freezing techniques.yaml for the full 51-run batch.
+# Operator-approved holdout draw (seed = 42, Q-S6-1). Do NOT edit split assignments.
 
 catalog_version: "1.0"
 holdout_draw_seed: 42
-split_status: "proposed_pending_operator_approval"
+split_status: "approved_frozen"
 
 techniques:
   - technique_id: "T1053.005"
@@ -334,28 +334,32 @@ techniques:
               & reg.exe ADD "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "SysHealthMonV1" /t REG_SZ /d $dst /f | Out-Null
 
       - variant: 2
-        verify_hint: "Double-extension executable report.pdf.exe in Users\\Public with Hidden attr"
+        verify_hint: "Double-extension executable report.pdf.exe in Users\\Public with Hidden attr + companion cmd"
         expected_artifact_keys:
           - "file|c:\\users\\public\\report.pdf.exe|report.pdf.exe"
+          - "file|c:\\users\\public\\open_report_v2.cmd|open_report_v2.cmd"
         steps:
           - action: "masquerade_double_ext_v2"
             cmd: |
               $dst = 'C:\Users\Public\report.pdf.exe'
               [System.IO.File]::Copy('C:\Windows\System32\hostname.exe', $dst, $true)
               (Get-Item $dst).Attributes = 'Hidden, System, Archive'
-              & $dst | Out-Null
+              [System.IO.File]::WriteAllText('C:\Users\Public\open_report_v2.cmd', "@echo off`r`n`"$dst`"`r`n")
+              & cmd.exe /c C:\Users\Public\open_report_v2.cmd | Out-Null
 
       - variant: 3
-        verify_hint: "Renamed system binary taskhostw.exe placed in Windows\\Temp and executed"
+        verify_hint: "Renamed system binary taskhostw.exe + companion script placed in Windows\\Temp and executed"
         expected_artifact_keys:
           - "file|c:\\windows\\temp\\taskhostw.exe|taskhostw.exe"
+          - "file|c:\\windows\\temp\\th_launch_v3.ps1|th_launch_v3.ps1"
         steps:
           - action: "masquerade_taskhostw_v3"
             cmd: |
               $dst = 'C:\Windows\Temp\taskhostw.exe'
               [System.IO.File]::Copy('C:\Windows\System32\systeminfo.exe', $dst, $true)
               (Get-Item $dst).Attributes = 'Hidden, Archive'
-              & $dst > C:\Windows\Temp\th_v3.txt
+              [System.IO.File]::WriteAllText('C:\Windows\Temp\th_launch_v3.ps1', "& '$dst' | Out-File C:\Windows\Temp\th_v3.txt")
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\th_launch_v3.ps1 | Out-Null
 
   - technique_id: "T1112"
     name: "Modify Registry Persistence / Winlogon / IFEO"
@@ -414,15 +418,17 @@ techniques:
               & reg.exe ADD "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "CertSyncV1" /t REG_SZ /d "powershell.exe -NoProfile -File C:\Users\Public\payload_v1.ps1" /f | Out-Null
 
       - variant: 2
-        verify_hint: "Mshta executing local benign HTA file in ProgramData"
+        verify_hint: "Mshta executing local benign HTA file in ProgramData via companion cmd"
         expected_artifact_keys:
           - "file|c:\\programdata\\portal_v2.hta|portal_v2.hta"
+          - "file|c:\\programdata\\portal_open_v2.cmd|portal_open_v2.cmd"
         steps:
           - action: "mshta_local_hta_v2"
             cmd: |
               $hta = '<html><head><script>var w=new ActiveXObject("WScript.Shell");window.close();</script></head><body>ok</body></html>'
               [System.IO.File]::WriteAllText('C:\ProgramData\portal_v2.hta', $hta)
-              & mshta.exe C:\ProgramData\portal_v2.hta
+              [System.IO.File]::WriteAllText('C:\ProgramData\portal_open_v2.cmd', "@echo off`r`nmshta.exe C:\ProgramData\portal_v2.hta`r`n")
+              & cmd.exe /c C:\ProgramData\portal_open_v2.cmd | Out-Null
 
       - variant: 3
         verify_hint: "Rundll32 spawned in background holding dummy entry + staged DLL copy"
@@ -563,38 +569,45 @@ techniques:
     split: "dev"
     variants:
       - variant: 1
-        verify_hint: "Staged PowerShell inventory script + hidden cmd wrapper in ProgramData"
+        verify_hint: "Staged PowerShell inventory script + cmd wrapper + RunOnce in ProgramData"
         expected_artifact_keys:
           - "file|c:\\programdata\\sys_audit_v1.ps1|sys_audit_v1.ps1"
-          - "prefetch|c:\\windows\\prefetch|systeminfo.exe"
+          - "file|c:\\programdata\\sys_audit_wrap_v1.cmd|sys_audit_wrap_v1.cmd"
+          - "run_key|hku|sysauditoncelv1"
         steps:
           - action: "staged_sysinfo_v1"
             cmd: |
               [System.IO.File]::WriteAllText('C:\ProgramData\sys_audit_v1.ps1', 'systeminfo.exe | Out-File C:\ProgramData\sys_audit_v1.txt')
-              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\sys_audit_v1.ps1 | Out-Null
+              [System.IO.File]::WriteAllText('C:\ProgramData\sys_audit_wrap_v1.cmd', "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\sys_audit_v1.ps1`r`n")
+              & cmd.exe /c C:\ProgramData\sys_audit_wrap_v1.cmd | Out-Null
+              & reg.exe ADD "HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce" /v "SysAuditOnceV1" /t REG_SZ /d "C:\ProgramData\sys_audit_wrap_v1.cmd" /f | Out-Null
 
       - variant: 2
-        verify_hint: "Staged batch running wmic os + hostname in Users\\Public"
+        verify_hint: "Staged batch + PowerShell runner + Prefetch in Users\\Public"
         expected_artifact_keys:
           - "file|c:\\users\\public\\env_probe_v2.bat|env_probe_v2.bat"
+          - "file|c:\\users\\public\\env_probe_helper_v2.ps1|env_probe_helper_v2.ps1"
           - "prefetch|c:\\windows\\prefetch|hostname.exe"
         steps:
           - action: "staged_sysinfo_v2"
             cmd: |
               [System.IO.File]::WriteAllText('C:\Users\Public\env_probe_v2.bat', "@echo off`r`nhostname > C:\Users\Public\host_v2.txt`r`nsysteminfo >> C:\Users\Public\host_v2.txt`r`n")
-              & cmd.exe /c C:\Users\Public\env_probe_v2.bat | Out-Null
+              [System.IO.File]::WriteAllText('C:\Users\Public\env_probe_helper_v2.ps1', '& cmd.exe /c C:\Users\Public\env_probe_v2.bat; Start-Sleep -Seconds 150')
+              Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\Users\Public\env_probe_helper_v2.ps1") -WindowStyle Hidden
 
       - variant: 3
-        verify_hint: "Staged vbs + cmd collecting OS/drive details in Windows\\Temp"
+        verify_hint: "Staged ps1 + cmd + vbs collecting OS/drive details in Windows\\Temp"
         expected_artifact_keys:
           - "file|c:\\windows\\temp\\host_profile_v3.cmd|host_profile_v3.cmd"
           - "file|c:\\windows\\temp\\host_profile_v3.ps1|host_profile_v3.ps1"
+          - "file|c:\\windows\\temp\\host_profile_v3.vbs|host_profile_v3.vbs"
         steps:
           - action: "staged_sysinfo_v3"
             cmd: |
               [System.IO.File]::WriteAllText('C:\Windows\Temp\host_profile_v3.ps1', 'Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version | Out-File C:\Windows\Temp\os_v3.txt')
               [System.IO.File]::WriteAllText('C:\Windows\Temp\host_profile_v3.cmd', "@echo off`r`npowershell.exe -NoProfile -File C:\Windows\Temp\host_profile_v3.ps1`r`n")
-              & cmd.exe /c C:\Windows\Temp\host_profile_v3.cmd | Out-Null
+              [System.IO.File]::WriteAllText('C:\Windows\Temp\host_profile_v3.vbs', 'CreateObject("WScript.Shell").Run "cmd.exe /c C:\Windows\Temp\host_profile_v3.cmd", 0, True')
+              & wscript.exe //B C:\Windows\Temp\host_profile_v3.vbs
 
   - technique_id: "T1087.001"
     name: "Local Account Discovery (Staged Script + Traces)"
@@ -602,38 +615,45 @@ techniques:
     split: "holdout"
     variants:
       - variant: 1
-        verify_hint: "Staged script enumerating net user / net localgroup into ProgramData"
+        verify_hint: "Staged cmd + ps1 enumerating net user / localgroup into ProgramData + RunOnce"
         expected_artifact_keys:
           - "file|c:\\programdata\\acct_scan_v1.cmd|acct_scan_v1.cmd"
-          - "prefetch|c:\\windows\\prefetch|net.exe"
+          - "file|c:\\programdata\\acct_scan_v1.ps1|acct_scan_v1.ps1"
+          - "run_key|hku|acctscanv1"
         steps:
           - action: "staged_acct_enum_v1"
             cmd: |
               [System.IO.File]::WriteAllText('C:\ProgramData\acct_scan_v1.cmd', "@echo off`r`nnet user > C:\ProgramData\acct_v1.txt`r`nnet localgroup Administrators >> C:\ProgramData\acct_v1.txt`r`n")
-              & cmd.exe /c C:\ProgramData\acct_scan_v1.cmd | Out-Null
+              [System.IO.File]::WriteAllText('C:\ProgramData\acct_scan_v1.ps1', '& cmd.exe /c C:\ProgramData\acct_scan_v1.cmd; Start-Sleep -Seconds 150')
+              Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-WindowStyle", "Hidden", "-File", "C:\ProgramData\acct_scan_v1.ps1") -WindowStyle Hidden
+              & reg.exe ADD "HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce" /v "AcctScanV1" /t REG_SZ /d "C:\ProgramData\acct_scan_v1.cmd" /f | Out-Null
 
       - variant: 2
-        verify_hint: "Staged PowerShell enumerating local users + RunOnce trace"
+        verify_hint: "Staged PowerShell + cmd wrapper enumerating local users + RunOnce trace"
         expected_artifact_keys:
           - "file|c:\\users\\public\\enum_users_v2.ps1|enum_users_v2.ps1"
+          - "file|c:\\users\\public\\enum_users_v2.cmd|enum_users_v2.cmd"
           - "run_key|hku|acctauditv2"
         steps:
           - action: "staged_acct_enum_v2"
             cmd: |
               [System.IO.File]::WriteAllText('C:\Users\Public\enum_users_v2.ps1', 'Get-LocalUser | Out-File C:\Users\Public\local_users_v2.txt')
-              & powershell.exe -NoProfile -File C:\Users\Public\enum_users_v2.ps1 | Out-Null
+              [System.IO.File]::WriteAllText('C:\Users\Public\enum_users_v2.cmd', "@echo off`r`npowershell.exe -NoProfile -File C:\Users\Public\enum_users_v2.ps1`r`n")
+              & cmd.exe /c C:\Users\Public\enum_users_v2.cmd | Out-Null
               & reg.exe ADD "HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce" /v "AcctAuditV2" /t REG_SZ /d "powershell.exe -NoProfile -File C:\Users\Public\enum_users_v2.ps1" /f | Out-Null
 
       - variant: 3
-        verify_hint: "Staged batch calling whoami /all and query user in Windows\\Temp"
+        verify_hint: "Staged bat + vbs calling whoami /all and net accounts + background sleep in Windows\\Temp"
         expected_artifact_keys:
           - "file|c:\\windows\\temp\\priv_check_v3.bat|priv_check_v3.bat"
+          - "file|c:\\windows\\temp\\priv_check_v3.ps1|priv_check_v3.ps1"
           - "prefetch|c:\\windows\\prefetch|whoami.exe"
         steps:
           - action: "staged_acct_enum_v3"
             cmd: |
               [System.IO.File]::WriteAllText('C:\Windows\Temp\priv_check_v3.bat', "@echo off`r`nwhoami /all > C:\Windows\Temp\priv_v3.txt`r`nnet accounts >> C:\Windows\Temp\priv_v3.txt`r`n")
-              & cmd.exe /c C:\Windows\Temp\priv_check_v3.bat | Out-Null
+              [System.IO.File]::WriteAllText('C:\Windows\Temp\priv_check_v3.ps1', '& cmd.exe /c C:\Windows\Temp\priv_check_v3.bat; Start-Sleep -Seconds 150')
+              Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-WindowStyle", "Hidden", "-File", "C:\Windows\Temp\priv_check_v3.ps1") -WindowStyle Hidden
 
   - technique_id: "T1552.001"
     name: "Unsecured Credentials in Files"
@@ -641,28 +661,30 @@ techniques:
     split: "dev"
     variants:
       - variant: 1
-        verify_hint: "Staged PowerShell search script for password/token patterns in Users\\Public"
+        verify_hint: "Staged PowerShell + cmd wrapper searching password/token patterns in Users\\Public"
         expected_artifact_keys:
           - "file|c:\\users\\public\\cfg_sweep_v1.ps1|cfg_sweep_v1.ps1"
-          - "file|c:\\users\\public\\sample_secret_v1.txt|sample_secret_v1.txt"
+          - "file|c:\\users\\public\\cfg_sweep_v1.cmd|cfg_sweep_v1.cmd"
         steps:
           - action: "cred_file_sweep_v1"
             cmd: |
               [System.IO.File]::WriteAllText('C:\Users\Public\sample_secret_v1.txt', 'dummy_token=demo_only')
               [System.IO.File]::WriteAllText('C:\Users\Public\cfg_sweep_v1.ps1', 'Select-String -Path C:\Users\Public\*.txt -Pattern "token","password" | Out-File C:\Users\Public\found_v1.txt')
-              & powershell.exe -NoProfile -File C:\Users\Public\cfg_sweep_v1.ps1 | Out-Null
+              [System.IO.File]::WriteAllText('C:\Users\Public\cfg_sweep_v1.cmd', "@echo off`r`npowershell.exe -NoProfile -File C:\Users\Public\cfg_sweep_v1.ps1`r`n")
+              & cmd.exe /c C:\Users\Public\cfg_sweep_v1.cmd | Out-Null
 
       - variant: 2
-        verify_hint: "Staged batch calling findstr for password strings in ProgramData"
+        verify_hint: "Staged batch + ps1 calling findstr for password strings in ProgramData"
         expected_artifact_keys:
           - "file|c:\\programdata\\str_scan_v2.cmd|str_scan_v2.cmd"
-          - "prefetch|c:\\windows\\prefetch|findstr.exe"
+          - "file|c:\\programdata\\str_scan_v2.ps1|str_scan_v2.ps1"
         steps:
           - action: "cred_findstr_v2"
             cmd: |
               [System.IO.File]::WriteAllText('C:\ProgramData\note_v2.txt', 'config_key=offline_test')
               [System.IO.File]::WriteAllText('C:\ProgramData\str_scan_v2.cmd', "@echo off`r`nfindstr /si password C:\ProgramData\*.txt > C:\ProgramData\hits_v2.txt`r`n")
-              & cmd.exe /c C:\ProgramData\str_scan_v2.cmd | Out-Null
+              [System.IO.File]::WriteAllText('C:\ProgramData\str_scan_v2.ps1', '& cmd.exe /c C:\ProgramData\str_scan_v2.cmd')
+              & powershell.exe -NoProfile -File C:\ProgramData\str_scan_v2.ps1 | Out-Null
 
       - variant: 3
         verify_hint: "Staged hidden script + Run key archiving config filenames in Windows\\Temp"

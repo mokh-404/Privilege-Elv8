@@ -287,6 +287,7 @@ def run_pipeline(
     seed: int = config.SEED,
     max_epochs_override: int | None = None,
     is_smoke: bool = False,
+    csv_path: Path | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Execute requested Track B splits, write tables + metadata JSON, and return DataFrames."""
     set_global_seed(seed)
@@ -334,7 +335,27 @@ def run_pipeline(
         outputs["rotations"] = dfr
         print(f"Saved Split 2 rotations -> {pr}")
 
-    meta = run_metadata({
+        agg_cols = ["pr_auc", "roc_auc"] + [f"unseen_recall_at_fpr_{f}" for f in config.TRACK_B_FPR_TARGETS]
+        summary = (
+            dfr.groupby(["arm", "arm_name"], sort=False)[agg_cols]
+            .agg(["mean", "std", "min", "max"])
+        )
+        summary.columns = [f"{col}_{stat}" for col, stat in summary.columns]
+        summary = summary.reset_index()
+        summary["n_rotations"] = int(dfr["rotation"].nunique())
+        summary["caveat"] = config.TRACK_B_CAVEAT
+        summary["seed"] = seed
+        summary["draw_seed"] = config.TRACK_B_HOLDOUT_DRAW_SEED
+        summary["kmeans_seed"] = config.TRACK_B_KMEANS_SEED
+        summary["commit"] = get_commit_hash()
+        prs = out_tables_dir / (
+            "track_b_split2_rotations_summary_smoke.csv" if is_smoke else "track_b_split2_rotations_summary.csv"
+        )
+        summary.to_csv(prs, index=False)
+        outputs["rotations_summary"] = summary
+        print(f"Saved Split 2 rotation summary -> {prs}")
+
+    extra_meta = {
         "track": "B",
         "smoke": is_smoke,
         "arms": list(arms),
@@ -343,7 +364,11 @@ def run_pipeline(
         "splits": list(outputs),
         "draw_seed": config.TRACK_B_HOLDOUT_DRAW_SEED,
         "kmeans_seed": config.TRACK_B_KMEANS_SEED,
-    })
+    }
+    if csv_path is not None and Path(csv_path).exists():
+        extra_meta["csv_path"] = str(csv_path)
+        extra_meta.update({f"csv_{k}": v for k, v in cic_malmem.csv_hashes(csv_path).items()})
+    meta = run_metadata(extra_meta)
     write_json(meta, Path(logs_dir) / f"track_b_{'smoke_' if is_smoke else ''}meta.json")
     return outputs
 
@@ -394,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
         out_tables_dir=args.out_dir, logs_dir=config.LOGS_DIR,
         models_dir=(config.MODELS_DIR if args.save_models else None),
         is_smoke=False,
+        csv_path=args.csv,
     )
     return 0
 

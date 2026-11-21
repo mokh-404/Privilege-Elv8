@@ -1,0 +1,36 @@
+{
+  "arms": [
+    "rf",
+    "xgb",
+    "iforest",
+    "mlp",
+    "ae"
+  ],
+  "commit": "2e207a55357cf5bf6150f31aa24047d5a6fe74b4-dirty",
+  "csv_md5": "7a969ce248207e80af81bdf73601601a",
+  "csv_path": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/data/external/cic_malmem_2022/Obfuscated-MalMem2022.csv",
+  "csv_sha256": "df27cc6d4ffef0388c6114d459e7ce5c9a099ecf7ae6606d06eaa4093980bcf3",
+  "device": "cuda",
+  "draw_seed": 42,
+  "generated_at_utc": "2026-11-21T02:51:22Z",
+  "kmeans_seed": 42,
+  "n_features": 55,
+  "n_rows": 58596,
+  "numpy_version": "2.5.5",
+  "pandas_version": "3.1.1",
+  "platform": "Linux-7.2.8-9-omarchy-x86_64-with-glibc2.44",
+  "python": "3.12.16",
+  "seed": 42,
+  "shap_version": "0.54.1",
+  "sklearn_version": "1.9.1",
+  "smoke": false,
+  "splits": [
+    "split1",
+    "split2",
+    "rotations",
+    "rotations_summary"
+  ],
+  "torch_version": "2.15.0+cu132",
+  "track": "B",
+  "xgboost_version": "3.4.1"
+}
