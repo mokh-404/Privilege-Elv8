@@ -1,27 +1,23 @@
 # Project Progress
 
 ## Done
-- **Step 1** (pending git commit once `.venv` + test verification completes):
-  - Repo layout created under `docs_claude/dfir-triage-ml/` with docs `00..12`, `.gitignore`, `pytest.ini`, `requirements.in`.
+- **Step 1** (commit `b3a5a26`, `tests/test_config.py`: 7 passed):
+  - Repo layout created under `docs_claude/dfir-triage-ml/` with docs `00..12`, `.gitignore`, `pytest.ini`, `requirements.in`, and pinned `requirements.txt` (57 lines, Python 3.12.16 `.venv`).
   - `src/config.py` with locked 20-feature schema, `ORACLE_FEATURES`, `RULE_FEATURES`, `META_COLUMNS`, `LABEL_COL`, `SEED = 42`, and `LOLBIN_LIST`.
   - `src/utils/repro.py` for seeding, CUDA/CPU detection, git commit hash, and run metadata.
-  - `tests/test_config.py`.
-- **Step 2**:
+- **Step 2** (commit `d0aba7a`, `tests/test_sanitize.py` + `tests/test_features.py`: 103 passed):
   - `src/data/sanitize.py` (FE-08 assertion + DS-10 runner footprint exclusion).
   - `src/data/features.py` (Shannon entropy + 20 locked features + isolated oracle columns; CLI flag token guard for `/sc` / `/reg`).
-  - `tests/fixtures.py`, `tests/test_sanitize.py`, `tests/test_features.py`.
-- **Step 3**:
+- **Step 3** (commit `ec995ed`, `tests/test_metrics_preprocess.py`: 12 passed):
   - `src/models/preprocess.py` (`SharedPreprocessor` + `assert_no_forbidden_inputs` leakage guard).
   - `src/eval/metrics.py` (`pr_auc`, `precision_at_k`, `recall_at_k`, `fpr_at_recall`, `threshold_at_fpr`, `bootstrap_by_group`, secondary accuracy/F1 for Track B Split 1 only).
-  - `tests/test_metrics_preprocess.py`.
-- **Step 4 (code written, awaiting real CSV)**:
+- **Step 4 (code written & tested on synthetic data; full suite 135 passed)**:
   - `src/models/sklearn_models.py`, `src/models/mlp.py`, `src/models/autoencoder.py`.
   - `src/data/splits.py`, `src/data/cic_malmem.py`, `src/eval/run_track_b.py`.
-  - `tests/test_models.py`, `tests/test_track_b.py`.
+  - `tests/test_models.py`, `tests/test_track_b.py` (including synthetic 1,000-row end-to-end Track B smoke test).
 
 ## In progress
-- Installing Python 3.12.16 dependencies into `.venv/` and running `pytest` + git commits for Steps 1–4.
-- Inspecting `data/external/cic_malmem_2022/Obfuscated-MalMem2022.csv` via `python -m src.data.cic_malmem --inspect`.
+- Step 4 real-CSV inspection and operator sign-off on distinct `Category` strings before writing `src/data/cic_malmem.py:parse_category`.
 
 ## Blocked
 - **Track B `Category` parser (`src/data/cic_malmem.py:parse_category`)**: blocked on `data/external/cic_malmem_2022/Obfuscated-MalMem2022.csv` placement and operator review of the printed distinct `Category` strings (stop-and-ask rule).
