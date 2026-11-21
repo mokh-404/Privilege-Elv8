@@ -1,0 +1,7 @@
+label,split_pool,row_count
+attacker_induced,dev,70
+attacker_induced,test,33
+baseline,dev,821
+baseline,test,245
+benign_drift,dev,288
+benign_drift,test,92

@@ -18,26 +18,26 @@
 - **Step 5 complete (commits `624923a`, `ea9701c`, live Win11 VM verified)**:
   - `collector/Collect-Artifacts.ps1`, `collector/manifest_schema.json`, `collector/Test-Collector.ps1`, `collector/README.md`, `tests/test_collector.py`.
   - Live smoke test on `win11`: `SMOKE_PASS`, `total_records=1187` in `54.8s`, all 11 SHA-256 hashes re-verified on host (`ALL_HASHES_MATCH=True`), `amcache` fail-soft `locked_hive_no_vss`, zero SSH/collector leak rows, `win11_base.qcow2` `stat` unchanged.
-- **Step 6 complete through dry run (commits `2e207a5`, `a9620c9`, `ece0e5f`, `8f2dc06`)**:
-  - `lab_automation/techniques.yaml` (`split_status: approved_frozen`, 5 approved holdout techniques across 5 tactics), `benign_noise.ps1`, `guest_runner.py`, `run_one.py`, `run_all.py`, `lab_config.example.yaml`, `tests/test_lab_automation.py`.
-  - Exact Win11 sudo reset sequence implemented and verified (`destroy` -> `rm -f overlay` -> `qemu-img create` -> `chown nobody:nobody` -> `cp nvram_base nvram_live` -> `virsh start` -> `virsh shutdown` -> `rm -f overlay`).
-  - 3-run `--dry-run` successfully executed on live Win11: `dry_ctrl_01` (173.97s), `dry_T1053_005_v1` (133.23s), `dry_T1543_003_v1` (136.94s). All 3 succeeded, overlays cleanly deleted after each run, `win11_base.qcow2` untouched.
-- **Step 7 dry-run sanity check complete (commit `a157c67` + live verification)**:
-  - `src/rules/deterministic_rules.py` (15 rules `RULE-001..RULE-015`), `src/data/labeler.py` (baseline diff + provenance labeling, baseline/drift deduplication, hash-bucketed splits, review-sample export), `tests/test_rules_and_labeler.py`.
-  - Dry-run labeling into `data/interim/dry_run_processed/dataset_v1.parquet`: 1,084 total rows (1,065 baseline, 15 benign_drift, 4 attacker_induced), all 20 locked features computed cleanly, zero forbidden tokens under FE-08, zero `sshd*.pf` leaks (4 dropped and logged), zero NTFS junction duplicates, 2 dev positives (`T1053.005`) and 2 test positives (`T1543.003`).
-- **Step 8 (code & synthetic end-to-end tests passing; awaiting frozen Track A dataset)**:
+- **Step 6 complete (`51/51` live Win11 runs, commits `2e207a5`..`30be588`)**:
+  - `lab_automation/techniques.yaml` (`split_status: approved_frozen`, 5 approved holdout techniques across 5 tactics), `benign_noise.ps1` (stratified compound naming & interpreter/target alignment; offline audit max numeric AUC `0.6865`, max categorical gap `17.5pp`), `guest_runner.py`, `run_one.py`, `run_all.py`, `lab_config.yaml`, `tests/test_lab_automation.py`.
+  - Full 51-run batch (`ctrl_01..ctrl_03` + 48 attack runs) completed `51/51` `status=success` on attempt 1 in `7007.2s` (`116.8 min`, `607.1 MB` raw collector output, `0` manifest SHA-256 mismatches, `51/51` overlays deleted, `win11` `shut off`, `win11_base.qcow2` unchanged).
+- **Step 7 complete & frozen (commit `a157c67` + dataset freeze)**:
+  - `src/rules/deterministic_rules.py` (15 rules `RULE-001..RULE-015`), `src/data/labeler.py`, `tests/test_rules_and_labeler.py`.
+  - 8 audited `expected_artifact_keys` corrections recorded in `data/processed/label_corrections.csv`; 6 shared `.pf` `os_or_background_drift` rows verified and retained as `benign_drift`.
+  - Frozen `data/processed/dataset_v1.parquet`: `1549` total rows (`1066` baseline, `380` benign_drift, `103` attacker_induced [`70` dev / `33` test]), `dev=1179`, `test=370`, `test_sha256=2046f3ffbcbb9bdbc05f5db0e97b8d7554e41179a6f46dadb77fe65506db9e07`, `0` dev/test overlaps, `0` FE-08 failures, `98` runner Prefetch drops (`54` `sshd.exe`, `44` `sftp-server.exe`).
+  - Human review of `data/processed/review_sample.csv` signed off (`111/111` agreed, recorded in `data/splits/dataset_v1_manifest.json`).
+- **Step 8 (code & synthetic end-to-end tests passing; extending Track A dev eval)**:
   - `src/eval/run_track_a.py`, `src/eval/ablations.py`, `src/eval/shap_explain.py`, `src/eval/figures.py`, `src/eval/export_findings.py`, `tests/test_track_a_and_step8.py`.
-  - Full test suite: `180 passed in 24.14s`.
+  - Full pre-freeze unit test suite: `180 passed in 25.84s`.
 
 ## In progress
-- 51-run full Track A batch launching via `lab_automation.run_all --resume`.
+- Step 8 Track A Dev `GroupKFold` CV (`--dev`, plus rules/random baselines, per-`artifact_type` + `file+run_key+task` views, run+technique bootstrap CIs, and feature-subset probes; awaiting `"go --final"` before frozen test evaluation).
 
 ## Known Limitations
 - **Benign Artifact Types Coverage**: Benign activity generator (`benign_noise.ps1`) produces hard-negative artifacts across `file`, `task`, `run_key`, and `prefetch`. `service` and security-sensitive `registry` keys (IFEO, UAC hijack, Defender policies) are produced exclusively by attack techniques (`T1543.003`, `T1112`, `T1562.001`, `T1548.002`). Service creation (`sc.exe create`) and security registry modifications were omitted from background benign noise to prevent cross-run interference, host security collisions, and provenance destabilization during concurrent simulation.
 
 ## Blocked / Awaiting Operator Decision
-- **51-run full Track A batch**: Ready to launch upon operator approval (`.venv/bin/python -m lab_automation.run_all --resume`).
-- **Step 7 final dataset freeze & Step 8 Track A execution**: Scheduled to run immediately following the 51-run batch completion.
+- **Step 8 Track A `--final` frozen test evaluation**: Held pending operator review of Dev `GroupKFold` CV results and `"go --final"` confirmation.
 
 ## Resolved Questions
 - **`Q-S6-2` (`lab_config.yaml` host values)**: Resolved — `libvirt_uri: qemu:///system`, `domain_name: win11`, `network_name: win11-isolated`, `guest_ip: 192.168.150.50`, `ssh_user: mokh`, `ssh_key_path: /home/fsociety/.ssh/id_ed25519`, `base_image: /var/lib/libvirt/images/win11_base.qcow2`, `overlay_image: /var/lib/libvirt/images/win11_overlay.qcow2`, `nvram_live: /var/lib/libvirt/qemu/nvram/win11_VARS.fd`, `nvram_base: /var/lib/libvirt/qemu/nvram/win11_VARS.fd.base`, `use_sudo_for_libvirt_files: true`, `post_ssh_settle_seconds: 20`.

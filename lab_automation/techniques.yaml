@@ -154,6 +154,7 @@ techniques:
           - "file|c:\\programdata\\wmimon\\log_rotate_v1.cmd|log_rotate_v1.cmd"
           - "wmi_subscription|root\\subscription\\__eventfilter|diskquotafilterv1"
           - "wmi_subscription|root\\subscription\\commandlineeventconsumer|diskquotaconsumerv1"
+          - 'wmi_subscription|root\subscription\__filtertoconsumerbinding|__eventfilter (name = "diskquotafilterv1")->commandlineeventconsumer (name = "diskquotaconsumerv1")'
         steps:
           - action: "create_wmi_subscription"
             cmd: |
@@ -169,6 +170,7 @@ techniques:
           - "file|c:\\users\\public\\net_probe_v2.ps1|net_probe_v2.ps1"
           - "wmi_subscription|root\\subscription\\__eventfilter|netprobeintervalv2"
           - "wmi_subscription|root\\subscription\\commandlineeventconsumer|netprobehandlerv2"
+          - 'wmi_subscription|root\subscription\__filtertoconsumerbinding|__eventfilter (name = "netprobeintervalv2")->commandlineeventconsumer (name = "netprobehandlerv2")'
         steps:
           - action: "create_wmi_ps_subscription"
             cmd: |
@@ -183,6 +185,7 @@ techniques:
           - "file|c:\\windows\\temp\\wmi_stage_v3.vbs|wmi_stage_v3.vbs"
           - "wmi_subscription|root\\subscription\\__eventfilter|sessionauditfilterv3"
           - "wmi_subscription|root\\subscription\\activescripteventconsumer|sessionauditscriptv3"
+          - 'wmi_subscription|root\subscription\__filtertoconsumerbinding|__eventfilter (name = "sessionauditfilterv3")->activescripteventconsumer (name = "sessionauditscriptv3")'
         steps:
           - action: "create_wmi_activescript"
             cmd: |
@@ -285,6 +288,7 @@ techniques:
         expected_artifact_keys:
           - "file|c:\\users\\public\\runner_v1.cmd|runner_v1.cmd"
           - "process|cmd.exe"
+          - "run_key|hku|shellrunnerv1"
         steps:
           - action: "run_cmd_background_v1"
             cmd: |
@@ -338,6 +342,7 @@ techniques:
         expected_artifact_keys:
           - "file|c:\\users\\public\\report.pdf.exe|report.pdf.exe"
           - "file|c:\\users\\public\\open_report_v2.cmd|open_report_v2.cmd"
+          - "prefetch|c:\\windows\\prefetch|report.pdf.exe"
         steps:
           - action: "masquerade_double_ext_v2"
             cmd: |
@@ -529,6 +534,7 @@ techniques:
         expected_artifact_keys:
           - "file|c:\\users\\public\\side_app\\version.dll|version.dll"
           - "file|c:\\users\\public\\side_app\\viewer.exe|viewer.exe"
+          - "run_key|hku|sideviewerv1"
         steps:
           - action: "stage_dll_side_load_v1"
             cmd: |
@@ -555,6 +561,7 @@ techniques:
         expected_artifact_keys:
           - "file|c:\\windows\\temp\\loader\\profapi.dll|profapi.dll"
           - "file|c:\\windows\\temp\\loader\\updater.exe|updater.exe"
+          - "run_key|hku|loaderv3"
         steps:
           - action: "stage_dll_side_load_v3"
             cmd: |
@@ -573,7 +580,7 @@ techniques:
         expected_artifact_keys:
           - "file|c:\\programdata\\sys_audit_v1.ps1|sys_audit_v1.ps1"
           - "file|c:\\programdata\\sys_audit_wrap_v1.cmd|sys_audit_wrap_v1.cmd"
-          - "run_key|hku|sysauditoncelv1"
+          - "run_key|hku|sysauditoncev1"
         steps:
           - action: "staged_sysinfo_v1"
             cmd: |

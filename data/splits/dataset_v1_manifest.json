@@ -1,0 +1,40 @@
+{
+  "commit": "30be588a15d102d07909f112973a69361d2c5ade-dirty",
+  "dataset_path": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/data/processed/dataset_v1.parquet",
+  "generated_at_utc": "2026-11-21T23:31:51Z",
+  "holdout_draw_seed": 42,
+  "holdout_techniques": [
+    "T1036.005",
+    "T1059.003",
+    "T1087.001",
+    "T1543.003",
+    "T1548.002"
+  ],
+  "label_counts": {
+    "attacker_induced": 103,
+    "baseline": 1066,
+    "benign_drift": 380
+  },
+  "n_attack_runs": 48,
+  "n_control_runs": 3,
+  "n_runs": 51,
+  "seed": 42,
+  "split_counts": {
+    "dev": 1179,
+    "test": 370
+  },
+  "test_positives": 33,
+  "test_sha256": "2046f3ffbcbb9bdbc05f5db0e97b8d7554e41179a6f46dadb77fe65506db9e07",
+  "total_rows": 1549,
+  "human_review": {
+    "status": "approved",
+    "n_reviewed": 111,
+    "n_agreed": 111,
+    "agreement_rate": 1.0,
+    "n_positives_reviewed": 11,
+    "n_benign_drift_reviewed": 100,
+    "label_corrections_approved": 8,
+    "kept_os_drift_prefetch_approved": 6,
+    "reviewed_at_utc": "2026-11-21T23:53:52Z"
+  }
+}
