@@ -1,0 +1,4 @@
+run_id,technique,variant,split,status,attempts,duration_s,reset_s,boot_to_ssh_s,settle_s,launchers_s,flush_s,collection_s,scp_s,teardown_s,overlay_size_mb,output_size_mb,overlay_deleted,seed,error,finished_utc,commit
+dry_ctrl_01,CONTROL,0,control,success,1,173.97,0.104,36.765,20.0,45.0,5.0,60.107,0.767,4.217,86.94,11.78,True,42,,2026-11-21T17:05:23Z,ece0e5fe6873fe3d176557572bd312005dbca88a
+dry_T1053_005_v1,T1053.005,1,dev,success,1,133.23,0.105,22.929,20.0,20.067,5.0,57.119,0.38,4.169,102.44,11.85,True,43,,2026-11-21T19:03:39Z,8f2dc06c59097e977ca78d586817a120dcace2de
+dry_T1543_003_v1,T1543.003,1,holdout,success,1,136.94,0.108,37.863,20.0,10.877,5.0,55.232,0.33,4.161,99.5,11.83,True,44,,2026-11-21T19:05:56Z,8f2dc06c59097e977ca78d586817a120dcace2de
