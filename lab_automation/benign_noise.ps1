@@ -56,7 +56,7 @@ foreach ($step in $StepList) {
             $csvOut = Join-Path $WorkDir "service_status_$Tag.csv"
             $body = "Get-Service | Select-Object -First 15 Name,Status | Export-Csv -NoTypeInformation -Path '$csvOut'"
             [System.IO.File]::WriteAllText($psScript, $body)
-            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $psScript | Out-Null
+            & powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File $psScript | Out-Null
             Emit-Prov "ps_diag" @(
                 ("file|" + $psScript.ToLowerInvariant() + "|" + ("health_check_$Tag.ps1").ToLowerInvariant())
             )

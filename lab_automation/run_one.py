@@ -239,16 +239,32 @@ def render_attack_script(
     return script
 
 
-def render_benign_script(benign_ps1_path: Path, seed: int, order: Sequence[str]) -> str:
-    body = benign_ps1_path.read_text(encoding="utf-8")
+def render_benign_script(
+    benign_ps1_path: Path,
+    seed: int,
+    order: Sequence[str],
+    remote_path: str | None = None,
+) -> str:
     order_str = ",".join(order)
-    return (
-        f"$__seed = {int(seed)}\n"
-        f"$__order = '{order_str}'\n"
-        "& {\n"
-        f"{body}\n"
-        "} -Seed $__seed -Order $__order\n"
-    )
+    if remote_path:
+        script = (
+            f"$__seed = {int(seed)}\n"
+            f"$__order = '{order_str}'\n"
+            f"& '{remote_path}' -Seed $__seed -Order $__order\n"
+        )
+    else:
+        body = benign_ps1_path.read_text(encoding="utf-8")
+        script = (
+            f"$__seed = {int(seed)}\n"
+            f"$__order = '{order_str}'\n"
+            "& {\n"
+            f"{body}\n"
+            "} -Seed $__seed -Order $__order\n"
+        )
+    import pandas as pd
+    assert_clean(pd.DataFrame([{"artifact_key": "rendered_benign", "command_line": script}]),
+                 fields=("command_line",), report_path=None)
+    return script
 
 
 def _extract_provenance(stdout: str, run_id: str, technique_id: str | None, variant: int | None) -> list[dict]:
@@ -347,6 +363,8 @@ def run_single(
         timings["settle_s"] = round(time.monotonic() - t0, 3)
 
         sshd_pids = _query_sshd_pids(runner)
+        guest_out = cfg.guest_collector_out.rstrip("\\")
+        runner.run_powershell(f"[void][System.IO.Directory]::CreateDirectory('{guest_out}')", timeout_s=30)
 
         t0 = time.monotonic()
         if mode == "control":
@@ -361,8 +379,10 @@ def run_single(
             sleep_fn(cfg.control_wait_seconds)
         elif mode == "attack":
             assert technique is not None and variant_spec is not None
+            remote_benign = f"{guest_out}\\benign_noise.ps1"
+            runner.upload_file(benign_script, remote_benign)
             sched = build_interleaving_schedule(seed, BENIGN_STEPS, n_attack_steps=len(variant_spec["steps"]))
-            b_script = render_benign_script(benign_script, seed, sched.benign_order)
+            b_script = render_benign_script(benign_script, seed, sched.benign_order, remote_path=remote_benign)
             a_script = render_attack_script(variant_spec, seed)
 
             results: dict[str, CommandResult] = {}
@@ -430,8 +450,6 @@ def run_single(
         timings["flush_s"] = round(time.monotonic() - t0, 3)
 
         t0 = time.monotonic()
-        guest_out = cfg.guest_collector_out.rstrip("\\")
-        runner.run_powershell(f"[void][System.IO.Directory]::CreateDirectory('{guest_out}')", timeout_s=30)
         remote_collector = f"{guest_out}\\Collect-Artifacts.ps1"
         runner.upload_file(collector_script, remote_collector)
 
