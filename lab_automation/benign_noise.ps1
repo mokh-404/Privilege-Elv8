@@ -37,12 +37,15 @@ function Emit-Prov([string]$Action, [string[]]$ExpectedKeys) {
 }
 
 # Shared word pools and directory pool matching attack distributions from techniques.yaml
-$DocStems = @("notes", "review", "status", "incident", "sync", "release", "summary", "plan", "catalog", "wiki", "docs", "report")
-$HtmlStems = @("portal", "intranet", "dashboard", "index", "guide", "support")
-$ScriptStems = @("audit", "chk", "probe", "report", "cfg", "log", "mon", "maint", "diag", "queue", "sync", "sweep")
-$TaskStems = @("SyncCheck", "MaintHelper", "DiskAudit", "LogRotate", "IndexRefresh", "CertMon", "HealthCheck", "DiagSweep", "QueueMgr", "CacheMaint")
-$RunStems = @("Notes", "SyncAgent", "SessionHelper", "Notifier", "ProfileSync", "Assistant", "QueueSvc")
-$Suffixes = @("", "_v1", "_v2", "_v3")
+$FilePrefixes = @("sys", "net", "host", "acct", "cfg", "disk", "user", "svc", "diag", "log", "sync", "data", "cache", "task", "file", "env", "mon", "perf")
+$FileStems = @("audit", "probe", "scan", "sweep", "check", "helper", "monitor", "worker", "agent", "status", "report", "clean", "maint", "sync", "update", "refresh", "backup", "review")
+$FileExts = @("ps1", "ps1", "cmd", "cmd", "bat", "vbs")
+
+$TaskPrefixes = @("Cache", "Telemetry", "Font", "System", "Index", "Network", "Health", "Service", "Data", "Disk")
+$TaskStems = @("MaintenanceHelper", "IndexRefresh", "CacheUpdater", "StatusMonitor", "HealthCheck", "UpdateHelper")
+
+$RunPrefixes = @("Desktop", "Printer", "SysHealth", "Cert", "SysAudit", "Acct", "Cfg", "Health", "Sync", "Net")
+$RunStems = @("SyncAgent", "SpoolFix", "Mon", "Sync", "Once", "Scan", "Audit", "Indexer", "Agent", "Fix")
 
 $Dirs = @(
     "C:\ProgramData\Diagnostics",
@@ -57,8 +60,13 @@ $Dirs = @(
 function Get-TargetDir {
     return (Get-Random -InputObject $Dirs)
 }
-function Get-Suffix {
-    return (Get-Random -InputObject $Suffixes)
+
+function Get-CompoundFileName([string]$ForcedExt = "") {
+    $p = Get-Random -InputObject $FilePrefixes
+    $s = Get-Random -InputObject $FileStems
+    $suf = if ((Get-Random -Minimum 0 -Maximum 100) -lt 56) { "_v" + (Get-Random -InputObject @(1, 2, 3)) } else { "" }
+    $ext = if (-not [string]::IsNullOrWhiteSpace($ForcedExt)) { $ForcedExt } else { Get-Random -InputObject $FileExts }
+    return "$p`_$s$suf.$ext"
 }
 
 foreach ($step in $StepList) {
@@ -66,30 +74,23 @@ foreach ($step in $StepList) {
         "workspace_doc" {
             $d = Get-TargetDir
             [void][System.IO.Directory]::CreateDirectory($d)
-            $stem1 = Get-Random -InputObject $DocStems
-            $suf1 = Get-Suffix
-            $fn1 = "$stem1$suf1.txt"
-            $doc = Join-Path $d $fn1
+            $fn1 = Get-CompoundFileName "cmd"
+            $doc1 = Join-Path $d $fn1
+            $fn2 = Get-CompoundFileName "ps1"
+            $doc2 = Join-Path $d $fn2
 
-            $stem2 = Get-Random -InputObject $HtmlStems
-            $suf2 = Get-Suffix
-            $fn2 = "$stem2$suf2.html"
-            $html = Join-Path $d $fn2
-
-            [System.IO.File]::WriteAllText($doc, "Quarterly engineering review notes.")
-            [System.IO.File]::WriteAllText($html, "<html><body><h1>Offline Intranet Docs</h1></body></html>")
+            [System.IO.File]::WriteAllText($doc1, "@echo off`r`nrem System maintenance batch`r`necho Maintenance OK`r`n")
+            [System.IO.File]::WriteAllText($doc2, "# Administrative telemetry and health check`r`nGet-Date | Out-Null`r`n")
             Emit-Prov "workspace_doc" @(
-                ("file|" + $doc.ToLowerInvariant() + "|" + $fn1.ToLowerInvariant()),
-                ("file|" + $html.ToLowerInvariant() + "|" + $fn2.ToLowerInvariant())
+                ("file|" + $doc1.ToLowerInvariant() + "|" + $fn1.ToLowerInvariant()),
+                ("file|" + $doc2.ToLowerInvariant() + "|" + $fn2.ToLowerInvariant())
             )
             Start-Sleep -Milliseconds (300 + (($Seed * 17) % 700))
         }
         "ps_diag" {
             $d = Get-TargetDir
             [void][System.IO.Directory]::CreateDirectory($d)
-            $stem = Get-Random -InputObject $ScriptStems
-            $suf = Get-Suffix
-            $fn = "$stem$suf.ps1"
+            $fn = Get-CompoundFileName "ps1"
             $psScript = Join-Path $d $fn
             $csvOut = Join-Path $d "service_status.csv"
             $body = "Get-Service | Select-Object -First 15 Name,Status | Export-Csv -NoTypeInformation -Path '$csvOut'"
@@ -100,32 +101,59 @@ foreach ($step in $StepList) {
             )
         }
         "backup_task" {
-            $stem = Get-Random -InputObject $TaskStems
-            $suf = Get-Suffix
-            $tName = "$stem$suf"
-            $outTxt = "C:\Windows\Temp\task_idx.txt"
-            $cmd = "cmd.exe /c dir C:\Users\Public > $outTxt"
-            & schtasks.exe /Create /TN $tName /TR $cmd /SC ONCE /ST 23:55 /F | Out-Null
+            $tp = Get-Random -InputObject $TaskPrefixes
+            $ts = Get-Random -InputObject $TaskStems
+            $tName = "$tp$ts"
+            $td = Get-TargetDir
+            [void][System.IO.Directory]::CreateDirectory($td)
+            $tScriptFn = Get-CompoundFileName "ps1"
+            $tScript = Join-Path $td $tScriptFn
+            [System.IO.File]::WriteAllText($tScript, "Get-Date | Out-File -FilePath `"$td\task_idx.log`"")
+
+            # 67% powershell, 33% cmd matching attack task distribution
+            if ((Get-Random -Minimum 0 -Maximum 100) -lt 67) {
+                $trCmd = "powershell.exe -NoProfile -WindowStyle Hidden -File `"$tScript`""
+            } else {
+                $trCmd = "cmd.exe /c `"$tScript`""
+            }
+            & schtasks.exe /Create /TN $tName /TR $trCmd /SC ONCE /ST 23:55 /F | Out-Null
             Emit-Prov "backup_task" @(
-                ("task|\|" + $tName.ToLowerInvariant())
+                ("task|\|" + $tName.ToLowerInvariant()),
+                ("file|" + $tScript.ToLowerInvariant() + "|" + $tScriptFn.ToLowerInvariant())
             )
         }
         "run_note" {
-            $stem = Get-Random -InputObject $RunStems
-            $suf = Get-Suffix
-            $valName = "$stem$suf"
-            $valCmd = "C:\Windows\System32\notepad.exe C:\Users\Public\meeting_notes.txt"
-            & reg.exe ADD "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v $valName /t REG_SZ /d $valCmd /f | Out-Null
+            $rp = Get-Random -InputObject $RunPrefixes
+            $rs = Get-Random -InputObject $RunStems
+            $rsuf = if ((Get-Random -Minimum 0 -Maximum 100) -lt 60) { "V" + (Get-Random -InputObject @(1, 2, 3)) } else { "" }
+            $valName = "$rp$rs$rsuf"
+            $rd = Get-TargetDir
+            [void][System.IO.Directory]::CreateDirectory($rd)
+            $rScriptFn = Get-CompoundFileName "ps1"
+            $rScript = Join-Path $rd $rScriptFn
+            [System.IO.File]::WriteAllText($rScript, "Write-Output `"sync ok`" | Out-File `"$rd\run_sync.log`"")
+
+            # 50% powershell interpreter, 50% direct path matching attack run key distribution
+            if ((Get-Random -Minimum 0 -Maximum 100) -lt 50) {
+                $valCmd = "powershell.exe -NoProfile -WindowStyle Hidden -File `"$rScript`""
+            } else {
+                $valCmd = "`"$rScript`""
+            }
+            $regHive = if ((Get-Random -Minimum 0 -Maximum 100) -lt 88) {
+                "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+            } else {
+                "HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+            }
+            & reg.exe ADD $regHive /v $valName /t REG_SZ /d $valCmd /f | Out-Null
             Emit-Prov "run_note" @(
-                ("run_key|hku|" + $valName.ToLowerInvariant())
+                ("run_key|hku|" + $valName.ToLowerInvariant()),
+                ("file|" + $rScript.ToLowerInvariant() + "|" + $rScriptFn.ToLowerInvariant())
             )
         }
         "cmd_archive" {
             $d = Get-TargetDir
             [void][System.IO.Directory]::CreateDirectory($d)
-            $stem = Get-Random -InputObject $ScriptStems
-            $suf = Get-Suffix
-            $fn = "$stem$suf.cmd"
+            $fn = Get-CompoundFileName "cmd"
             $bat = Join-Path $d $fn
             $batBody = "@echo off`r`ndir C:\Users\Public > `"$d\dir_list.txt`"`r`n"
             [System.IO.File]::WriteAllText($bat, $batBody)

@@ -30,7 +30,10 @@
   - Full test suite: `180 passed in 24.14s`.
 
 ## In progress
-- None (pre-batch dry-run verification and sanity checks complete).
+- 51-run full Track A batch launching via `lab_automation.run_all --resume`.
+
+## Known Limitations
+- **Benign Artifact Types Coverage**: Benign activity generator (`benign_noise.ps1`) produces hard-negative artifacts across `file`, `task`, `run_key`, and `prefetch`. `service` and security-sensitive `registry` keys (IFEO, UAC hijack, Defender policies) are produced exclusively by attack techniques (`T1543.003`, `T1112`, `T1562.001`, `T1548.002`). Service creation (`sc.exe create`) and security registry modifications were omitted from background benign noise to prevent cross-run interference, host security collisions, and provenance destabilization during concurrent simulation.
 
 ## Blocked / Awaiting Operator Decision
 - **51-run full Track A batch**: Ready to launch upon operator approval (`.venv/bin/python -m lab_automation.run_all --resume`).
