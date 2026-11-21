@@ -89,3 +89,12 @@ local account creation or suspicious group change; event-log clear / defence-imp
 ```
 
 Note: the values in this example are schema illustrations supplied by the operator, not results.
+
+## Follow-up decisions (2026-11-21 — Steps 4–6 kickoff)
+
+| Item | Decision |
+|---|---|
+| `Q-S1-1` (`artifact_key` separator) | Keep `\|` (`ARTIFACT_KEY_SEP = "\|"`) everywhere, including `manifest.json`, feature tables, and `findings.json` / `export_findings.py`. |
+| `Q-S1-2` (Extra `artifact_type` levels) | Approved: keep `file`, `shimcache`, `wmi_subscription`, `registry`, `other`, `na` alongside the original 8 `ARTIFACT_TYPE_LEVELS` in `src/config.py`. |
+| Win11 Libvirt Overlay Design | Persistent domain `win11` on `qemu:///system`, UEFI NVRAM (`win11_VARS.fd.base` -> `win11_VARS.fd`), TPM 2.0 (`tpm-crb`), MAC `52:54:00:ba:30:f3`. Each run destroys `win11` if running, replaces `win11_overlay.qcow2` backed by read-only `win11_base.qcow2`, restores `win11_VARS.fd` from `.base`, calls `virsh start win11`, waits for SSH + `post_ssh_settle_seconds: 20`, runs launchers/control + collector, shuts down `win11`, and deletes `win11_overlay.qcow2`. Never use `virsh create` transient domains. |
+

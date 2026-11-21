@@ -40,12 +40,18 @@ def inspect_csv(path: str | Path = config.CIC_MALMEM_CSV) -> dict[str, Any]:
     print(f"Missing values: {n_nan}; infinite numeric values: {n_inf}")
 
     cat_counts = {}
+    prefix_counts: dict[tuple[str, str], int] = {}
     if config.CIC_CATEGORY_COL in df.columns:
         vc = df[config.CIC_CATEGORY_COL].value_counts(dropna=False)
         cat_counts = {str(k): int(v) for k, v in vc.items()}
-        print(f"Distinct {config.CIC_CATEGORY_COL} values ({len(vc)}):")
-        for val in sorted(cat_counts):
-            print(f"  {val!r}: {cat_counts[val]}")
+        for val, cnt in cat_counts.items():
+            parts = val.split("-")
+            key = ("Benign", "Benign") if val == "Benign" else (parts[0], parts[1] if len(parts) > 1 else "")
+            prefix_counts[key] = prefix_counts.get(key, 0) + cnt
+        print(f"Distinct raw {config.CIC_CATEGORY_COL} values: {len(vc)} (grouped into {len(prefix_counts)} category/family prefixes):")
+        for (c_part, f_part), cnt in sorted(prefix_counts.items()):
+            ex = next((k for k in sorted(cat_counts) if (k == "Benign" if c_part == "Benign" else k.startswith(f"{c_part}-{f_part}-"))), "")
+            print(f"  {c_part:12s} | {f_part:16s} | rows={cnt:5d} | example={ex!r}")
 
     # Check if any column might identify individual source samples (doc 09 section 2)
     suspicious = []

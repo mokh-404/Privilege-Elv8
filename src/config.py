@@ -91,11 +91,10 @@ assert not set(FEATURES) & set(ORACLE_FEATURES + RULE_FEATURES + META_COLUMNS + 
 
 FORBIDDEN_MODEL_INPUTS = frozenset(ORACLE_FEATURES + RULE_FEATURES + META_COLUMNS + [LABEL_COL])
 
-# Categorical level sets. "na" is always a level. Documented levels come from doc 10.
-# Extra artifact types (file, shimcache, wmi_subscription, registry) are PROPOSED in
-# docs/PROGRESS.md (question Q-S1-2) because the operator added collection of ShimCache,
-# WMI subscriptions, UAC/IFEO keys and dropped files. Until confirmed they are kept as
-# levels here; the one-hot encoder learns levels from training data in any case.
+# Categorical level sets. "na" is always a level. Core 8 levels come from doc 10;
+# extra levels (file, shimcache, wmi_subscription, registry, other) were approved by the
+# operator (docs/12_operator_decisions.md, Q-S1-2) to cover ShimCache, WMI subscriptions,
+# UAC/IFEO keys and dropped files within the locked 20-feature schema.
 ARTIFACT_TYPE_LEVELS = [
     "task", "service", "run_key", "startup", "prefetch", "amcache", "process", "account",
     "file", "shimcache", "wmi_subscription", "registry", "other", "na",
@@ -136,7 +135,7 @@ LOLBIN_LIST = [
 # --------------------------------------------------------------------------------------
 # Each normalised row is one artifact. Field names below are produced by the collector ->
 # normaliser step (Step 5/7). Missing values are None/NaN.
-ARTIFACT_KEY_SEP = "|"   # doc 10: "<artifact_type>|<normalised lower-case path or key>|<name>" (see Q-S1-1)
+ARTIFACT_KEY_SEP = "|"   # canonical separator everywhere, incl. findings.json (Q-S1-1 resolved)
 
 # Every string that feeds a feature (directly or via a class mapping). FE-08 assertion runs on all of them.
 STRING_INPUT_FIELDS = [

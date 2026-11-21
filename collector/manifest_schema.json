@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DFIR-Triage Collector Manifest",
+  "type": "object",
+  "required": [
+    "collector_version",
+    "script_sha256",
+    "hostname",
+    "operator",
+    "start_utc",
+    "end_utc",
+    "elapsed_seconds",
+    "powershell_version",
+    "artifact_key_sep",
+    "total_records",
+    "outputs",
+    "skipped",
+    "host_changes",
+    "command_classes_used"
+  ],
+  "properties": {
+    "collector_version": { "type": "string" },
+    "script_sha256": { "type": ["string", "null"] },
+    "hostname": { "type": "string" },
+    "operator": { "type": "string" },
+    "start_utc": { "type": "string" },
+    "end_utc": { "type": "string" },
+    "elapsed_seconds": { "type": "number", "minimum": 0 },
+    "stage_timings_seconds": {
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    },
+    "powershell_version": { "type": "string" },
+    "os_version": { "type": "string" },
+    "artifact_key_sep": { "type": "string", "const": "|" },
+    "total_records": { "type": "integer", "minimum": 0 },
+    "outputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "artifact_type", "row_count", "sha256"],
+        "properties": {
+          "file": { "type": "string" },
+          "artifact_type": { "type": "string" },
+          "row_count": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["artifact_type", "status", "reason"],
+        "properties": {
+          "artifact_type": { "type": "string" },
+          "status": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "excluded_counts": { "type": "object" },
+    "host_changes": { "type": "array" },
+    "command_classes_used": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
