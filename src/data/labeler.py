@@ -166,7 +166,10 @@ def _provenance_summary(provenance_rows: Sequence[Mapping[str, Any]]) -> dict[st
         ts = rec.get("timestamp_utc") or rec.get("timestamp")
         if ts and launcher in ("attack", "benign", "control"):
             timestamps.append(str(ts))
-        exp = [str(k) for k in (rec.get("expected_artifact_keys") or [])]
+        raw_exp = rec.get("expected_artifact_keys") or []
+        if isinstance(raw_exp, str):
+            raw_exp = [raw_exp]
+        exp = [str(k) for k in raw_exp if isinstance(k, (str, bytes)) or not isinstance(k, dict)]
         if launcher == "attack":
             attack_keys.extend(exp)
             if rec.get("technique_id") and technique_id is None:
@@ -310,7 +313,7 @@ def deduplicate_and_assign_splits(
         ben_df = ben_df.assign(_prio=ben_df[config.LABEL_COL].map(rank_prio).fillna(2))
         ben_df = ben_df.sort_values(["artifact_key", "_prio", "run_id"], kind="mergesort")
         for akey, grp in ben_df.groupby("artifact_key", sort=False):
-            first = grp.iloc[0].drop(labels=["_prio"]).copy()
+            first = grp.iloc[0].drop(labels=["_prio"]).to_dict()
             run_ids = sorted({str(r) for r in grp["run_id"]})
             first["seen_run_ids"] = json.dumps(run_ids)
             first["seen_count"] = len(run_ids)

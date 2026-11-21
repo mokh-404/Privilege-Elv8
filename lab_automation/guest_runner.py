@@ -112,8 +112,12 @@ class SSHGuestRunner(GuestRunner):
         raise TimeoutError(f"Guest SSH {self.user}@{self.host}:{self.port} not ready within {timeout_s}s: {last_err}")
 
     def run_powershell(self, script_text: str, timeout_s: int = 180) -> CommandResult:
-        # Execute via neutral stdin (-Command -) so no base64/encoded flag or temp file is created.
-        cmd = self.ssh_cmd("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -")
+        # Read entire stdin as one compiled scriptblock so PowerShell 5.1 does not split on blank lines
+        # (and without -EncodedCommand, Invoke-Expression, or temp files on disk).
+        cmd = self.ssh_cmd(
+            'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass '
+            '-Command "Invoke-Command -ScriptBlock ([scriptblock]::Create([Console]::In.ReadToEnd()))"'
+        )
         cp = self._run(cmd, input=script_text, capture_output=True, text=True, timeout=timeout_s)
         return CommandResult(
             returncode=cp.returncode,

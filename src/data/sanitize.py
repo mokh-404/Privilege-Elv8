@@ -121,6 +121,11 @@ def drop_runner_footprint(
             pid = row.get("pid")
             if pid is not None and not pd.isna(pid) and int(pid) in pids:
                 return f"pid:{int(pid)}"
+        if row.get("artifact_type") == "prefetch":
+            nm = str(row.get("name") or "").lower()
+            for proc_nm in names:
+                if nm.startswith(f"{proc_nm}-") and nm.endswith(".pf"):
+                    return f"prefetch_runner:{proc_nm}"
         return None
 
     reasons = df.apply(reason, axis=1) if len(df) else pd.Series([], dtype=object)

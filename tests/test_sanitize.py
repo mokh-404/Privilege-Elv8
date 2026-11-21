@@ -62,13 +62,16 @@ def test_drop_runner_footprint(tmp_path):
         {"artifact_key": "c", "artifact_type": "process", "name": "powershell.exe", "path": "", "pid": 12},
         {"artifact_key": "d", "artifact_type": "file", "name": "out.json", "path": "C:\\collector_out\\out.json"},
         {"artifact_key": "e", "artifact_type": "file", "name": "x.exe", "path": "C:\\Users\\Public\\x.exe"},
+        {"artifact_key": "f", "artifact_type": "prefetch", "name": "SSHD.EXE-2B5F0E53.pf", "path": "C:\\WINDOWS\\Prefetch\\SSHD.EXE-2B5F0E53.pf"},
+        {"artifact_key": "g", "artifact_type": "prefetch", "name": "CMD.EXE-0BD30981.pf", "path": "C:\\WINDOWS\\Prefetch\\CMD.EXE-0BD30981.pf"},
     ])
     log = tmp_path / "drop.csv"
     kept, dropped = drop_runner_footprint(df, exclude_pids=[11], log_path=log)
-    assert list(kept["artifact_key"]) == ["c", "e"]
-    assert set(dropped["artifact_key"]) == {"a", "b", "d"}
+    assert list(kept["artifact_key"]) == ["c", "e", "g"]
+    assert set(dropped["artifact_key"]) == {"a", "b", "d", "f"}
+    assert "prefetch_runner:sshd.exe" in set(dropped["drop_reason"])
     assert log.exists()
-    assert len(pd.read_csv(log)) == 3
+    assert len(pd.read_csv(log)) == 4
 
 
 def test_patterns_are_the_spec_patterns():

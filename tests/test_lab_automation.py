@@ -347,3 +347,42 @@ def test_dry_run_isolation_from_real_runs(tmp_path, monkeypatch):
     assert not real_dir.exists()
     assert (tmp_path / "logs" / "dry_run_table.csv").exists()
     assert not (tmp_path / "logs" / "run_table.csv").exists()
+
+
+def test_render_attack_uses_native_ps_array_and_ssh_uses_scriptblock():
+    from lab_automation.guest_runner import SSHGuestRunner
+
+    cat = _load_catalog()
+    script = run_one.render_attack_script(cat["techniques"][0]["variants"][0], seed=42)
+    assert "ConvertFrom-Json" not in script
+    assert "expected_artifact_keys=@(" in script
+
+    captured_cmds = []
+    def fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="WRAPPER_PID=500\n", stderr="")
+
+    runner = SSHGuestRunner("192.168.150.50", "mokh", "/tmp/id", run_cmd=fake_run)
+    res = runner.run_powershell("Write-Output ok")
+    assert res.wrapper_pid == 500
+    assert "Invoke-Command -ScriptBlock ([scriptblock]::Create([Console]::In.ReadToEnd()))" in captured_cmds[0][-1]
+
+
+def test_run_single_fails_if_benign_emits_no_provenance(tmp_path):
+    class _SilentBenignRunner(_FakeRunner):
+        def run_powershell(self, script_text: str, timeout_s: int = 180) -> CommandResult:
+            if "$__order" in script_text:
+                return CommandResult(0, "", "", wrapper_pid=None)
+            return super().run_powershell(script_text, timeout_s=timeout_s)
+
+    cfg = run_one.LabConfig(run_output_dir=str(tmp_path / "runs"))
+    cat = _load_catalog()
+    with pytest.raises(RuntimeError, match="did not emit WRAPPER_PID"):
+        run_one.run_single(
+            cfg, run_id="run_silent", mode="attack",
+            technique=cat["techniques"][0], variant_spec=cat["techniques"][0]["variants"][0],
+            runner=_SilentBenignRunner(),
+            run_cmd=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="shut off", stderr=""),
+            sleep_fn=lambda _: None,
+            provenance_dir=tmp_path / "prov",
+        )

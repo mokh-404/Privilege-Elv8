@@ -500,6 +500,7 @@ Run-Stage "startup" {
     $startupDirs = [System.Collections.Generic.List[string]]::new()
     [void]$startupDirs.Add("C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup")
     foreach ($uDir in (Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue)) {
+        if (($uDir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
         $cand = Join-Path $uDir.FullName "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
         if ([System.IO.Directory]::Exists($cand)) { [void]$startupDirs.Add($cand) }
     }
@@ -779,6 +780,7 @@ Run-Stage "file" {
     [void]$scanRoots.Add(@{ Path = "C:\Users\Public"; MaxDepth = 5 })
     [void]$scanRoots.Add(@{ Path = "C:\ProgramData"; MaxDepth = 4 })
     foreach ($uDir in (Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue)) {
+        if (($uDir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
         [void]$scanRoots.Add(@{ Path = (Join-Path $uDir.FullName "AppData\Local\Temp"); MaxDepth = 4 })
         [void]$scanRoots.Add(@{ Path = (Join-Path $uDir.FullName "AppData\Roaming"); MaxDepth = 4 })
         [void]$scanRoots.Add(@{ Path = (Join-Path $uDir.FullName "AppData\Local"); MaxDepth = 3 })
@@ -791,6 +793,10 @@ Run-Stage "file" {
         if ($scanState.count -ge $MaxScannedFiles) { return }
         if (-not [System.IO.Directory]::Exists($DirPath)) { return }
         if (Is-ExcludedPath $DirPath) { return }
+        try {
+            $di = [System.IO.DirectoryInfo]::new($DirPath)
+            if (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return }
+        } catch { return }
         $lowDir = ($DirPath.TrimEnd("\") + "\").ToLowerInvariant()
         foreach ($frag in $skipDirFragments) {
             if ($lowDir.Contains($frag)) { return }

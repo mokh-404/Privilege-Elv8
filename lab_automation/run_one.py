@@ -191,6 +191,14 @@ def build_interleaving_schedule(
     )
 
 
+def _ps_string_array(items: Sequence[str]) -> str:
+    """Format a Python string sequence as a native PowerShell `@('a','b')` array literal."""
+    if not items:
+        return "@()"
+    quoted = ",".join("'" + str(s).replace("'", "''") + "'" for s in items)
+    return f"@({quoted})"
+
+
 def render_attack_script(
     variant_spec: dict[str, Any],
     seed: int,
@@ -206,18 +214,18 @@ def render_attack_script(
         "$SelfPid = $PID",
         'Write-Output ("WRAPPER_PID={0}" -f $SelfPid)',
     ]
+    exp_ps = _ps_string_array(expected)
     for idx in order:
         st = steps[idx]
         action = str(st["action"])
         cmd = str(st["cmd"]).rstrip()
-        exp_json = json.dumps(expected)
         lines.append(cmd)
         lines.append(
             "$prov = [ordered]@{"
             "launcher='attack';"
             f"action='{action}';"
             "timestamp_utc=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ');"
-            f"expected_artifact_keys=@(ConvertFrom-Json '{exp_json}');"
+            f"expected_artifact_keys={exp_ps};"
             "wrapper_pid=$SelfPid;"
             f"seed={int(seed)}"
             "}"
@@ -379,13 +387,26 @@ def run_single(
             if errors:
                 raise RuntimeError(f"Launcher thread error(s) in {run_id}: {errors}")
             for tag, res in results.items():
-                if res.wrapper_pid is not None:
-                    wrapper_pids.append(res.wrapper_pid)
                 if res.returncode != 0:
-                    raise RuntimeError(f"{tag} launcher exited {res.returncode} in {run_id}: {res.stderr}")
-                provenance_rows.extend(_extract_provenance(
+                    raise RuntimeError(
+                        f"{tag} launcher exited {res.returncode} in {run_id}: "
+                        f"stdout={res.stdout[:300]!r} stderr={res.stderr[:300]!r}"
+                    )
+                if res.wrapper_pid is None:
+                    raise RuntimeError(
+                        f"{tag} launcher did not emit WRAPPER_PID in {run_id}: "
+                        f"stdout={res.stdout[:300]!r} stderr={res.stderr[:300]!r}"
+                    )
+                wrapper_pids.append(res.wrapper_pid)
+                prov_recs = _extract_provenance(
                     res.stdout, run_id, technique["technique_id"], int(variant_spec["variant"]),
-                ))
+                )
+                if not prov_recs:
+                    raise RuntimeError(
+                        f"{tag} launcher emitted 0 PROVENANCE records in {run_id}: "
+                        f"stdout={res.stdout[:300]!r} stderr={res.stderr[:300]!r}"
+                    )
+                provenance_rows.extend(prov_recs)
         else:
             raise ValueError(f"Unknown mode: {mode!r}")
         timings["launchers_s"] = round(time.monotonic() - t0, 3)

@@ -58,6 +58,7 @@ def test_collector_covers_hku_sshd_amcache_and_pipe_sep():
     assert '$ArtifactKeySep = "|"' in src
     assert "record_sha256" in src
     assert "file_sha256" in src
+    assert "ReparsePoint" in src
     # No PowerShell 7-only ternary/null-coalescing operators (must stay PS 5.1 compatible)
     assert " ? " not in src
     assert " ?? " not in src
