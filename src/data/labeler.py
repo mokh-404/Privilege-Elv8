@@ -141,18 +141,31 @@ def _provenance_summary(provenance_rows: Sequence[Mapping[str, Any]]) -> dict[st
     attack_keys: list[str] = []
     benign_keys: list[str] = []
     wrapper_pids: set[int] = set()
+    exclude_pids: set[int] = set()
     technique_id: str | None = None
     variant: Any = None
     timestamps: list[str] = []
+
+    def _add_pid_list(val: Any, target: set[int]) -> None:
+        if isinstance(val, (list, tuple, set)):
+            for p in val:
+                if p is not None and not pd.isna(p):
+                    target.add(int(p))
 
     for rec in provenance_rows:
         wpid = rec.get("wrapper_pid")
         if wpid is not None and not pd.isna(wpid):
             wrapper_pids.add(int(wpid))
-        ts = rec.get("timestamp_utc") or rec.get("timestamp")
-        if ts:
-            timestamps.append(str(ts))
+            exclude_pids.add(int(wpid))
+        _add_pid_list(rec.get("wrapper_pids"), wrapper_pids)
+        _add_pid_list(rec.get("wrapper_pids"), exclude_pids)
+        _add_pid_list(rec.get("sshd_pids"), exclude_pids)
+        _add_pid_list(rec.get("exclude_pids"), exclude_pids)
+
         launcher = str(rec.get("launcher") or "").lower()
+        ts = rec.get("timestamp_utc") or rec.get("timestamp")
+        if ts and launcher in ("attack", "benign", "control"):
+            timestamps.append(str(ts))
         exp = [str(k) for k in (rec.get("expected_artifact_keys") or [])]
         if launcher == "attack":
             attack_keys.extend(exp)
@@ -168,6 +181,7 @@ def _provenance_summary(provenance_rows: Sequence[Mapping[str, Any]]) -> dict[st
         "attack_keys": attack_keys,
         "benign_keys": benign_keys,
         "wrapper_pids": sorted(wrapper_pids),
+        "exclude_pids": sorted(exclude_pids),
         "technique_id": technique_id,
         "variant": variant,
         "window": window,
@@ -196,7 +210,7 @@ def label_run(
     # DS-10: drop runner footprint (sshd.exe, launcher wrapper PIDs, collector paths) BEFORE sanitize
     df, _ = sanitize.drop_runner_footprint(
         df,
-        exclude_pids=prov["wrapper_pids"],
+        exclude_pids=prov["exclude_pids"],
         log_path=runner_log_path,
     )
     # FE-08: hard assertion on all feature-input strings
@@ -417,6 +431,8 @@ def build_dataset(
     splits_dir: str | Path = config.SPLITS_DIR,
     baseline_snapshot_utc: object = None,
     seed: int = config.SEED,
+    exclude_dry_runs: bool = True,
+    runner_log_path: str | Path | None = config.RUNNER_FOOTPRINT_LOG_CSV,
 ) -> dict[str, Any]:
     """End-to-end Step 7 builder: baseline index -> label -> dedupe -> features -> parquet + manifest."""
     raw_runs_dir = Path(raw_runs_dir)
@@ -430,7 +446,12 @@ def build_dataset(
     tech_by_id = {str(t["technique_id"]): t for t in catalog["techniques"]}
 
     run_table = pd.read_csv(run_table_csv) if Path(run_table_csv).exists() else None
-    run_dirs = sorted(p for p in raw_runs_dir.iterdir() if p.is_dir() and (p / "manifest.json").exists())
+    run_dirs = sorted(
+        p for p in raw_runs_dir.iterdir()
+        if p.is_dir()
+        and (p / "manifest.json").exists()
+        and not (exclude_dry_runs and p.name.startswith("dry_"))
+    )
     if not run_dirs:
         raise FileNotFoundError(f"No completed run directories with manifest.json found under {raw_runs_dir}")
 
@@ -454,7 +475,11 @@ def build_dataset(
         is_ctrl = (
             rid.startswith(("ctrl_", "dry_ctrl_"))
             or str(tech_id).upper() == "CONTROL"
-            or (prov_r and all(p.get("launcher") == "control" for p in prov_r))
+            or (
+                bool(prov_r)
+                and any(p.get("launcher") == "control" for p in prov_r)
+                and all(p.get("launcher") in ("control", "runner_meta") for p in prov_r)
+            )
         )
         if is_ctrl:
             control_raw.append((rid, df_r, prov_r))
@@ -470,7 +495,11 @@ def build_dataset(
     baseline_dfs_clean = []
     for rid, cdf, prov_r in control_raw:
         ps = _provenance_summary(prov_r)
-        kept, _ = sanitize.drop_runner_footprint(cdf, exclude_pids=ps["wrapper_pids"])
+        kept, _ = sanitize.drop_runner_footprint(
+            cdf,
+            exclude_pids=ps["exclude_pids"],
+            log_path=runner_log_path,
+        )
         sanitize.assert_clean(kept)
         baseline_dfs_clean.append(kept)
     baseline_index = build_baseline_index(baseline_dfs_clean)
@@ -481,7 +510,10 @@ def build_dataset(
 
     for rid, cdf, prov_r in control_raw:
         windows_by_run[rid] = _provenance_summary(prov_r)["window"]
-        labelled_parts.append(label_run(cdf, baseline_index, prov_r, run_id=rid, is_control=True))
+        labelled_parts.append(label_run(
+            cdf, baseline_index, prov_r, run_id=rid, is_control=True,
+            runner_log_path=runner_log_path,
+        ))
 
     for rid, adf, prov_r, tid, var_num in attack_runs:
         windows_by_run[rid] = _provenance_summary(prov_r)["window"]
@@ -492,6 +524,7 @@ def build_dataset(
         labelled_parts.append(label_run(
             adf, baseline_index, prov_r, run_id=rid,
             technique_spec=tspec, variant_spec=vspec, is_control=False,
+            runner_log_path=runner_log_path,
         ))
 
     all_labelled = pd.concat(labelled_parts, ignore_index=True)
@@ -575,6 +608,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-table", type=Path, default=config.LOGS_DIR / "run_table.csv")
     parser.add_argument("--out-dir", type=Path, default=config.PROCESSED_DIR)
     parser.add_argument("--splits-dir", type=Path, default=config.SPLITS_DIR)
+    parser.add_argument("--runner-log", type=Path, default=config.RUNNER_FOOTPRINT_LOG_CSV)
+    parser.add_argument("--include-dry-runs", action="store_true", help="Include dry_* run directories.")
     parser.add_argument("--baseline-utc", default=None)
     args = parser.parse_args(argv)
 
@@ -586,6 +621,8 @@ def main(argv: list[str] | None = None) -> int:
         processed_dir=args.out_dir,
         splits_dir=args.splits_dir,
         baseline_snapshot_utc=args.baseline_utc,
+        exclude_dry_runs=not args.include_dry_runs,
+        runner_log_path=args.runner_log,
     )
     print(json.dumps(res["manifest"], indent=2))
     return 0

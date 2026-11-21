@@ -242,3 +242,50 @@ def test_label_does_not_depend_on_timestamps_or_rules():
     # Even though RULE-015 would fire on a .ps1 in C:\Users\Public and timestamp is in window, label must be benign_drift
     assert R.evaluate_row(df.iloc[0])
     assert out.iloc[0]["label"] == "benign_drift"
+
+
+def test_build_dataset_excludes_dry_runs_by_default_and_handles_runner_meta(tmp_path):
+    raw_dir = tmp_path / "raw"
+    prov_dir = tmp_path / "prov"
+
+    # Real control run with runner_meta record listing sshd_pids & wrapper_pids
+    ctrl_arts = [
+        _base_service("2026-11-21T01:00:00Z"),
+        {"artifact_type": "process", "artifact_key": "process|c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe#1234|powershell.exe",
+         "name": "powershell.exe", "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "pid": 1234},
+    ]
+    ctrl_prov = [
+        {"run_id": "ctrl_01", "launcher": "control", "timestamp_utc": "2026-11-21T01:00:00Z", "expected_artifact_keys": []},
+        {"run_id": "ctrl_01", "launcher": "runner_meta", "timestamp_utc": "2026-11-21T01:00:45Z",
+         "wrapper_pids": [1234], "sshd_pids": [1100], "exclude_pids": [1100, 1234]},
+    ]
+    _write_run(raw_dir, prov_dir, "ctrl_01", ctrl_arts, ctrl_prov)
+
+    # Dry run inside same directory must be ignored when exclude_dry_runs=True
+    _write_run(
+        raw_dir, prov_dir, "dry_T1053_005_v1",
+        [_base_service(), {"artifact_type": "task", "artifact_key": "task|\\|cachemaintenancehelper", "name": "CacheMaintenanceHelper"}],
+        [{"run_id": "dry_T1053_005_v1", "launcher": "attack", "technique_id": "T1053.005", "variant": 1,
+          "timestamp_utc": "2026-11-21T01:10:00Z", "expected_artifact_keys": ["task|\\|cachemaintenancehelper"]}],
+    )
+
+    res_excl = labeler.build_dataset(
+        raw_runs_dir=raw_dir, provenance_dir=prov_dir,
+        run_table_csv=tmp_path / "missing_rt.csv",
+        processed_dir=tmp_path / "proc_excl", splits_dir=tmp_path / "sp_excl",
+        runner_log_path=tmp_path / "dropped_excl.csv",
+        exclude_dry_runs=True,
+    )
+    assert res_excl["manifest"]["n_runs"] == 1
+    assert res_excl["manifest"]["n_control_runs"] == 1
+    assert "process|c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe#1234|powershell.exe" not in set(res_excl["dataset"]["artifact_key"])
+
+    res_incl = labeler.build_dataset(
+        raw_runs_dir=raw_dir, provenance_dir=prov_dir,
+        run_table_csv=tmp_path / "missing_rt.csv",
+        processed_dir=tmp_path / "proc_incl", splits_dir=tmp_path / "sp_incl",
+        runner_log_path=tmp_path / "dropped_incl.csv",
+        exclude_dry_runs=False,
+    )
+    assert res_incl["manifest"]["n_runs"] == 2
+    assert res_incl["manifest"]["label_counts"].get("attacker_induced", 0) == 1

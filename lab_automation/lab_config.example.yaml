@@ -1,27 +1,28 @@
 # Lab automation configuration for Windows 11 under libvirt/QEMU/KVM (Omarchy host).
-# Copy this file to lab_automation/lab_config.yaml and fill in guest_ip / network_name / ssh_key_path.
+# Copy this file to lab_automation/lab_config.yaml and fill in host-specific paths/keys.
 # lab_config.yaml is gitignored so host-specific paths and keys stay local.
 
 libvirt_uri: "qemu:///system"
 domain_name: "win11"
 
-# Read-only frozen base disk (never booted directly once frozen)
+# Read-only frozen base disk (mode 0444, never booted directly once frozen)
 base_image: "/var/lib/libvirt/images/win11_base.qcow2"
 # Throw-away per-run overlay disk configured on the persistent win11 domain
 overlay_image: "/var/lib/libvirt/images/win11_overlay.qcow2"
+overlay_owner: "nobody:nobody"
 
 # UEFI Secure Boot NVRAM state (restored before every boot)
 nvram_base: "/var/lib/libvirt/qemu/nvram/win11_VARS.fd.base"
-nvram_active: "/var/lib/libvirt/qemu/nvram/win11_VARS.fd"
+nvram_live: "/var/lib/libvirt/qemu/nvram/win11_VARS.fd"
 
 # Isolated libvirt network (must have NO <forward> element) and fixed guest MAC
-network_name: "isolated-lab"
+network_name: "win11-isolated"
 guest_mac: "52:54:00:ba:30:f3"
 
 # Guest SSH settings (OpenSSH Server with Administrator privileges)
-guest_ip: "192.168.100.10"
-ssh_user: "Administrator"
-ssh_key_path: "~/.ssh/win11_lab_ed25519"
+guest_ip: "192.168.150.50"
+ssh_user: "mokh"
+ssh_key_path: "/home/fsociety/.ssh/id_ed25519"
 ssh_port: 22
 
 # Timing & resource guards (seconds / GB)
@@ -33,9 +34,11 @@ launcher_timeout_seconds: 180
 control_wait_seconds: 45
 min_free_disk_gb: 30
 
-# Set true if /var/lib/libvirt/images or nvram requires sudo for qemu-img / cp / rm
-use_sudo_for_libvirt_files: false
+# Passwordless sudo for /usr/bin/{virsh,qemu-img,chown,cp,rm}
+use_sudo_for_libvirt_files: true
 
 # Paths
 guest_collector_out: "C:\\collector_out"
 run_output_dir: "data/raw/runs"
+dry_run_output_dir: "data/raw/dry_runs"
+dry_run_provenance_dir: "lab_automation/provenance/dry_runs"

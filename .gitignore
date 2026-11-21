@@ -6,6 +6,7 @@ __pycache__/
 # Data is never committed (raw guest output, external datasets, processed parquet)
 data/raw/runs/*
 !data/raw/runs/.gitkeep
+data/raw/dry_runs/
 data/external/**/*.csv
 data/interim/*
 !data/interim/.gitkeep
@@ -17,4 +18,5 @@ results/models/*
 
 # Host-side provenance logs stay on the host (they are committed only if the operator decides)
 lab_automation/provenance/*.jsonl
+lab_automation/provenance/dry_runs/
 lab_automation/lab_config.yaml

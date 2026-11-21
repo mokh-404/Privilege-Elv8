@@ -3,14 +3,15 @@
 Per run:
 1. Ensure persistent domain `win11` on `qemu:///system` is shut off (`virsh destroy` if needed).
 2. Remove any old overlay qcow2, create fresh copy-on-write overlay backed by read-only
-   `base_image`, and restore UEFI `nvram_active` from `nvram_base` (never touches `base_image`,
-   never uses `virsh create` transient domains).
+   `base_image`, `chown nobody:nobody` the overlay, and copy `nvram_base` -> `nvram_live`
+   (using only passwordless sudo binaries when `use_sudo_for_libvirt_files=true`; never
+   touches `base_image`, never uses `virsh create` transient domains).
 3. `virsh -c qemu:///system start win11`, wait for SSH, then sleep `post_ssh_settle_seconds` (20s).
-4. Control mode: wait `control_wait_seconds`.
-   Attack mode: launch `benign_noise.ps1` and the rendered neutral attack script on two
-   parallel SSH sessions with seeded start offsets in [0, 20]s and seeded step ordering.
+4. Record guest `sshd` PIDs, then in control mode wait `control_wait_seconds`, or in attack mode
+   launch `benign_noise.ps1` and the rendered neutral attack script on two parallel SSH sessions
+   with seeded start offsets in [0, 20]s and seeded step ordering.
 5. Wait `post_launchers_flush_seconds` (5s), upload & run `collector/Collect-Artifacts.ps1`
-   with captured `-ExcludePids`, download output via `scp` to `data/raw/runs/<run_id>/`.
+   with captured `-ExcludePids` (wrapper + sshd PIDs), download output via `scp`.
 6. Guaranteed cleanup in `finally`: `virsh shutdown` (then `destroy` on timeout) and
    delete `overlay_image`. Writes host-side provenance JSONL strictly on the host.
 """
@@ -18,11 +19,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
+import os
+import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -44,6 +46,14 @@ BENIGN_STEPS = [
     "sysinternals_check",
 ]
 
+_SUDO_BIN_MAP = {
+    "virsh": "/usr/bin/virsh",
+    "qemu-img": "/usr/bin/qemu-img",
+    "chown": "/usr/bin/chown",
+    "cp": "/usr/bin/cp",
+    "rm": "/usr/bin/rm",
+}
+
 
 @dataclass
 class LabConfig:
@@ -51,13 +61,14 @@ class LabConfig:
     domain_name: str = "win11"
     base_image: str = "/var/lib/libvirt/images/win11_base.qcow2"
     overlay_image: str = "/var/lib/libvirt/images/win11_overlay.qcow2"
+    overlay_owner: str = "nobody:nobody"
     nvram_base: str = "/var/lib/libvirt/qemu/nvram/win11_VARS.fd.base"
-    nvram_active: str = "/var/lib/libvirt/qemu/nvram/win11_VARS.fd"
-    network_name: str = "isolated-lab"
+    nvram_live: str = "/var/lib/libvirt/qemu/nvram/win11_VARS.fd"
+    network_name: str = "win11-isolated"
     guest_mac: str = "52:54:00:ba:30:f3"
-    guest_ip: str = "192.168.100.10"
-    ssh_user: str = "Administrator"
-    ssh_key_path: str = "~/.ssh/win11_lab_ed25519"
+    guest_ip: str = "192.168.150.50"
+    ssh_user: str = "mokh"
+    ssh_key_path: str = "/home/fsociety/.ssh/id_ed25519"
     ssh_port: int = 22
     boot_timeout_seconds: int = 180
     post_ssh_settle_seconds: int = 20
@@ -69,10 +80,18 @@ class LabConfig:
     use_sudo_for_libvirt_files: bool = False
     guest_collector_out: str = r"C:\collector_out"
     run_output_dir: str = str(config.RAW_RUNS_DIR)
+    dry_run_output_dir: str = str(config.DATA_DIR / "raw" / "dry_runs")
+    dry_run_provenance_dir: str = str(config.PROVENANCE_DIR / "dry_runs")
+
+    @property
+    def nvram_active(self) -> str:
+        return self.nvram_live
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "LabConfig":
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        data = dict(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
+        if "nvram_active" in data and "nvram_live" not in data:
+            data["nvram_live"] = data.pop("nvram_active")
         valid = {f for f in cls.__dataclass_fields__}
         filtered = {k: v for k, v in data.items() if k in valid}
         return cls(**filtered)
@@ -87,24 +106,29 @@ class InterleavingSchedule:
     attack_order: list[int]
 
 
-def build_virsh_cmd(uri: str, *args: str) -> list[str]:
-    return ["virsh", "-c", uri, *args]
+def _maybe_sudo(cmd: list[str], use_sudo: bool) -> list[str]:
+    if not use_sudo:
+        return cmd
+    exe = _SUDO_BIN_MAP.get(cmd[0], cmd[0])
+    return ["sudo", "-n", exe, *cmd[1:]]
+
+
+def build_virsh_cmd(uri: str, *args: str, use_sudo: bool = False) -> list[str]:
+    return _maybe_sudo(["virsh", "-c", uri, *args], use_sudo=use_sudo)
 
 
 def build_overlay_cmd(base_image: str, overlay_image: str, use_sudo: bool = False) -> list[str]:
-    cmd = ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", base_image, overlay_image]
-    return (["sudo", *cmd] if use_sudo else cmd)
-
-
-def _fs_cmd(args: list[str], use_sudo: bool) -> list[str]:
-    return (["sudo", *args] if use_sudo else args)
+    return _maybe_sudo(
+        ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", base_image, overlay_image],
+        use_sudo=use_sudo,
+    )
 
 
 def prepare_fresh_win11_state(
     cfg: LabConfig,
     run_cmd: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> None:
-    """Shut off win11 if needed, recreate throw-away overlay from base, and restore NVRAM."""
+    """Reset persistent Win11 state: destroy if running -> rm -> qemu-img -> chown -> cp NVRAM."""
     state_cp = run_cmd(build_virsh_cmd(cfg.libvirt_uri, "domstate", cfg.domain_name),
                        capture_output=True, text=True, timeout=15)
     state = (state_cp.stdout or "").strip().lower()
@@ -112,11 +136,14 @@ def prepare_fresh_win11_state(
         run_cmd(build_virsh_cmd(cfg.libvirt_uri, "destroy", cfg.domain_name),
                 capture_output=True, text=True, timeout=30, check=True)
 
-    run_cmd(_fs_cmd(["rm", "-f", cfg.overlay_image], cfg.use_sudo_for_libvirt_files),
+    run_cmd(_maybe_sudo(["rm", "-f", cfg.overlay_image], cfg.use_sudo_for_libvirt_files),
             capture_output=True, text=True, timeout=30, check=True)
     run_cmd(build_overlay_cmd(cfg.base_image, cfg.overlay_image, cfg.use_sudo_for_libvirt_files),
             capture_output=True, text=True, timeout=30, check=True)
-    run_cmd(_fs_cmd(["cp", "-f", cfg.nvram_base, cfg.nvram_active], cfg.use_sudo_for_libvirt_files),
+    if cfg.overlay_owner:
+        run_cmd(_maybe_sudo(["chown", cfg.overlay_owner, cfg.overlay_image], cfg.use_sudo_for_libvirt_files),
+                capture_output=True, text=True, timeout=30, check=True)
+    run_cmd(_maybe_sudo(["cp", cfg.nvram_base, cfg.nvram_live], cfg.use_sudo_for_libvirt_files),
             capture_output=True, text=True, timeout=30, check=True)
 
 
@@ -140,7 +167,7 @@ def shutdown_and_cleanup_win11(
             run_cmd(build_virsh_cmd(cfg.libvirt_uri, "destroy", cfg.domain_name),
                     capture_output=True, text=True, timeout=30)
     finally:
-        run_cmd(_fs_cmd(["rm", "-f", cfg.overlay_image], cfg.use_sudo_for_libvirt_files),
+        run_cmd(_maybe_sudo(["rm", "-f", cfg.overlay_image], cfg.use_sudo_for_libvirt_files),
                 capture_output=True, text=True, timeout=30)
 
 
@@ -190,7 +217,7 @@ def render_attack_script(
             "launcher='attack';"
             f"action='{action}';"
             "timestamp_utc=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ');"
-            f"expected_artifact_keys=(ConvertFrom-Json '{exp_json}');"
+            f"expected_artifact_keys=@(ConvertFrom-Json '{exp_json}');"
             "wrapper_pid=$SelfPid;"
             f"seed={int(seed)}"
             "}"
@@ -198,7 +225,6 @@ def render_attack_script(
         lines.append('Write-Output ("PROVENANCE:" + ($prov | ConvertTo-Json -Depth 4 -Compress))')
 
     script = "\n".join(lines) + "\n"
-    # Hard FE-08 check BEFORE anything touches the guest
     import pandas as pd
     assert_clean(pd.DataFrame([{"artifact_key": "rendered_attack", "command_line": script}]),
                  fields=("command_line",), report_path=None)
@@ -208,15 +234,13 @@ def render_attack_script(
 def render_benign_script(benign_ps1_path: Path, seed: int, order: Sequence[str]) -> str:
     body = benign_ps1_path.read_text(encoding="utf-8")
     order_str = ",".join(order)
-    # Invoke inline with explicit parameters via a function wrapper so no file needs staging
-    wrapped = (
+    return (
         f"$__seed = {int(seed)}\n"
         f"$__order = '{order_str}'\n"
         "& {\n"
         f"{body}\n"
         "} -Seed $__seed -Order $__order\n"
     )
-    return wrapped
 
 
 def _extract_provenance(stdout: str, run_id: str, technique_id: str | None, variant: int | None) -> list[dict]:
@@ -231,12 +255,42 @@ def _extract_provenance(stdout: str, run_id: str, technique_id: str | None, vari
     return out
 
 
+def _query_sshd_pids(runner: GuestRunner) -> list[int]:
+    try:
+        res = runner.run_powershell(
+            "$p = @(Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -in @('sshd.exe','sshd-session.exe','ssh-agent.exe') } | "
+            "Select-Object -ExpandProperty ProcessId); "
+            "Write-Output ('SSHD_PIDS=' + ($p -join ','))",
+            timeout_s=30,
+        )
+        m = re.search(r"SSHD_PIDS=([0-9,]*)", res.stdout or "")
+        if m and m.group(1):
+            return sorted({int(x) for x in m.group(1).split(",") if x.strip()})
+    except Exception:
+        pass
+    return []
+
+
 def write_provenance_jsonl(records: Sequence[dict], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, sort_keys=True) + "\n")
     return path
+
+
+def _safe_file_size(path: str | Path) -> int:
+    try:
+        return int(os.stat(path).st_size)
+    except OSError:
+        return 0
+
+
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
 def run_single(
@@ -264,15 +318,29 @@ def run_single(
     out_dir = Path(cfg.run_output_dir) / run_id
     prov_path = Path(provenance_dir) / f"{run_id}.jsonl"
     wrapper_pids: list[int] = []
+    sshd_pids: list[int] = []
     provenance_rows: list[dict] = []
+    timings: dict[str, float] = {}
+    overlay_size_bytes = 0
 
+    t0 = time.monotonic()
     prepare_fresh_win11_state(cfg, run_cmd=run_cmd)
+    timings["reset_s"] = round(time.monotonic() - t0, 3)
+
     try:
+        t0 = time.monotonic()
         run_cmd(build_virsh_cmd(cfg.libvirt_uri, "start", cfg.domain_name),
                 capture_output=True, text=True, timeout=60, check=True)
         runner.wait_ready(timeout_s=cfg.boot_timeout_seconds)
-        sleep_fn(cfg.post_ssh_settle_seconds)
+        timings["boot_to_ssh_s"] = round(time.monotonic() - t0, 3)
 
+        t0 = time.monotonic()
+        sleep_fn(cfg.post_ssh_settle_seconds)
+        timings["settle_s"] = round(time.monotonic() - t0, 3)
+
+        sshd_pids = _query_sshd_pids(runner)
+
+        t0 = time.monotonic()
         if mode == "control":
             provenance_rows.append({
                 "run_id": run_id,
@@ -287,7 +355,6 @@ def run_single(
             assert technique is not None and variant_spec is not None
             sched = build_interleaving_schedule(seed, BENIGN_STEPS, n_attack_steps=len(variant_spec["steps"]))
             b_script = render_benign_script(benign_script, seed, sched.benign_order)
-            # Keep attack steps ordered deterministically inside variant while interleaved against benign
             a_script = render_attack_script(variant_spec, seed)
 
             results: dict[str, CommandResult] = {}
@@ -299,7 +366,7 @@ def run_single(
                     barrier.wait(timeout=30)
                     sleep_fn(offset_s)
                     results[tag] = runner.run_powershell(script_body, timeout_s=cfg.launcher_timeout_seconds)
-                except BaseException as exc:  # pragma: no cover - verified via test_launcher_error
+                except BaseException as exc:  # pragma: no cover
                     errors[tag] = exc
 
             tb = threading.Thread(target=_worker, args=("benign", sched.benign_offset_s, b_script))
@@ -321,27 +388,52 @@ def run_single(
                 ))
         else:
             raise ValueError(f"Unknown mode: {mode!r}")
+        timings["launchers_s"] = round(time.monotonic() - t0, 3)
 
+        exclude_pids = sorted(set(wrapper_pids) | set(sshd_pids))
+        provenance_rows.append({
+            "run_id": run_id,
+            "launcher": "runner_meta",
+            "action": "captured_runner_pids",
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expected_artifact_keys": [],
+            "wrapper_pids": wrapper_pids,
+            "sshd_pids": sshd_pids,
+            "exclude_pids": exclude_pids,
+            "seed": int(seed),
+        })
         write_provenance_jsonl(provenance_rows, prov_path)
-        sleep_fn(cfg.post_launchers_flush_seconds)
 
-        # Ensure guest collector folder exists, upload collector, execute, scp back
+        t0 = time.monotonic()
+        sleep_fn(cfg.post_launchers_flush_seconds)
+        timings["flush_s"] = round(time.monotonic() - t0, 3)
+
+        t0 = time.monotonic()
         guest_out = cfg.guest_collector_out.rstrip("\\")
         runner.run_powershell(f"[void][System.IO.Directory]::CreateDirectory('{guest_out}')", timeout_s=30)
         remote_collector = f"{guest_out}\\Collect-Artifacts.ps1"
         runner.upload_file(collector_script, remote_collector)
 
-        excl_arg = f"-ExcludePids @({','.join(str(p) for p in wrapper_pids)})" if wrapper_pids else ""
+        excl_arg = f"-ExcludePids @({','.join(str(p) for p in exclude_pids)})" if exclude_pids else ""
         collect_cmd = f"& '{remote_collector}' -OutDir '{guest_out}' {excl_arg}".strip()
         col_res = runner.run_powershell(collect_cmd, timeout_s=180)
         if col_res.returncode != 0:
             raise RuntimeError(f"Collector failed in {run_id} (rc={col_res.returncode}): {col_res.stderr}")
+        timings["collection_s"] = round(time.monotonic() - t0, 3)
 
+        t0 = time.monotonic()
         runner.download_dir(guest_out, out_dir)
+        timings["scp_s"] = round(time.monotonic() - t0, 3)
+        overlay_size_bytes = _safe_file_size(cfg.overlay_image)
     finally:
+        t0 = time.monotonic()
         shutdown_and_cleanup_win11(cfg, run_cmd=run_cmd, sleep_fn=sleep_fn)
+        timings["teardown_s"] = round(time.monotonic() - t0, 3)
 
-    duration = round(time.monotonic() - t_start, 2)
+    timings["total_s"] = round(time.monotonic() - t_start, 2)
+    overlay_deleted = not Path(cfg.overlay_image).exists()
+    output_size_bytes = _dir_size_bytes(out_dir)
+
     return {
         "run_id": run_id,
         "mode": mode,
@@ -349,8 +441,13 @@ def run_single(
         "variant": int(variant_spec["variant"]) if variant_spec else 0,
         "split": technique["split"] if technique else "control",
         "status": "success",
-        "duration_s": duration,
+        "duration_s": timings["total_s"],
+        "timings": timings,
         "wrapper_pids": wrapper_pids,
+        "sshd_pids": sshd_pids,
+        "overlay_size_mb": round(overlay_size_bytes / (1024 ** 2), 2),
+        "output_size_mb": round(output_size_bytes / (1024 ** 2), 2),
+        "overlay_deleted": overlay_deleted,
         "provenance_path": str(prov_path),
         "output_dir": str(out_dir),
     }

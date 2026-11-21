@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -47,6 +48,14 @@ class GuestRunner(ABC):
         """Copy a guest directory recursively to the host."""
 
 
+def _win_scp_path(remote_path: str) -> str:
+    """Normalize Windows paths for OpenSSH SCP/SFTP (`C:/dir/file` -> `/C:/dir/file` or `C:/dir/file`)."""
+    p = remote_path.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", p):
+        return "/" + p
+    return p
+
+
 class SSHGuestRunner(GuestRunner):
     """OpenSSH client (`ssh` / `scp`) runner over an isolated libvirt network."""
 
@@ -79,10 +88,10 @@ class SSHGuestRunner(GuestRunner):
         return ["ssh", *self._base_ssh_opts("-p"), f"{self.user}@{self.host}", remote_cmd]
 
     def scp_upload_cmd(self, local_path: Path, remote_path: str) -> list[str]:
-        return ["scp", *self._base_ssh_opts("-P"), str(local_path), f"{self.user}@{self.host}:{remote_path}"]
+        return ["scp", *self._base_ssh_opts("-P"), str(local_path), f"{self.user}@{self.host}:{_win_scp_path(remote_path)}"]
 
     def scp_download_cmd(self, remote_dir: str, local_dir: Path) -> list[str]:
-        return ["scp", "-r", *self._base_ssh_opts("-P"), f"{self.user}@{self.host}:{remote_dir}", str(local_dir)]
+        return ["scp", "-r", *self._base_ssh_opts("-P"), f"{self.user}@{self.host}:{_win_scp_path(remote_dir)}", str(local_dir)]
 
     def wait_ready(self, timeout_s: int = 180, poll_interval_s: float = 3.0) -> float:
         t0 = time.monotonic()
@@ -121,11 +130,30 @@ class SSHGuestRunner(GuestRunner):
     def download_dir(self, remote_dir: str, local_dir: Path, timeout_s: int = 120) -> None:
         local_dir = Path(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
-        # Copy contents inside remote_dir (remote_dir/*) into local_dir
-        src = remote_dir.rstrip("\\/") + "/*"
-        cp = self._run(self.scp_download_cmd(src, local_dir), capture_output=True, text=True, timeout=timeout_s)
-        if cp.returncode != 0:
-            raise RuntimeError(f"scp download failed ({remote_dir} -> {local_dir}): {cp.stderr}")
+        remote_clean = remote_dir.rstrip("\\/")
+        stage_dir = local_dir.parent / f".stage_{local_dir.name}"
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            cp = self._run(self.scp_download_cmd(remote_clean, stage_dir), capture_output=True, text=True, timeout=timeout_s)
+            if cp.returncode != 0:
+                raise RuntimeError(f"scp download failed ({remote_dir} -> {local_dir}): {cp.stderr}")
+            # `scp -r host:/C:/collector_out stage_dir` places files in `stage_dir/collector_out/`
+            remote_name = Path(remote_clean.replace("\\", "/")).name
+            inner = stage_dir / remote_name
+            src_root = inner if inner.is_dir() else stage_dir
+            for item in src_root.iterdir():
+                dest = local_dir / item.name
+                if dest.exists():
+                    if dest.is_dir():
+                        shutil.rmtree(dest)
+                    else:
+                        dest.unlink()
+                shutil.move(str(item), str(dest))
+        finally:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 class QemuGuestAgentRunner(GuestRunner):
@@ -160,7 +188,6 @@ class QemuGuestAgentRunner(GuestRunner):
         raise TimeoutError(f"QEMU guest agent for {self.domain} not ready within {timeout_s}s")
 
     def run_powershell(self, script_text: str, timeout_s: int = 180) -> CommandResult:
-        # Note: QGA guest-exec has no stdin stream; pass neutral script via input-data base64 to guest-exec.
         res = self._qga({
             "execute": "guest-exec",
             "arguments": {

@@ -97,6 +97,9 @@ class _FakeRunner(GuestRunner):
         return 0.5
 
     def run_powershell(self, script_text: str, timeout_s: int = 180) -> CommandResult:
+        if "SSHD_PIDS=" in script_text:
+            self.calls.append("sshd_pids")
+            return CommandResult(0, "SSHD_PIDS=1100,1104\n", "", wrapper_pid=None)
         if script_text.strip().startswith("[void][System.IO.Directory]::CreateDirectory"):
             self.calls.append("mkdir_collector")
             return CommandResult(0, "", "", wrapper_pid=None)
@@ -159,24 +162,40 @@ def test_win11_persistent_domain_lifecycle_and_cleanup(tmp_path):
     )
     assert res["status"] == "success"
     assert set(res["wrapper_pids"]) == {2001, 2002}
+    assert res["sshd_pids"] == [1100, 1104]
+    for k in ("reset_s", "boot_to_ssh_s", "settle_s", "launchers_s", "flush_s",
+              "collection_s", "scp_s", "teardown_s", "total_s"):
+        assert k in res["timings"]
+
     # Never uses transient `virsh create`
     assert not any("create" in c and "virsh" in c for c in cmds)
-    # Must destroy running domain, rebuild overlay from base, restore NVRAM, start win11, shutdown, remove overlay
-    assert ["virsh", "-c", "qemu:///system", "destroy", "win11"] in cmds
-    assert ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", cfg.base_image, cfg.overlay_image] in cmds
-    assert ["cp", "-f", cfg.nvram_base, cfg.nvram_active] in cmds
-    assert ["virsh", "-c", "qemu:///system", "start", "win11"] in cmds
-    assert ["virsh", "-c", "qemu:///system", "shutdown", "win11"] in cmds
+    # Exact reset order: destroy -> rm -f -> qemu-img create -> chown -> cp NVRAM -> virsh start -> shutdown -> rm -f
+    expected_seq = [
+        ["virsh", "-c", "qemu:///system", "destroy", "win11"],
+        ["rm", "-f", cfg.overlay_image],
+        ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", cfg.base_image, cfg.overlay_image],
+        ["chown", cfg.overlay_owner, cfg.overlay_image],
+        ["cp", cfg.nvram_base, cfg.nvram_live],
+        ["virsh", "-c", "qemu:///system", "start", "win11"],
+        ["virsh", "-c", "qemu:///system", "shutdown", "win11"],
+        ["rm", "-f", cfg.overlay_image],
+    ]
+    indices = [cmds.index(c) if i < len(expected_seq) - 1 else len(cmds) - 1 - cmds[::-1].index(c)
+               for i, c in enumerate(expected_seq)]
+    assert indices == sorted(indices)
     assert cmds[-1] == ["rm", "-f", cfg.overlay_image]
 
     # Settle (20s) + flush (5s) occurred
     assert 20 in sleeps and 5 in sleeps
-    # Collector received both wrapper PIDs to exclude
+    # Collector received both sshd and wrapper PIDs to exclude
     col_call = next(c for c in runner.calls if c.startswith("collect:"))
-    assert "-ExcludePids @(2001,2002)" in col_call or "-ExcludePids @(2002,2001)" in col_call
-    # Host provenance log contains both launchers
+    assert "-ExcludePids @(1100,1104,2001,2002)" in col_call
+    # Host provenance log contains both launchers + runner_meta with sshd_pids & wrapper_pids
     prov_lines = [json.loads(l) for l in (tmp_path / "prov" / "run_test_01.jsonl").read_text().splitlines()]
-    assert {r["launcher"] for r in prov_lines} == {"benign", "attack"}
+    assert {r["launcher"] for r in prov_lines} == {"benign", "attack", "runner_meta"}
+    meta_rec = next(r for r in prov_lines if r["launcher"] == "runner_meta")
+    assert meta_rec["sshd_pids"] == [1100, 1104]
+    assert set(meta_rec["wrapper_pids"]) == {2001, 2002}
 
 
 def test_win11_cleanup_runs_on_launcher_failure(tmp_path):
@@ -207,8 +226,13 @@ def test_resume_and_retry_once(tmp_path):
     dry_runs = run_all.build_run_list(cat, dry_run=True)
     dev_rid = dry_runs[1]["run_id"]
     hold_rid = dry_runs[2]["run_id"]
-    runs_dir = tmp_path / "runs"
-    cfg = run_one.LabConfig(run_output_dir=str(runs_dir), min_free_disk_gb=30.0)
+    runs_dir = tmp_path / "dry_runs"
+    cfg = run_one.LabConfig(
+        run_output_dir=str(tmp_path / "runs"),
+        dry_run_output_dir=str(runs_dir),
+        dry_run_provenance_dir=str(tmp_path / "dry_prov"),
+        min_free_disk_gb=30.0,
+    )
     run_table = tmp_path / "run_table.csv"
 
     attempts_seen: dict[str, int] = {}
@@ -248,3 +272,78 @@ def test_disk_guard_aborts_below_30gb(tmp_path):
     with pytest.raises(RuntimeError, match="free disk"):
         run_all.run_batch(cfg, cat, dry_run=True, run_table_path=tmp_path / "rt.csv",
                           single_runner=lambda *a, **kw: {}, disk_usage_fn=low_disk)
+
+
+def test_lab_config_from_yaml_win11_fields():
+    cfg = run_one.LabConfig.from_yaml(config.LAB_DIR / "lab_config.example.yaml")
+    assert cfg.nvram_live == "/var/lib/libvirt/qemu/nvram/win11_VARS.fd"
+    assert cfg.nvram_active == cfg.nvram_live
+    assert cfg.overlay_owner == "nobody:nobody"
+    assert cfg.use_sudo_for_libvirt_files is True
+    assert not hasattr(cfg, "domain_xml_template")
+
+
+def test_sudo_reset_uses_only_five_allowed_binaries():
+    cmds: list[list[str]] = []
+    allowed_sudo_bins = {
+        "/usr/bin/virsh",
+        "/usr/bin/qemu-img",
+        "/usr/bin/chown",
+        "/usr/bin/cp",
+        "/usr/bin/rm",
+    }
+
+    def fake_subproc(cmd, **kwargs):
+        cmds.append(list(cmd))
+        out = "running\n" if "domstate" in cmd and len(cmds) == 1 else "shut off\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    cfg = run_one.LabConfig(use_sudo_for_libvirt_files=True, overlay_owner="nobody:nobody")
+    run_one.prepare_fresh_win11_state(cfg, run_cmd=fake_subproc)
+    run_one.shutdown_and_cleanup_win11(cfg, run_cmd=fake_subproc, sleep_fn=lambda _: None)
+
+    sudo_cmds = [c for c in cmds if c[0] == "sudo"]
+    assert sudo_cmds, "Expected sudo commands when use_sudo_for_libvirt_files=True"
+    for sc in sudo_cmds:
+        assert sc[1] == "-n"
+        assert sc[2] in allowed_sudo_bins
+    assert not any("virsh" in " ".join(c) and "create" in c for c in cmds)
+
+    expected_sudo_seq = [
+        ["sudo", "-n", "/usr/bin/rm", "-f", cfg.overlay_image],
+        ["sudo", "-n", "/usr/bin/qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", cfg.base_image, cfg.overlay_image],
+        ["sudo", "-n", "/usr/bin/chown", "nobody:nobody", cfg.overlay_image],
+        ["sudo", "-n", "/usr/bin/cp", cfg.nvram_base, cfg.nvram_live],
+        ["sudo", "-n", "/usr/bin/rm", "-f", cfg.overlay_image],
+    ]
+    assert sudo_cmds == expected_sudo_seq
+
+
+def test_dry_run_isolation_from_real_runs(tmp_path, monkeypatch):
+    cat = _load_catalog()
+    monkeypatch.setattr(config, "LOGS_DIR", tmp_path / "logs")
+    real_dir = tmp_path / "real_runs"
+    dry_dir = tmp_path / "dry_runs"
+    cfg = run_one.LabConfig(
+        run_output_dir=str(real_dir),
+        dry_run_output_dir=str(dry_dir),
+        dry_run_provenance_dir=str(tmp_path / "dry_prov"),
+        min_free_disk_gb=30.0,
+    )
+    seen_out_dirs: list[str] = []
+
+    def stub_runner(cfg_arg, run_id, mode, technique, variant_spec, seed):
+        seen_out_dirs.append(cfg_arg.run_output_dir)
+        out = Path(cfg_arg.run_output_dir) / run_id
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "manifest.json").write_text("{}", encoding="utf-8")
+        return {"status": "success", "duration_s": 2.0, "timings": {"boot_to_ssh_s": 1.0}}
+
+    Disk = namedtuple("Disk", "total used free")
+    ok_disk = lambda _p: Disk(500 * 1024**3, 100 * 1024**3, 400 * 1024**3)
+    df = run_all.run_batch(cfg, cat, dry_run=True, resume=False, single_runner=stub_runner, disk_usage_fn=ok_disk)
+    assert len(df) == 3
+    assert seen_out_dirs == [str(dry_dir)] * 3
+    assert not real_dir.exists()
+    assert (tmp_path / "logs" / "dry_run_table.csv").exists()
+    assert not (tmp_path / "logs" / "run_table.csv").exists()

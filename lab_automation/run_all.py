@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import shutil
 from pathlib import Path
 from typing import Any, Callable
@@ -104,13 +105,26 @@ def run_batch(
     dry_run: bool = False,
     resume: bool = False,
     n_controls: int = 3,
-    run_table_path: Path = config.LOGS_DIR / "run_table.csv",
+    run_table_path: Path | None = None,
     single_runner: Callable[..., dict[str, Any]] = run_single,
     disk_usage_fn: Callable = shutil.disk_usage,
 ) -> pd.DataFrame:
-    """Execute planned runs with --resume, retry-once on failure, disk guard, and run_table.csv."""
+    """Execute planned runs with --resume, retry-once on failure, disk guard, and run_table.csv.
+
+    Dry runs are isolated into `cfg.dry_run_output_dir`, `cfg.dry_run_provenance_dir`,
+    and `results/logs/dry_run_table.csv` so they never mix with the real 51-run batch.
+    """
     run_list = build_run_list(catalog, dry_run=dry_run, n_controls=n_controls)
-    run_table_path = Path(run_table_path)
+    if dry_run:
+        run_cfg = dataclasses.replace(cfg, run_output_dir=cfg.dry_run_output_dir)
+        prov_dir = Path(cfg.dry_run_provenance_dir)
+        default_table = config.LOGS_DIR / "dry_run_table.csv"
+    else:
+        run_cfg = cfg
+        prov_dir = config.PROVENANCE_DIR
+        default_table = config.LOGS_DIR / "run_table.csv"
+
+    run_table_path = Path(run_table_path) if run_table_path is not None else default_table
     run_table_path.parent.mkdir(parents=True, exist_ok=True)
     commit = get_commit_hash()
 
@@ -119,7 +133,7 @@ def run_batch(
         prev = pd.read_csv(run_table_path)
         for _, row in prev.iterrows():
             rid = str(row["run_id"])
-            manifest_ok = (Path(cfg.run_output_dir) / rid / "manifest.json").exists()
+            manifest_ok = (Path(run_cfg.run_output_dir) / rid / "manifest.json").exists()
             if row.get("status") == "success" and manifest_ok:
                 completed_map[rid] = row.to_dict()
 
@@ -131,29 +145,39 @@ def run_batch(
             records.append(rec)
             continue
 
-        free_gb = check_free_disk_gb(Path(cfg.run_output_dir), disk_usage_fn=disk_usage_fn)
-        if free_gb < cfg.min_free_disk_gb:
+        free_gb = check_free_disk_gb(Path(run_cfg.run_output_dir), disk_usage_fn=disk_usage_fn)
+        if free_gb < run_cfg.min_free_disk_gb:
             raise RuntimeError(
-                f"Aborting before {rid}: free disk {free_gb:.1f} GB < guard {cfg.min_free_disk_gb} GB"
+                f"Aborting before {rid}: free disk {free_gb:.1f} GB < guard {run_cfg.min_free_disk_gb} GB"
             )
 
         last_err = ""
         status = "failed"
         duration_s = 0.0
+        timings: dict[str, float] = {}
+        overlay_mb = 0.0
+        output_mb = 0.0
+        overlay_deleted = False
         attempts = 0
         for attempt in (1, 2):   # retry once on failure (Prompt E spec)
             attempts = attempt
             try:
-                res = single_runner(
-                    cfg,
-                    run_id=rid,
-                    mode=item["mode"],
-                    technique=item["technique"],
-                    variant_spec=item["variant_spec"],
-                    seed=item["seed"],
-                )
+                kwargs: dict[str, Any] = {
+                    "run_id": rid,
+                    "mode": item["mode"],
+                    "technique": item["technique"],
+                    "variant_spec": item["variant_spec"],
+                    "seed": item["seed"],
+                }
+                if single_runner is run_single:
+                    kwargs["provenance_dir"] = prov_dir
+                res = single_runner(run_cfg, **kwargs)
                 status = str(res.get("status", "success"))
                 duration_s = float(res.get("duration_s", 0.0))
+                timings = dict(res.get("timings") or {})
+                overlay_mb = float(res.get("overlay_size_mb", 0.0))
+                output_mb = float(res.get("output_size_mb", 0.0))
+                overlay_deleted = bool(res.get("overlay_deleted", False))
                 last_err = ""
                 break
             except Exception as exc:
@@ -167,6 +191,17 @@ def run_batch(
             "status": status,
             "attempts": attempts,
             "duration_s": duration_s,
+            "reset_s": timings.get("reset_s", 0.0),
+            "boot_to_ssh_s": timings.get("boot_to_ssh_s", 0.0),
+            "settle_s": timings.get("settle_s", 0.0),
+            "launchers_s": timings.get("launchers_s", 0.0),
+            "flush_s": timings.get("flush_s", 0.0),
+            "collection_s": timings.get("collection_s", 0.0),
+            "scp_s": timings.get("scp_s", 0.0),
+            "teardown_s": timings.get("teardown_s", 0.0),
+            "overlay_size_mb": overlay_mb,
+            "output_size_mb": output_mb,
+            "overlay_deleted": overlay_deleted,
             "seed": item["seed"],
             "error": last_err,
             "finished_utc": utc_now_iso(),
@@ -183,10 +218,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Batch Win11 libvirt data-generation runner.")
     parser.add_argument("--config", type=Path, default=config.LAB_DIR / "lab_config.yaml")
     parser.add_argument("--techniques", type=Path, default=config.TECHNIQUES_YAML)
-    parser.add_argument("--dry-run", action="store_true", help="Run 3 runs (1 control, 1 dev, 1 holdout).")
+    parser.add_argument("--dry-run", action="store_true", help="Run 3 isolated dry runs (1 control, 1 dev, 1 holdout).")
     parser.add_argument("--resume", action="store_true", help="Skip runs already succeeded with manifest.json.")
     parser.add_argument("--propose-holdout", action="store_true", help="Print seeded holdout split and exit.")
-    parser.add_argument("--run-table", type=Path, default=config.LOGS_DIR / "run_table.csv")
+    parser.add_argument("--run-table", type=Path, default=None)
     args = parser.parse_args(argv)
 
     catalog = yaml.safe_load(args.techniques.read_text(encoding="utf-8"))
@@ -199,7 +234,9 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = LabConfig.from_yaml(args.config)
     df = run_batch(cfg, catalog, dry_run=args.dry_run, resume=args.resume, run_table_path=args.run_table)
-    print(df[["run_id", "technique", "variant", "status", "duration_s"]].to_string(index=False))
+    cols = [c for c in ("run_id", "technique", "variant", "status", "boot_to_ssh_s", "settle_s",
+                        "launchers_s", "collection_s", "scp_s", "teardown_s", "duration_s") if c in df.columns]
+    print(df[cols].to_string(index=False))
     return 0
 
 
