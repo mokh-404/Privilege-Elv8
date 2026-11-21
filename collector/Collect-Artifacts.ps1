@@ -667,6 +667,9 @@ Run-Stage "process" {
         [void]$children[$ppid].Add([int]$p.ProcessId)
     }
 
+    $sshdNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($sn in @("sshd.exe", "sshd-session.exe", "ssh-agent.exe")) { [void]$sshdNames.Add($sn) }
+
     $selfTree = [System.Collections.Generic.HashSet[int]]::new()
     $queue = [System.Collections.Generic.Queue[int]]::new()
     [void]$queue.Enqueue([int]$PID)
@@ -676,16 +679,30 @@ Run-Stage "process" {
             foreach ($ch in $children[$cur]) { [void]$queue.Enqueue($ch) }
         }
     }
+
+    # Exclude intermediate SSH wrapper ancestors when invoked via sshd (e.g. sshd -> cmd.exe -> powershell.exe)
+    $ancChain = [System.Collections.Generic.List[int]]::new()
+    $ancVisited = [System.Collections.Generic.HashSet[int]]::new()
+    [void]$ancVisited.Add([int]$PID)
+    $walkPid = if ($byPid.ContainsKey([int]$PID)) { [int]$byPid[[int]$PID].ParentProcessId } else { 0 }
+    while ($walkPid -gt 0 -and $byPid.ContainsKey($walkPid) -and $ancVisited.Add($walkPid)) {
+        $ancProc = $byPid[$walkPid]
+        if ($sshdNames.Contains([string]$ancProc.Name)) {
+            foreach ($apid in $ancChain) { [void]$selfTree.Add($apid) }
+            break
+        }
+        [void]$ancChain.Add($walkPid)
+        $walkPid = [int]$ancProc.ParentProcessId
+    }
+
     $paramPidSet = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($ep in $ExcludePids) { [void]$paramPidSet.Add([int]$ep) }
-    $sshdNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($sn in @("sshd.exe", "sshd-session.exe", "ssh-agent.exe")) { [void]$sshdNames.Add($sn) }
 
     foreach ($p in $allProcs) {
-        $pId = [int]$p.ProcessId
-        if ($selfTree.Contains($pId)) { $ExcludedCounts.processes_self_tree++; continue }
+        $procId = [int]$p.ProcessId
+        if ($selfTree.Contains($procId)) { $ExcludedCounts.processes_self_tree++; continue }
         if ($sshdNames.Contains([string]$p.Name)) { $ExcludedCounts.processes_sshd++; continue }
-        if ($paramPidSet.Contains($pId)) { $ExcludedCounts.processes_param_pid++; continue }
+        if ($paramPidSet.Contains($procId)) { $ExcludedCounts.processes_param_pid++; continue }
         if ((Is-ExcludedPath $p.ExecutablePath) -or (Is-ExcludedPath $p.CommandLine)) {
             $ExcludedCounts.processes_param_path++
             continue
@@ -697,10 +714,12 @@ Run-Stage "process" {
         }
         $execPath = Expand-NormPath $p.ExecutablePath
         $fmeta = if ($execPath) { Get-FileMetadata $execPath } else { $null }
-        $keyPath = if ($execPath) { "$execPath#$pId" } else { "pid#$pId" }
+        $cmdNorm = if ([string]::IsNullOrWhiteSpace($p.CommandLine)) { "" } else { $p.CommandLine.Trim().ToLowerInvariant() }
+        $cmdTag = if ($cmdNorm) { (Compute-Sha256Hex ($Utf8NoBom.GetBytes($cmdNorm))).Substring(0, 8) } else { "nocmd" }
+        $keyPath = if ($execPath) { "$execPath#$cmdTag" } else { "$($p.Name)#$cmdTag" }
         Add-ArtifactRecord -ArtifactType "process" -PathOrKey $keyPath -Name $p.Name `
             -Path $execPath -CommandLine $p.CommandLine -ParentName $pParentName `
-            -PidVal $pId -PpidVal ([int]$p.ParentProcessId) -FileMeta $fmeta `
+            -PidVal $procId -PpidVal ([int]$p.ParentProcessId) -FileMeta $fmeta `
             -CreatedUtc (To-UtcIso $p.CreationDate)
     }
 }

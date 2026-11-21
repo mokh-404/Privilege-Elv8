@@ -30,13 +30,21 @@ class SanitizationError(AssertionError):
         )
 
 
-def find_forbidden(text: object, patterns: Sequence = config.FORBIDDEN_PATTERNS) -> list[str]:
+def find_forbidden(
+    text: object,
+    patterns: Sequence = config.FORBIDDEN_PATTERNS,
+    allowlist: Sequence = config.FE08_BENIGN_OS_ALLOWLIST,
+) -> list[str]:
     """Return every forbidden-token match in `text` (empty list if clean or not a string)."""
     if text is None or not isinstance(text, str) or text == "":
         return []
+    allowed_spans = [(am.start(), am.end()) for ap in allowlist for am in ap.finditer(text)]
     hits: list[str] = []
     for pat in patterns:
-        hits.extend(m.group(0) for m in pat.finditer(text))
+        for m in pat.finditer(text):
+            if any(a0 <= m.start() and m.end() <= a1 for a0, a1 in allowed_spans):
+                continue
+            hits.append(m.group(0))
     return hits
 
 

@@ -61,3 +61,12 @@ def test_collector_covers_hku_sshd_amcache_and_pipe_sep():
     # No PowerShell 7-only ternary/null-coalescing operators (must stay PS 5.1 compatible)
     assert " ? " not in src
     assert " ?? " not in src
+
+
+def test_collector_no_powershell_autovar_assignments():
+    forbidden = {"pid", "host", "home", "input", "args", "true", "false", "null", "error", "psscriptroot", "pscommandpath"}
+    for p in (PS1, SMOKE_PS1):
+        src = p.read_text(encoding="utf-8")
+        assigned = re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)\s*=", src)
+        collisions = [v for v in assigned if v.lower() in forbidden]
+        assert not collisions, f"{p.name} assigns PowerShell automatic variable(s): {collisions}"

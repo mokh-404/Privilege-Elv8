@@ -75,3 +75,10 @@ def test_patterns_are_the_spec_patterns():
     pats = [p.pattern for p in sanitize.config.FORBIDDEN_PATTERNS]
     assert len(pats) == 4
     assert pats[3] == r"(?<![A-Za-z])ART(?![A-Za-z])"
+
+
+def test_benign_msvc_atomic_wait_allowlisted_without_weakening_fe08():
+    assert find_forbidden("msvcp140_atomic_wait.dll") == []
+    assert find_forbidden(r"C:\Users\mokh\AppData\Local\Microsoft\OneDrive\25.087.0506.0001\msvcp140_atomic_wait.dll") == []
+    # Path outside allowlisted token carrying a real forbidden token must still be flagged
+    assert find_forbidden(r"C:\AtomicRedTeam\msvcp140_atomic_wait.dll") == ["AtomicRedTeam"]

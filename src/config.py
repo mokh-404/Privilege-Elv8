@@ -153,6 +153,13 @@ FORBIDDEN_PATTERNS = [
     re.compile(r"(?<![A-Za-z])ART(?![A-Za-z])"),                           # case-sensitive
 ]
 
+# Narrow span allowlist for legitimate signed OS/runtime filenames that contain a forbidden
+# substring (e.g. Microsoft VC++20 std::atomic::wait DLL shipped with Windows 11 OneDrive).
+# Rows are NOT scrubbed or dropped; only matches strictly inside an allowlisted token span are ignored.
+FE08_BENIGN_OS_ALLOWLIST = [
+    re.compile(r"(?<![A-Za-z0-9_])msvcp\d+_atomic_wait\.dll(?![A-Za-z0-9_])", re.I),
+]
+
 # --------------------------------------------------------------------------------------
 # Runner footprint exclusion (DS-10). Rows matching these are dropped BEFORE sanitization
 # and logged to RUNNER_FOOTPRINT_LOG_CSV. Per-run PIDs (sshd.exe, launcher wrapper shells,
