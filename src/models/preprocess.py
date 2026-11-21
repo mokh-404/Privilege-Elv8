@@ -68,7 +68,7 @@ def build_preprocessor(
             list(categorical),
         ))
     if numeric:
-        steps = [("impute", SimpleImputer(strategy="constant", fill_value=0, add_indicator=True))]
+        steps = [("impute", SimpleImputer(strategy="constant", fill_value=0, add_indicator=True, keep_empty_features=True))]
         if scale_numeric:
             steps.append(("scale", StandardScaler()))
         transformers.append(("num", Pipeline(steps), list(numeric)))
@@ -131,6 +131,9 @@ class SharedPreprocessor:
         self.fitted = True
         self.feature_origin_ = output_feature_origin(self.ct)
         self.feature_names_ = list(self.ct.get_feature_names_out())
+        assert len(self.feature_origin_) == len(self.feature_names_), (
+            f"feature_origin_ ({len(self.feature_origin_)}) != feature_names_ ({len(self.feature_names_)})"
+        )
         return self
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:

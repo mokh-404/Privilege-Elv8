@@ -124,3 +124,10 @@ def test_preprocessor_numeric_only_track_b():
     pre = SharedPreprocessor(categorical=[], numeric=["a", "b"], binary=[]).fit(df)
     X = pre.transform(df)
     assert X.shape == (3, 3)   # a, b, missing-indicator(a)
+
+
+def test_preprocessor_keeps_all_nan_numeric_column():
+    df = pd.DataFrame({"a": [np.nan, np.nan, np.nan], "b": [1.0, 2.0, 3.0]})
+    pre = SharedPreprocessor(categorical=[], numeric=["a", "b"], binary=[]).fit(df)
+    X = pre.transform(df)
+    assert X.shape[1] == len(pre.feature_origin_) == len(pre.feature_names_) == 3

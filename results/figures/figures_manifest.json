@@ -1,0 +1,28 @@
+{
+  "commit": "a157c67765d7f620d8c1eab2a8123b9f43cc93bf-dirty",
+  "figures": [
+    {
+      "commit": "a157c67765d7f620d8c1eab2a8123b9f43cc93bf-dirty",
+      "dpi": 300,
+      "figure": "fig7_track_b_comparison",
+      "file": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/results/figures/fig7_track_b_comparison.png",
+      "format": "png",
+      "source_csvs": [
+        "track_b_split1.csv",
+        "track_b_split2.csv"
+      ]
+    },
+    {
+      "commit": "a157c67765d7f620d8c1eab2a8123b9f43cc93bf-dirty",
+      "dpi": 300,
+      "figure": "fig7_track_b_comparison",
+      "file": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/results/figures/fig7_track_b_comparison.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_b_split1.csv",
+        "track_b_split2.csv"
+      ]
+    }
+  ],
+  "generated_at_utc": "2026-11-21T02:56:54Z"
+}
