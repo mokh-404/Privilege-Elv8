@@ -20,6 +20,7 @@
 | [v2/REFGRAPH_SPEC.md](v2/REFGRAPH_SPEC.md) | Static referential graph specification (context-split nodes, 4 MFT states, experimental forward Prefetch hashing, training-pool IHF, 3 propagation baselines, leakage rules) |
 | [v2/REFGRAPH_FEASIBILITY_V1_DEV.md](v2/REFGRAPH_FEASIBILITY_V1_DEV.md) | Step E4 read-only v1-dev referential-graph link coverage feasibility audit (`5.16%` outgoing / `10.33%` any cold-disk link rate; v2 extractor recommendations) |
 | [v2/NOVELTY_VERIFICATION.md](v2/NOVELTY_VERIFICATION.md) | Step E6 prior-art verification ledger from `v2/concept_a_gap_audit.md` (`[1]`–`[137]` cataloged with every row marked `UNVERIFIED` + 2026 anomaly flags) |
+| [v2/FEATURE_PARITY_AUDIT.md](v2/FEATURE_PARITY_AUDIT.md) | Step F0 live-v1 vs offline-v2 parity audit of all 20 locked `full_20` features, `OD-V2-02` `process`-row exclusion impact, and clean-image parity test procedure |
 | [v2/hardening/POINTER_CAPTURE_SPEC.md](v2/hardening/POINTER_CAPTURE_SPEC.md) | Offline unprivileged-container pointer-capture schema & v1 collector gap audit (`OD-V2-04`, `OD-V2-16`) |
 | [v2/plan.md](../v2/plan.md) | Reconciled Phase 1 implementation tracker and step checklist (`Steps A, B, C.1, Concept C, C.2, E1–E7`, deferred `C.3, C.4, C.6, D`) |
 
