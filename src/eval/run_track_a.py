@@ -324,6 +324,91 @@ def evaluate_score_vector(
     return row
 
 
+def compute_paired_comparisons(
+    df: pd.DataFrame,
+    y: np.ndarray,
+    score_map: dict[str, np.ndarray],
+    arm_names: dict[str, str] | None = None,
+    pairs: Sequence[tuple[str, str]] | None = None,
+    group_by: str = "run_id",
+    n_boot: int = config.N_BOOTSTRAP,
+    seed: int = config.BOOTSTRAP_SEED,
+) -> pd.DataFrame:
+    """Paired cluster bootstrap PR-AUC comparisons across all / hard-negative views."""
+    names = arm_names or {**config.ARM_DISPLAY, **BASELINE_DISPLAY}
+    if pairs is None:
+        ml_keys = [k for k in score_map if k not in BASELINE_DISPLAY]
+        best_ml = max(ml_keys, key=lambda k: M.pr_auc(y, score_map[k])) if ml_keys else None
+        raw_pairs: list[tuple[str, str]] = [("xgb", "rf")]
+        if best_ml is not None:
+            raw_pairs.append((best_ml, "rules_binary"))
+        if best_ml != "rf":
+            raw_pairs.append(("rf", "rules_binary"))
+        if best_ml != "xgb":
+            raw_pairs.append(("xgb", "rules_binary"))
+        raw_pairs.extend([("rf", "mlp"), ("xgb", "mlp")])
+        seen: set[tuple[str, str]] = set()
+        use_pairs: list[tuple[str, str]] = []
+        for a, b in raw_pairs:
+            if (a, b) not in seen and a != b and a in score_map and b in score_map:
+                seen.add((a, b))
+                use_pairs.append((a, b))
+    else:
+        use_pairs = [(a, b) for a, b in pairs if a in score_map and b in score_map]
+
+    slices: list[tuple[str, np.ndarray]] = [("all", np.ones(len(df), dtype=bool))]
+    if "artifact_type" in df.columns:
+        at = df["artifact_type"].astype(str)
+        hn_mask = at.isin(HARD_NEG_ARTIFACT_TYPES).to_numpy()
+        if hn_mask.any():
+            slices.append(("file+run_key+task", hn_mask))
+            if config.LABEL_COL in df.columns:
+                hn_drift = hn_mask & (df[config.LABEL_COL].astype(str) != "baseline").to_numpy()
+                if hn_drift.any():
+                    slices.append(("file+run_key+task_drift_only", hn_drift))
+
+    commit = get_commit_hash()
+    rows: list[dict[str, Any]] = []
+    for slice_name, mask in slices:
+        sub_df = df.iloc[mask].reset_index(drop=True)
+        y_sub = y[mask]
+        n_pos = int((y_sub == 1).sum())
+        n_neg = int((y_sub == 0).sum())
+        for arm_a, arm_b in use_pairs:
+            res = M.paired_bootstrap_track_a(
+                M.pr_auc,
+                y_sub,
+                score_map[arm_a][mask],
+                score_map[arm_b][mask],
+                sub_df,
+                group_by=group_by,
+                n_boot=n_boot,
+                seed=seed,
+            )
+            rows.append({
+                "artifact_slice": slice_name,
+                "arm_a": arm_a,
+                "arm_a_name": names.get(arm_a, arm_a),
+                "arm_b": arm_b,
+                "arm_b_name": names.get(arm_b, arm_b),
+                "n_rows": int(len(sub_df)),
+                "n_pos": n_pos,
+                "n_neg": n_neg,
+                "pr_auc_a": float(res["point_a"]),
+                "pr_auc_b": float(res["point_b"]),
+                "diff": float(res["diff"]),
+                "ci_lo": float(res["ci_lo"]),
+                "ci_hi": float(res["ci_hi"]),
+                "excludes_zero": bool(res["excludes_zero"]),
+                "verdict": str(res["verdict"]),
+                "group_by": str(res["group_by"]),
+                "n_boot_valid": int(res["n_boot_valid"]),
+                "seed": int(seed),
+                "commit": commit,
+            })
+    return pd.DataFrame(rows)
+
+
 def evaluate_by_artifact_type(
     df: pd.DataFrame,
     y: np.ndarray,
@@ -513,6 +598,11 @@ def run_dev_cv(
 
     by_type_df = evaluate_by_artifact_type(dev_df, y_dev, score_map, arm_names, n_boot=n_boot)
     by_type_df.to_csv(out_tables_dir / "track_a_dev_by_artifact_type.csv", index=False)
+
+    paired_df = compute_paired_comparisons(
+        dev_df, y_dev, score_map, arm_names, group_by="run_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED,
+    )
+    paired_df.to_csv(out_tables_dir / "track_a_dev_paired_bootstrap.csv", index=False)
 
     # Per-technique dev OOF breakdown against all dev benign rows
     dev_techniques = sorted(dev_df.loc[y_dev == 1, "technique_id"].astype(str).unique())
@@ -845,6 +935,9 @@ def run_final_eval(
     pr_df = pd.DataFrame(pr_rows)
     baselines_df = pd.DataFrame(baseline_rows)
     by_type_df = evaluate_by_artifact_type(test_df, y_test, score_map, arm_names, n_boot=n_boot)
+    paired_df = compute_paired_comparisons(
+        test_df, y_test, score_map, arm_names, group_by="run_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED,
+    )
 
     # Feature-subset probes evaluated once on frozen test set (fitted on full dev_df)
     probe_rows: list[dict[str, Any]] = []
@@ -869,6 +962,7 @@ def run_final_eval(
     pr_df.to_csv(out_tables_dir / "track_a_pr_curves.csv", index=False)
     baselines_df.to_csv(out_tables_dir / "track_a_test_baselines.csv", index=False)
     by_type_df.to_csv(out_tables_dir / "track_a_test_by_artifact_type.csv", index=False)
+    paired_df.to_csv(out_tables_dir / "track_a_test_paired_bootstrap.csv", index=False)
     probes_df.to_csv(out_tables_dir / "track_a_test_probes.csv", index=False)
     preds_df.to_parquet(out_tables_dir / "track_a_test_predictions.parquet", index=False)
 
@@ -895,6 +989,7 @@ def run_final_eval(
         "predictions": preds_df,
         "baselines": baselines_df,
         "by_artifact_type": by_type_df,
+        "paired_bootstrap": paired_df,
         "probes": probes_df,
     }
 

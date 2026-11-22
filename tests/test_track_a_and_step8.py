@@ -128,6 +128,7 @@ def test_track_a_end_to_end_final_guard_ablations_shap_and_figures(tmp_path):
     assert (tables_dir / "track_a_dev_by_artifact_type.csv").exists()
     assert (tables_dir / "track_a_dev_per_technique.csv").exists()
     assert (tables_dir / "track_a_dev_oof_predictions.parquet").exists()
+    assert (tables_dir / "track_a_dev_paired_bootstrap.csv").exists()
 
     # 2. Tampered test hash must fail
     tampered = ds.copy()
@@ -152,6 +153,11 @@ def test_track_a_end_to_end_final_guard_ablations_shap_and_figures(tmp_path):
     assert set(res["baselines"]["arm"]) == {"rules_binary", "rules_count", "random"}
     assert {"all", "file+run_key+task", "file+run_key+task_drift_only"} <= set(res["by_artifact_type"]["artifact_slice"])
     assert set(res["probes"]["probe"]) == set(run_track_a.PROBE_FEATURE_SETS)
+    assert "paired_bootstrap" in res and (tables_dir / "track_a_test_paired_bootstrap.csv").exists()
+    pb = res["paired_bootstrap"]
+    assert {"artifact_slice", "arm_a", "arm_b", "diff", "ci_lo", "ci_hi", "excludes_zero", "verdict"} <= set(pb.columns)
+    all_pairs = set(zip(pb.loc[pb["artifact_slice"] == "all", "arm_a"], pb.loc[pb["artifact_slice"] == "all", "arm_b"]))
+    assert {("xgb", "rf"), ("rf", "mlp")} <= all_pairs
     assert len(res["t5"]) == 5 * 5   # 5 holdout techniques x 5 arms
 
     with pytest.raises(RuntimeError, match="--force"):

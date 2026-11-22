@@ -204,32 +204,13 @@ def _build_group_map(indices: np.ndarray, keys: np.ndarray) -> tuple[np.ndarray,
     return uniq, {k: indices[sub_keys == k] for k in uniq}
 
 
-def bootstrap_track_a(
-    metric: Callable[[np.ndarray, np.ndarray], float],
-    y,
-    scores,
-    df,
-    group_by: str = "run_id",
-    n_boot: int = 1000,
-    seed: int = 42,
-    alpha: float = 0.05,
-) -> dict:
-    """Stratified percentile bootstrap CI for Track A by 'run_id' or 'technique_id'.
-
-    Because deduplicated `baseline` rows are anchored largely to ctrl_01 and benign rows
-    have no technique_id:
-      - group_by='run_id': cluster non-baseline rows (label != 'baseline') by `run_id`
-        and resample baseline rows independently with replacement.
-      - group_by='technique_id': cluster positive rows (y == 1) by `technique_id`,
-        cluster `benign_drift` rows by `run_id`, and resample `baseline` rows by row.
-    """
+def _prepare_track_a_strata(y: np.ndarray, df, group_by: str) -> dict:
+    """Build stratification/cluster index structures for Track A bootstrap."""
     if group_by not in ("run_id", "technique_id"):
         raise ValueError(f"group_by must be 'run_id' or 'technique_id', got {group_by!r}")
-    y, s = _arr(y, scores)
     if len(y) != len(df):
         raise ValueError(f"df length ({len(df)}) != y length ({len(y)})")
 
-    point = float(metric(y, s))
     has_label = "label" in df.columns
     has_run = "run_id" in df.columns
     has_tech = "technique_id" in df.columns
@@ -249,49 +230,95 @@ def bootstrap_track_a(
     tech_vals = df["technique_id"].fillna("UNKNOWN").astype(str).to_numpy() if has_tech else np.empty(0, dtype=str)
 
     if group_by == "run_id":
-        if has_run and len(non_base_idx):
-            nb_uniq, nb_map = _build_group_map(non_base_idx, run_vals)
-        else:
-            nb_uniq, nb_map = np.empty(0, dtype=str), {}
+        nb_uniq, nb_map = _build_group_map(non_base_idx, run_vals) if (has_run and len(non_base_idx)) else (np.empty(0, dtype=str), {})
+        pos_uniq, pos_map = np.empty(0, dtype=str), {}
+        dr_uniq, dr_map = np.empty(0, dtype=str), {}
     else:
-        if has_tech and len(pos_idx):
-            pos_uniq, pos_map = _build_group_map(pos_idx, tech_vals)
-        else:
-            pos_uniq, pos_map = np.empty(0, dtype=str), {}
-        if has_run and len(drift_idx):
-            dr_uniq, dr_map = _build_group_map(drift_idx, run_vals)
-        else:
-            dr_uniq, dr_map = np.empty(0, dtype=str), {}
+        nb_uniq, nb_map = np.empty(0, dtype=str), {}
+        pos_uniq, pos_map = _build_group_map(pos_idx, tech_vals) if (has_tech and len(pos_idx)) else (np.empty(0, dtype=str), {})
+        dr_uniq, dr_map = _build_group_map(drift_idx, run_vals) if (has_run and len(drift_idx)) else (np.empty(0, dtype=str), {})
+
+    return {
+        "base_idx": base_idx,
+        "drift_idx": drift_idx,
+        "non_base_idx": non_base_idx,
+        "pos_idx": pos_idx,
+        "nb_uniq": nb_uniq,
+        "nb_map": nb_map,
+        "pos_uniq": pos_uniq,
+        "pos_map": pos_map,
+        "dr_uniq": dr_uniq,
+        "dr_map": dr_map,
+    }
+
+
+def _sample_track_a_indices(strata: dict, group_by: str, rng: np.random.Generator) -> np.ndarray | None:
+    """Draw one stratified/clustered bootstrap index vector (exact RNG draw order)."""
+    parts: list[np.ndarray] = []
+    if group_by == "run_id":
+        nb_uniq = strata["nb_uniq"]
+        if len(nb_uniq):
+            pick = rng.choice(nb_uniq, size=len(nb_uniq), replace=True)
+            nb_map = strata["nb_map"]
+            parts.extend(nb_map[p] for p in pick)
+        elif len(strata["non_base_idx"]):
+            nb_i = strata["non_base_idx"]
+            parts.append(rng.choice(nb_i, size=len(nb_i), replace=True))
+        if len(strata["base_idx"]):
+            b_i = strata["base_idx"]
+            parts.append(rng.choice(b_i, size=len(b_i), replace=True))
+    else:
+        pos_uniq = strata["pos_uniq"]
+        if len(pos_uniq):
+            pick_t = rng.choice(pos_uniq, size=len(pos_uniq), replace=True)
+            pos_map = strata["pos_map"]
+            parts.extend(pos_map[p] for p in pick_t)
+        elif len(strata["pos_idx"]):
+            p_i = strata["pos_idx"]
+            parts.append(rng.choice(p_i, size=len(p_i), replace=True))
+        dr_uniq = strata["dr_uniq"]
+        if len(dr_uniq):
+            pick_d = rng.choice(dr_uniq, size=len(dr_uniq), replace=True)
+            dr_map = strata["dr_map"]
+            parts.extend(dr_map[p] for p in pick_d)
+        elif len(strata["drift_idx"]):
+            d_i = strata["drift_idx"]
+            parts.append(rng.choice(d_i, size=len(d_i), replace=True))
+        if len(strata["base_idx"]):
+            b_i = strata["base_idx"]
+            parts.append(rng.choice(b_i, size=len(b_i), replace=True))
+    return np.concatenate(parts) if parts else None
+
+
+def bootstrap_track_a(
+    metric: Callable[[np.ndarray, np.ndarray], float],
+    y,
+    scores,
+    df,
+    group_by: str = "run_id",
+    n_boot: int = 1000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> dict:
+    """Stratified percentile bootstrap CI for Track A by 'run_id' or 'technique_id'.
+
+    Because deduplicated `baseline` rows are anchored largely to ctrl_01 and benign rows
+    have no technique_id:
+      - group_by='run_id': cluster non-baseline rows (label != 'baseline') by `run_id`
+        and resample baseline rows independently with replacement.
+      - group_by='technique_id': cluster positive rows (y == 1) by `technique_id`,
+        cluster `benign_drift` rows by `run_id`, and resample `baseline` rows by row.
+    """
+    y, s = _arr(y, scores)
+    strata = _prepare_track_a_strata(y, df, group_by)
+    point = float(metric(y, s))
 
     rng = np.random.default_rng(seed)
     vals: list[float] = []
     for _ in range(int(n_boot)):
-        parts: list[np.ndarray] = []
-        if group_by == "run_id":
-            if len(nb_uniq):
-                pick = rng.choice(nb_uniq, size=len(nb_uniq), replace=True)
-                parts.extend(nb_map[p] for p in pick)
-            elif len(non_base_idx):
-                parts.append(rng.choice(non_base_idx, size=len(non_base_idx), replace=True))
-            if len(base_idx):
-                parts.append(rng.choice(base_idx, size=len(base_idx), replace=True))
-        else:
-            if len(pos_uniq):
-                pick_t = rng.choice(pos_uniq, size=len(pos_uniq), replace=True)
-                parts.extend(pos_map[p] for p in pick_t)
-            elif len(pos_idx):
-                parts.append(rng.choice(pos_idx, size=len(pos_idx), replace=True))
-            if len(dr_uniq):
-                pick_d = rng.choice(dr_uniq, size=len(dr_uniq), replace=True)
-                parts.extend(dr_map[p] for p in pick_d)
-            elif len(drift_idx):
-                parts.append(rng.choice(drift_idx, size=len(drift_idx), replace=True))
-            if len(base_idx):
-                parts.append(rng.choice(base_idx, size=len(base_idx), replace=True))
-
-        if not parts:
+        idx = _sample_track_a_indices(strata, group_by, rng)
+        if idx is None:
             continue
-        idx = np.concatenate(parts)
         y_b = y[idx]
         if (y_b == 1).sum() == 0 or (y_b == 0).sum() == 0:
             continue
@@ -303,6 +330,74 @@ def bootstrap_track_a(
         return {"point": point, "lo": float("nan"), "hi": float("nan"), "n_boot_valid": 0, "group_by": group_by}
     lo, hi = np.quantile(vals, [alpha / 2, 1 - alpha / 2])
     return {"point": point, "lo": float(lo), "hi": float(hi), "n_boot_valid": len(vals), "group_by": group_by}
+
+
+def paired_bootstrap_track_a(
+    metric: Callable[[np.ndarray, np.ndarray], float],
+    y,
+    scores_a,
+    scores_b,
+    df,
+    group_by: str = "run_id",
+    n_boot: int = 1000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> dict:
+    """Paired stratified percentile bootstrap for metric(A) - metric(B) on shared clusters."""
+    y_a, sa = _arr(y, scores_a)
+    y_b_chk, sb = _arr(y, scores_b)
+    if sa.shape != sb.shape:
+        raise ValueError(f"scores_a and scores_b differ in shape: {sa.shape} vs {sb.shape}")
+    strata = _prepare_track_a_strata(y_a, df, group_by)
+
+    point_a = float(metric(y_a, sa))
+    point_b = float(metric(y_b_chk, sb))
+    diff = point_a - point_b
+
+    rng = np.random.default_rng(seed)
+    diffs: list[float] = []
+    for _ in range(int(n_boot)):
+        idx = _sample_track_a_indices(strata, group_by, rng)
+        if idx is None:
+            continue
+        y_sub = y_a[idx]
+        if (y_sub == 1).sum() == 0 or (y_sub == 0).sum() == 0:
+            continue
+        va = float(metric(y_sub, sa[idx]))
+        vb = float(metric(y_sub, sb[idx]))
+        if not (np.isnan(va) or np.isnan(vb)):
+            diffs.append(va - vb)
+
+    if not diffs or np.isnan(diff):
+        return {
+            "point_a": point_a,
+            "point_b": point_b,
+            "diff": diff,
+            "ci_lo": float("nan"),
+            "ci_hi": float("nan"),
+            "excludes_zero": False,
+            "verdict": "not distinguishable",
+            "n_boot_valid": 0,
+            "group_by": group_by,
+        }
+    lo, hi = np.quantile(diffs, [alpha / 2, 1 - alpha / 2])
+    lo_f, hi_f = float(lo), float(hi)
+    excludes_zero = bool(lo_f > 0.0 or hi_f < 0.0)
+    if excludes_zero:
+        verdict = "a_better" if lo_f > 0.0 else "b_better"
+    else:
+        verdict = "not distinguishable"
+    return {
+        "point_a": point_a,
+        "point_b": point_b,
+        "diff": float(diff),
+        "ci_lo": lo_f,
+        "ci_hi": hi_f,
+        "excludes_zero": excludes_zero,
+        "verdict": verdict,
+        "n_boot_valid": len(diffs),
+        "group_by": group_by,
+    }
 
 
 def ranking_report(y, scores, ks: Sequence[int] = (10, 50, 100), recall: float = 0.9,

@@ -182,3 +182,48 @@ def test_bootstrap_track_a_run_and_technique():
     s_nb = s[(df["label"] != "baseline").to_numpy()]
     nb_ci = M.bootstrap_track_a(M.pr_auc, y_nb, s_nb, no_base, group_by="run_id", n_boot=25, seed=1)
     assert nb_ci["n_boot_valid"] > 0 and nb_ci["lo"] <= nb_ci["point"] <= nb_ci["hi"]
+
+
+def test_paired_bootstrap_track_a_run_id():
+    rows = []
+    for _ in range(60):
+        rows.append({"run_id": "ctrl_01", "technique_id": None, "label": "baseline"})
+    for r in range(8):
+        rid = f"run_{r}"
+        for _ in range(6):
+            rows.append({"run_id": rid, "technique_id": None, "label": "benign_drift"})
+        for _ in range(3):
+            rows.append({"run_id": rid, "technique_id": f"T{r % 4}", "label": "attacker_induced"})
+    df = pd.DataFrame(rows)
+    y = (df["label"] == "attacker_induced").astype(int).to_numpy()
+    rng = np.random.default_rng(11)
+    s_good = np.clip(rng.normal(0.15 + 0.70 * y, 0.08), 0.0, 1.0)
+    s_weak = np.clip(rng.normal(0.35 + 0.20 * y, 0.20), 0.0, 1.0)
+
+    r1 = M.paired_bootstrap_track_a(M.pr_auc, y, s_good, s_weak, df, group_by="run_id", n_boot=60, seed=42)
+    r2 = M.paired_bootstrap_track_a(M.pr_auc, y, s_good, s_weak, df, group_by="run_id", n_boot=60, seed=42)
+    assert r1 == r2
+    assert r1["group_by"] == "run_id"
+    assert r1["n_boot_valid"] == 60
+    assert r1["diff"] > 0.0
+    assert r1["ci_lo"] > 0.0 and r1["excludes_zero"] is True and r1["verdict"] == "a_better"
+
+    rev = M.paired_bootstrap_track_a(M.pr_auc, y, s_weak, s_good, df, group_by="run_id", n_boot=60, seed=42)
+    assert rev["diff"] == pytest.approx(-r1["diff"])
+    assert rev["ci_lo"] == pytest.approx(-r1["ci_hi"])
+    assert rev["ci_hi"] == pytest.approx(-r1["ci_lo"])
+    assert rev["excludes_zero"] is True and rev["verdict"] == "b_better"
+
+    same = M.paired_bootstrap_track_a(M.pr_auc, y, s_good, s_good, df, group_by="run_id", n_boot=60, seed=42)
+    assert same["diff"] == pytest.approx(0.0)
+    assert same["ci_lo"] == pytest.approx(0.0) and same["ci_hi"] == pytest.approx(0.0)
+    assert same["excludes_zero"] is False and same["verdict"] == "not distinguishable"
+
+    # Pairing variance reduction on correlated rankings sharing run-level difficulty
+    s_twin = s_good + rng.normal(0.0, 0.02, size=len(s_good))
+    marg_a = M.bootstrap_track_a(M.pr_auc, y, s_good, df, group_by="run_id", n_boot=60, seed=42)
+    marg_b = M.bootstrap_track_a(M.pr_auc, y, s_twin, df, group_by="run_id", n_boot=60, seed=42)
+    paired_ab = M.paired_bootstrap_track_a(M.pr_auc, y, s_good, s_twin, df, group_by="run_id", n_boot=60, seed=42)
+    paired_width = paired_ab["ci_hi"] - paired_ab["ci_lo"]
+    sum_marg_widths = (marg_a["hi"] - marg_a["lo"]) + (marg_b["hi"] - marg_b["lo"])
+    assert paired_width < sum_marg_widths
