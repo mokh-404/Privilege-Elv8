@@ -13,6 +13,9 @@
 | [PRE_51_LAUNCH.md](PRE_51_LAUNCH.md) | Pre-51-run stratified benign shortcut alignment audit (`ALL STOPPING CRITERIA SATISFIED: True`, max numeric AUC `0.6865`, max categorical gap `17.5pp`) |
 | [WORK_SUMMARY.md](WORK_SUMMARY.md) | Archived Step 1–7 pre-Step-8 execution checkpoint (Win11 51-run batch details, 8 label corrections, 6 kept `.pf` drift audits, per-technique coverage) |
 | [WINDOWS_11_LAB_SETUP.md](WINDOWS_11_LAB_SETUP.md) | Windows 11 libvirt/QEMU/KVM + UEFI Secure Boot + swtpm 2.0 guest image build & snapshot isolation guide |
+| [IMPROVEMENT_ANALYSIS.md](IMPROVEMENT_ANALYSIS.md) | Post-v1 read-only codebase, statistics, safety, and labeling audit (prioritized P0/P1/P2 findings + top 10 before v2) |
+| [v2/V2_PLAN.md](v2/V2_PLAN.md) | Pilot-first v2 plan (real executed/dormant malware strata, safety gate, offline labeling, blind freeze, learning curves, open questions) |
+| [v2/FINAL_EVAL_PLAN_v2_SKELETON.md](v2/FINAL_EVAL_PLAN_v2_SKELETON.md) | Draft pre-registration skeleton for v2 (all `[TBD]` fields pending pilot & blind-test freeze) |
 
 ## Original Phase-1 Design Specifications (`docs/specs/`)
 
