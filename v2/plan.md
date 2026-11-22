@@ -1,6 +1,6 @@
 # DFIR-Triage ML — v2 Phase 1 Implementation Tracker (`v2/plan.md`)
 
-**Status:** `IN PROGRESS — STEPS A, B, C.1, CONCEPT C, C.2 COMPLETE; EXECUTING STEPS E1–E7 (HARD STOP AFTER STEP E7)`  
+**Status:** `PHASE 1 STEPS A, B, C.1, CONCEPT C, C.2, E1–E7 COMPLETE — HARD STOP AWAITING MOKH CONFIRMATION FOR C.3, C.4, C.6, D`  
 **Repository:** `dfir-triage-ml` (branch `main`, base commit `ca73589`)  
 **Scope:** Phase 1 preparation ONLY — **NO malware acquisition, downloads, or execution**, **NO VM runs**, **NO host firewall, network, or libvirt domain XML changes applied**. Written institutional approval & Gate 0 sign-off (`OD-V2-07`) remain **PENDING**.
 
@@ -42,14 +42,14 @@ Comparing the initial `v2/plan.md` draft (commit `ca73589`) against Mokh's confi
 - **STEP C.1 (Hygiene, Schema & Refgraph Edge Columns):** *(Done — `366020a`)* `IMP-15` pytest hygiene + repo-hygiene tests; `IMP-07` 15 v2 provenance columns (incl. `pair_group_id`) + 3 refgraph edge columns (`ref_targets`, `ref_type`, `linked_artifact_keys`) in `FORBIDDEN_MODEL_INPUTS`; `IMP-13` export `task_name`, `service_name`, `start_mode`, `task_triggers`, `account_is_admin`, `account_enabled`.
 - **CONCEPT C (Cross-Stratum Execution Delta):** *(Done — `098a8c7`)* Formalize paired `sample_sha256` (`pair_group_id`) sampling across `dormant` + `executed`, anti-leakage holdout assertions, $\Delta_{\text{exec}}$, $\Delta_{\text{first\_hit}}$ ($\text{Rank}_{\min}$ + Intrusion-Detection Recall@k), and Byte/Signature Evasion Resilience Hypothesis across `OPERATOR_DECISIONS.md`, `V2_PLAN.md`, and `FINAL_EVAL_PLAN_v2_SKELETON.md`.
 - **STEP C.2 (Training Integrity as v2 Code Paths):** *(Done — `a14de03`)* `src/v2/config_v2.py`, `src/v2/models_v2.py`, `src/v2/training.py` (`iforest`/non-ES arms fit 100% eligible dev; `ae`/`mlp` early-stop strictly on disjoint inner grouped validation split; `K=5` seeds; nested family-grouped CV; equal `30`-trial budget with `20` fallback; split-local preprocessing; label-free vs `"label-selected"` unsup selection).
-- **STEPS E1–E7 (Concept A Static Referential Graph Additions):**
-  - **E1:** Record confirmed `OD-V2-16..19` in `OPERATOR_DECISIONS.md`, update `V2_PLAN.md`, `v2/plan.md`, `docs/INDEX.md`.
-  - **E2:** Offline pointer-capture schema & v1 collector gap audit in `docs/v2/hardening/POINTER_CAPTURE_SPEC.md`.
-  - **E3:** Write `docs/v2/REFGRAPH_SPEC.md` (nodes/edges, context-split, obfuscation, 4 MFT states, experimental Prefetch hashing, training-only IHF, 3 propagation baselines, leakage rules).
-  - **E4:** Read-only link-coverage feasibility audit on `dataset_v1.parquet` (`split_pool == "dev"` ONLY) in `src/v2/refgraph_audit.py` + `docs/v2/REFGRAPH_FEASIBILITY_V1_DEV.md`.
-  - **E5:** Prototype `src/v2/refgraph.py` link resolver + 3 propagation variants with synthetic hub-collapse and leakage-guard tests in `tests/test_v2_refgraph.py`.
-  - **E6:** Catalog all prior works from `v2/concept_a_gap_audit.md` in `docs/v2/NOVELTY_VERIFICATION.md` with every item marked `UNVERIFIED`.
-  - **E7:** Update `docs/v2/FINAL_EVAL_PLAN_v2_SKELETON.md` (`v2_refgraph` 3-variant comparison per stratum on PR-AUC, `effort@recall`, review-budget recall, tail risk; Concept C secondary; `OD-V2-19` deferred stretch). **HARD STOP AFTER STEP E7.**
+- **STEPS E1–E7 (Concept A Static Referential Graph Additions):** *(Done)*
+  - **E1:** *(Done — `03d0113`)* Record confirmed `OD-V2-16..19` in `OPERATOR_DECISIONS.md`, update `V2_PLAN.md`, `v2/plan.md`, `docs/INDEX.md`.
+  - **E2:** *(Done — `6f88605`)* Offline pointer-capture schema & v1 collector gap audit in `docs/v2/hardening/POINTER_CAPTURE_SPEC.md`.
+  - **E3:** *(Done — `a181e14`)* Write `docs/v2/REFGRAPH_SPEC.md` (nodes/edges, context-split, obfuscation, 4 MFT states, experimental Prefetch hashing, training-only IHF, 3 propagation baselines, leakage rules).
+  - **E4:** *(Done — `5bcfc0c`)* Read-only link-coverage feasibility audit on `dataset_v1.parquet` (`split_pool == "dev"` ONLY) in `src/v2/refgraph_audit.py` + `docs/v2/REFGRAPH_FEASIBILITY_V1_DEV.md`.
+  - **E5:** *(Done — `7ec7642`)* Prototype `src/v2/refgraph.py` link resolver + 3 propagation variants with synthetic hub-collapse and leakage-guard tests in `tests/test_v2_refgraph.py`.
+  - **E6:** *(Done — `b22d62a`)* Catalog all prior works from `v2/concept_a_gap_audit.md` in `docs/v2/NOVELTY_VERIFICATION.md` with every item marked `UNVERIFIED`.
+  - **E7:** *(Done)* Update `docs/v2/FINAL_EVAL_PLAN_v2_SKELETON.md` (`v2_refgraph` 3-variant comparison per stratum on PR-AUC, `effort@recall`, review-budget recall, tail risk; Concept C secondary; `OD-V2-19` deferred stretch). **HARD STOP AFTER STEP E7.**
 - **STEP C.3 (Statistics — deferred past E7 stop):** 10,000-perm MC random baseline, family-clustered paired bootstrap p-values + Holm-Bonferroni over fixed pairs, dev-calibrated thresholds from nested OOF, tie-expected P@k, LOFO dev table, dev-only/config-matched/guarded ablations, and `OD-V2-14` tail-risk/effort metrics.
 - **STEP C.4 (Labeling & Review — deferred past E7 stop):** Synthetic-tested process-tree/multi-control/dormant/`ambiguous_unattributed` v2 labeler, separated blinded review export (friend primary, Mokh 20% overlap Cohen's $\kappa$, non-overwrite guard).
 - **STEP C.6 (Realism Audit & Benign Generator Design — deferred past E7 stop):** Update `scripts/verify_stratified_shortcuts.py` with real sizes/byte histograms; design varied benign generator + template-quantization check (no VM code).

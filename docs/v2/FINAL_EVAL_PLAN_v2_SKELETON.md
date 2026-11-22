@@ -37,9 +37,10 @@ All forbidden columns (`ORACLE_FEATURES`, `RULE_FEATURES`, `META_COLUMNS` incl. 
 2. **`no_content`** *(18 features; drops `file_size_log`, `file_entropy` — isolates non-byte structural signals & tests dormant visibility limits)*.
 
 ### Secondary Pre-Registered Schemas (Strictly Outside `full_20`/`no_content` & Winner Rule)
-3. **`v2_refgraph` (`OD-V2-13`, Secondary Pre-Registered Arm):**
-   - Built **ONLY** from static cross-references extracted from the artifacts' own content (`ref_targets`, `ref_type`, `linked_artifact_keys` — e.g., Run key value -> target image path, service `ImagePath` -> binary, scheduled task action -> script/binary, Prefetch referenced files).
-   - **Zero leakage rule:** Links must **NEVER** use labeling provenance, Sysmon event logs, process trees, or timestamps. Raw edge columns are barred from `full_20` and `no_content` via `FORBIDDEN_MODEL_INPUTS`; only the dedicated `v2_refgraph` feature builder may read them to compute derived numeric graph features.
+3. **`v2_refgraph` (`OD-V2-13`, `OD-V2-16`, `OD-V2-17`, `OD-V2-18`, Secondary Pre-Registered Arm):**
+   - Built **ONLY** from schema-validated static cross-references and raw pointer fields captured offline (`OD-V2-16`, [`hardening/POINTER_CAPTURE_SPEC.md`](hardening/POINTER_CAPTURE_SPEC.md); zero executable payloads), exposed as `ref_targets`, `ref_type`, and `linked_artifact_keys` (`src.config.REFGRAPH_EDGE_COLUMNS`) per [`REFGRAPH_SPEC.md`](REFGRAPH_SPEC.md).
+   - **Zero leakage rule:** Links must **NEVER** use labels, labeling provenance, Sysmon event logs, process trees (`pid`, `ppid`, `parent_name`, `process_tree_root_guid`), or timestamps (`LeakageError` enforced by `assert_graph_inputs_clean()`). Raw pointer and edge columns are strictly barred from `full_20` and `no_content` via `FORBIDDEN_MODEL_INPUTS`.
+   - Evaluates three interpretable propagation baselines (`OD-V2-17`): **`(a)` base ranker alone**, **`(b)` naive undirected propagation**, and **`(c)` hub-attenuated typed propagation** (Heterogeneous GNNs such as R-GCN/GAT remain deferred outside v2 core per `OD-V2-18`).
    - Reported strictly in its own secondary table block; **never** enters `full_20`/`no_content` or the primary dual-config winner rule.
 4. **`[TBD: optional v2_extended]`** *(strictly secondary if added, never mixed into the `full_20`/`no_content` primary winner rule)*.
 
@@ -72,7 +73,11 @@ Rows flagged `ambiguous_unattributed` during automated Sysmon/ETW + diff labelin
   - Positives in bottom 50% and bottom 90% of model scores (`pos_in_bottom_50pct`, `pos_in_bottom_90pct`),
   - `effort@recall` (`effort_at_recall_50`, `effort_at_recall_80`, `effort_at_recall_90` — count and fraction of artifacts reviewed to reach 50%, 80%, and 90% recall).
   - **Random Tail Audit Sample-Size Calculator *(Future Work Only)*:** Observing `0` missed positives in $n$ uniform random tail draws yields a 95% upper bound on the missed-positive rate of $p_{\text{upper}}(n) = 1 - 0.05^{1/n}$ (e.g., $n = 5 \to 45.1\%$, $n = 59 \to 5.0\%$, $n = 300 \to 1.0\%$). Any live/field tail audit is deferred strictly as **future work only**.
-- **Referential-Graph Arm (`v2_refgraph`, `OD-V2-13`, Secondary Pre-Registered):** Evaluated with the exact same dev-calibrated/nested pipeline on static cross-reference features; reported in its own secondary table block alongside per-type link coverage.
+- **Referential-Graph Arm (`v2_refgraph`, `OD-V2-13`, `OD-V2-16`, `OD-V2-17`, Secondary Pre-Registered):**
+  - **Three-Variant Comparison (`OD-V2-17`):** Compare `(a)` unpropagated OOF base ranker alone vs `(b)` naive undirected unsplit propagation (hub-collapse baseline) vs `(c)` hub-attenuated typed propagation (context-split unidirectional `EXECUTES_IMAGE`, training-pool-only IHF weighting, four-state `$MFT` ref resolution, and additive per-edge source contributions per [`REFGRAPH_SPEC.md`](REFGRAPH_SPEC.md)). Heterogeneous GNNs (`R-GCN`, `GAT`) remain deferred outside v2 core (`OD-V2-18`).
+  - **Per-Stratum Reporting:** Reported in its own secondary table block **separately per blind-test stratum (`executed`, `dormant`)** (plus dev-only `emulated` disclosure where applicable), alongside per-`artifact_type` static link coverage and `resolved` / `dangling` / `ambiguous` MFT/path counts.
+  - **Evaluation Metrics Compared Across `(a)`, `(b)`, `(c)`:** `PR-AUC`, `effort@recall` (`50%`, `80%`, `90%` — artifact count and fraction), recall at fixed analyst review budgets (`k in {10, 20, 50, 100}`), and `OD-V2-14` tail-risk metrics (`worst_positive_rank`, `pos_in_bottom_50pct`, `pos_in_bottom_90pct`), with family-clustered paired bootstrap 95% CIs and two-sided paired family-clustered bootstrap `p_raw` for `(c) vs (a)` and `(c) vs (b)` (strictly outside the primary dual-config winner rule).
+  - **Strict OOF & Anti-Leakage Invariants:** Graph propagation consumes **strictly out-of-fold (OOF) base scores** inside dev CV and `--final` tuning (never in-sample fits); `RefGraphIDFModel` ($\text{df}_{\text{train}}$, $|\mathcal{D}_{\text{train}}|$) and degree statistics fit solely on training folds (`assert_graph_inputs_clean()` blocks labels, provenance, Sysmon, process-tree fields, and timestamps with `LeakageError`).
 
 ### Cross-Stratum Execution Delta (`executed` vs `dormant` on Paired `sample_sha256` Binaries, `OD-V2-15`, Secondary Pre-Registered)
 Evaluated strictly over paired `sample_sha256` binaries ($s \in \mathcal{S}_{\text{paired}}$, linked by `pair_group_id`) tested in both `dormant` (unexecuted staging run) and `executed` (detonated from the matching initial staging path) strata within the same split pool:
@@ -95,7 +100,7 @@ Evaluated strictly over paired `sample_sha256` binaries ($s \in \mathcal{S}_{\te
 ## 5. Multi-Seed Training, Nested Dev CV & Equal Tuning Budgets
 
 - **Models Evaluated (All Preserved in Every Table):** Supervised: `rf`, `xgb`, `mlp`, `lr`; Unsupervised (benign-only `fit` + benign-only `pre.fit`, `n_attack_seen_in_fit_ == 0`): `ae`, `iforest` (default selection strictly label-free; any labeled-val selection explicitly tagged `"label-selected"`).
-- **Nested Family-Grouped CV (Dev):** Outer `[TBD: 5]`-fold family-grouped CV estimates unbiased dev PR-AUC (+ leave-one-family-out LOFO table); inner `[TBD: 4]`-fold family-grouped CV tunes hyperparameters with an **equal trial budget `[TBD: 30 (fallback 20 if pilot compute heavy)]`** per tuned arm.
+- **Nested Family-Grouped CV (Dev):** Outer `[TBD: 5]`-fold family-grouped CV estimates unbiased dev PR-AUC (+ leave-one-family-out LOFO table); inner `[TBD: 4]`-fold family-grouped CV tunes hyperparameters with an **equal trial budget `[TBD: 30 (fallback 20 if pilot compute heavy)]`** per tuned arm (including `v2_refgraph` propagation hyperparameters tuned solely inside inner nested CV over OOF base predictions and training-fold-only IHF statistics).
 - **Early Stopping & Effective Training Size:** `mlp` and `ae` early-stop exclusively on disjoint **inner** grouped validation splits (never outer CV validation folds). Unsupervised `iforest` and all non-early-stopped arms train on `100%` of eligible dev rows (never dropping a fold for unused `X_val`). Config-matched hyperparameters are mandatory for `full_20` vs `no_content`, `v2_refgraph`, and all ablations.
 - **Multi-Seed `--final` Protocol:** Run across `K = 5` independent seeds (`seeds = [TBD: 42, 43, 44, 45, 46]`), reporting single-seed mean ± std PR-AUC alongside the K-seed ensemble score for both dev and blind test.
 
@@ -122,7 +127,16 @@ Evaluated strictly over paired `sample_sha256` binaries ($s \in \mathcal{S}_{\te
 
 ---
 
-## 7. Pre-`--final` Execution & Sign-Off Gate
+## 7. Deferred Post-v2-Final Stretch Items (`OD-V2-19` — Strictly After v2 `--final`)
+
+The following stretch evaluations are explicitly **deferred until after v2 `--final` completes**, must never influence v2 dev modeling or blind-test freeze decisions, and keep external prior-art comparisons in [`NOVELTY_VERIFICATION.md`](NOVELTY_VERIFICATION.md) tagged **`UNVERIFIED`** until primary sources are checked (to our knowledge, pending verification):
+1. **Timestomp / Temporal-Baseline Robustness Experiment:** Evaluate static pointer-based propagation alongside a temporal-window grouping baseline before and after deterministic timestamp perturbation on synthetic images.
+2. **Prefetch-Disabled Windows Server Ablation (`EnablePrefetcher = 0`):** Quantify secondary `v2_refgraph` degradation and fallback link yield when `.pf` records are absent and links rely solely on `$MFT`, Registry (`Run`/`CLSID`/`Services`), Scheduled Tasks, WMI, Amcache, Shimcache, and LNK/JumpLists.
+3. **Public Third-Party Corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`):** Evaluated strictly as **qualitative case studies with zero hyperparameter tuning** and zero feedback into v2 split selection.
+
+---
+
+## 8. Pre-`--final` Execution & Sign-Off Gate
 
 ```text
 [TBD: Exact v2 CLI commands populated and verified after Phase 4 dev run completes]
