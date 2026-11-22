@@ -848,12 +848,13 @@ def _eval_single_config_on_test(
     set_global_seed(config.SEED)
 
     test_meta_cols = [
-        c for c in (
+        c for c in dict.fromkeys([
             "run_id", "technique_id", "variant", "artifact_type", "artifact_key",
             "name", "path", "command_line", "registry_key", "registry_value",
             "signature_status", "attributes", "file_sha256", "record_sha256",
+            *config.RULE_EXPORT_COLUMNS,
             config.LABEL_COL, "rule_hit_count",
-        )
+        ])
         if c in test_df.columns
     ]
     preds_df = test_df[test_meta_cols].copy()

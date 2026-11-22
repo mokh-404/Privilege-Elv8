@@ -27,15 +27,15 @@ class LeakageError(AssertionError):
 
 
 def assert_no_forbidden_inputs(columns: Iterable[str], allowed_extra: Iterable[str] = ()) -> None:
-    """Refuse ORACLE_FEATURES, RULE_FEATURES, META_COLUMNS and the label as model inputs.
+    """Refuse ORACLE_FEATURES, RULE_FEATURES, META_COLUMNS, REFGRAPH_EDGE_COLUMNS and label.
 
     `allowed_extra` is only used by clearly named ablations (e.g. ["rule_hit_count"]).
-    The label and META columns can never be allowed.
+    META_COLUMNS (including v2 provenance), REFGRAPH_EDGE_COLUMNS, and LABEL_COL can never be allowed.
     """
     allowed = set(allowed_extra)
-    never = set(config.META_COLUMNS) | {config.LABEL_COL}
+    never = set(config.META_COLUMNS) | set(config.REFGRAPH_EDGE_COLUMNS) | {config.LABEL_COL}
     if allowed & never:
-        raise LeakageError(f"META/label columns can never be model inputs: {sorted(allowed & never)}")
+        raise LeakageError(f"META/refgraph/label columns can never be model inputs: {sorted(allowed & never)}")
     bad = (set(columns) & set(config.FORBIDDEN_MODEL_INPUTS)) - allowed
     if bad:
         raise LeakageError(f"Forbidden model inputs present: {sorted(bad)}")

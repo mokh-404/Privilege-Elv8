@@ -191,6 +191,8 @@ def test_labeler_end_to_end_diff_dedupe_and_no_leakage(tmp_path):
         processed_dir=proc_dir,
         splits_dir=splits_dir,
         baseline_snapshot_utc="2026-11-21T01:10:00Z",
+        runner_log_path=tmp_path / "runner_footprint_dropped.csv",
+        sanitization_report=tmp_path / "sanitization_failures.csv",
     )
     ds = res["dataset"]
     # Runner footprint dropped (sshd.exe & pid=999 gone)
@@ -220,10 +222,17 @@ def test_labeler_end_to_end_diff_dedupe_and_no_leakage(tmp_path):
 def test_labeler_rejects_forbidden_tokens(tmp_path):
     df = pd.DataFrame([{"artifact_key": "file|x|Atomic_Test_1.exe", "artifact_type": "file", "name": "Atomic_Test_1.exe"}])
     with pytest.raises(SanitizationError):
-        labeler.label_run(df, {}, [], run_id="r1", sanitization_report=tmp_path / "fail.csv")
+        labeler.label_run(
+            df,
+            {},
+            [],
+            run_id="r1",
+            runner_log_path=tmp_path / "runner_footprint_dropped.csv",
+            sanitization_report=tmp_path / "fail.csv",
+        )
 
 
-def test_label_does_not_depend_on_timestamps_or_rules():
+def test_label_does_not_depend_on_timestamps_or_rules(tmp_path):
     # A clean harmless row inside the attack time window without attack provenance -> benign_drift, NOT attacker_induced
     df = pd.DataFrame([{
         "artifact_type": "file",
@@ -238,6 +247,8 @@ def test_label_does_not_depend_on_timestamps_or_rules():
             "launcher": "attack", "timestamp_utc": "2026-11-21T02:00:00Z", "expected_artifact_keys": ["file|other|other"],
         }],
         run_id="r1",
+        runner_log_path=tmp_path / "runner_footprint_dropped.csv",
+        sanitization_report=tmp_path / "sanitization_failures.csv",
     )
     # Even though RULE-015 would fire on a .ps1 in C:\Users\Public and timestamp is in window, label must be benign_drift
     assert R.evaluate_row(df.iloc[0])
@@ -274,6 +285,7 @@ def test_build_dataset_excludes_dry_runs_by_default_and_handles_runner_meta(tmp_
         run_table_csv=tmp_path / "missing_rt.csv",
         processed_dir=tmp_path / "proc_excl", splits_dir=tmp_path / "sp_excl",
         runner_log_path=tmp_path / "dropped_excl.csv",
+        sanitization_report=tmp_path / "san_excl.csv",
         exclude_dry_runs=True,
     )
     assert res_excl["manifest"]["n_runs"] == 1
@@ -285,6 +297,7 @@ def test_build_dataset_excludes_dry_runs_by_default_and_handles_runner_meta(tmp_
         run_table_csv=tmp_path / "missing_rt.csv",
         processed_dir=tmp_path / "proc_incl", splits_dir=tmp_path / "sp_incl",
         runner_log_path=tmp_path / "dropped_incl.csv",
+        sanitization_report=tmp_path / "san_incl.csv",
         exclude_dry_runs=False,
     )
     assert res_incl["manifest"]["n_runs"] == 2

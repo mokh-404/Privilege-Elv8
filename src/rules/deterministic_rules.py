@@ -121,6 +121,23 @@ def _raw_dict(row: Mapping[str, Any]) -> dict:
     return r if isinstance(r, dict) else {}
 
 
+def _optional_bool(val: Any, default: bool = False) -> bool:
+    if val is None:
+        return default
+    try:
+        if pd.isna(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low in ("false", "0", "no", ""):
+            return False
+        if low in ("true", "1", "yes"):
+            return True
+    return bool(val)
+
+
 def evaluate_row(row: Mapping[str, Any]) -> list[RuleMatch]:
     """Evaluate all 15 deterministic rules on one normalised artifact row."""
     hits: list[RuleMatch] = []
@@ -228,9 +245,23 @@ def evaluate_row(row: Mapping[str, Any]) -> list[RuleMatch]:
             hits.append(_match("RULE-012", f"Non-default Winlogon {name} '{reg_val}'"))
 
     # RULE-013: Local account creation command or non-default local Administrator account
+    acc_is_admin = (
+        _optional_bool(raw.get("is_admin"), default=False)
+        if "is_admin" in raw
+        else _optional_bool(row.get("account_is_admin"), default=False)
+    )
+    acc_enabled = (
+        _optional_bool(raw.get("enabled"), default=True)
+        if "enabled" in raw
+        else (
+            not _optional_bool(raw.get("disabled"), default=False)
+            if "disabled" in raw
+            else _optional_bool(row.get("account_enabled"), default=True)
+        )
+    )
     if (re.search(r"(?i)\bnet(?:\.exe)?\s+user\b.*\s/add\b", cmd_low)
             or "new-localuser" in cmd_low
-            or (at == "account" and bool(raw.get("is_admin")) and raw.get("enabled", True)
+            or (at == "account" and acc_is_admin and acc_enabled
                 and name_low not in {"administrator"})):
         hits.append(_match("RULE-013", f"Local account creation or non-default local admin '{name or cmd[:60]}'"))
 

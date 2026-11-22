@@ -82,14 +82,43 @@ assert len(FEATURES) == 20
 # Never in the main model:
 ORACLE_FEATURES = ["file_age_minutes", "created_in_window"]   # oracle ablation only
 RULE_FEATURES = ["rule_hit_count"]                            # rule-hit ablation only
-META_COLUMNS = ["run_id", "technique_id", "variant", "launcher", "artifact_key"]
+V1_META_COLUMNS = ["run_id", "technique_id", "variant", "launcher", "artifact_key"]
+V2_PROVENANCE_COLUMNS = [
+    "schema_version",
+    "sample_sha256",
+    "sample_family",
+    "sample_category",
+    "sample_source",
+    "execution_state",
+    "run_duration_s",
+    "detonation_exit_status",
+    "process_tree_root_guid",
+    "attribution_method",
+    "attribution_confidence",
+    "packer_cluster",
+    "label_review_status",
+    "stratum",
+    "pair_group_id",
+]
+META_COLUMNS = V1_META_COLUMNS + V2_PROVENANCE_COLUMNS
+REFGRAPH_EDGE_COLUMNS = ["ref_targets", "ref_type", "linked_artifact_keys"]
+RULE_EXPORT_COLUMNS = [
+    "task_name",
+    "service_name",
+    "start_mode",
+    "task_triggers",
+    "account_is_admin",
+    "account_enabled",
+]
 LABEL_COL = "label"   # attacker_induced | benign_drift | baseline -> y = (label == "attacker_induced")
 POSITIVE_LABEL = "attacker_induced"
 BENIGN_LABELS = ["baseline", "benign_drift"]
 LABEL_VALUES = [POSITIVE_LABEL] + BENIGN_LABELS
-assert not set(FEATURES) & set(ORACLE_FEATURES + RULE_FEATURES + META_COLUMNS + [LABEL_COL])
 
-FORBIDDEN_MODEL_INPUTS = frozenset(ORACLE_FEATURES + RULE_FEATURES + META_COLUMNS + [LABEL_COL])
+FORBIDDEN_MODEL_INPUTS = frozenset(
+    ORACLE_FEATURES + RULE_FEATURES + META_COLUMNS + REFGRAPH_EDGE_COLUMNS + [LABEL_COL]
+)
+assert not set(FEATURES) & set(FORBIDDEN_MODEL_INPUTS)
 
 # Categorical level sets. "na" is always a level. Core 8 levels come from doc 10;
 # extra levels (file, shimcache, wmi_subscription, registry, other) were approved by the

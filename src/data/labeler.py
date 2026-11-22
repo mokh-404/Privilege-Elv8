@@ -436,6 +436,7 @@ def build_dataset(
     seed: int = config.SEED,
     exclude_dry_runs: bool = True,
     runner_log_path: str | Path | None = config.RUNNER_FOOTPRINT_LOG_CSV,
+    sanitization_report: str | Path | None = config.SANITIZATION_FAILURES_CSV,
 ) -> dict[str, Any]:
     """End-to-end Step 7 builder: baseline index -> label -> dedupe -> features -> parquet + manifest."""
     raw_runs_dir = Path(raw_runs_dir)
@@ -503,7 +504,7 @@ def build_dataset(
             exclude_pids=ps["exclude_pids"],
             log_path=runner_log_path,
         )
-        sanitize.assert_clean(kept)
+        sanitize.assert_clean(kept, report_path=sanitization_report)
         baseline_dfs_clean.append(kept)
     baseline_index = build_baseline_index(baseline_dfs_clean)
 
@@ -516,6 +517,7 @@ def build_dataset(
         labelled_parts.append(label_run(
             cdf, baseline_index, prov_r, run_id=rid, is_control=True,
             runner_log_path=runner_log_path,
+            sanitization_report=sanitization_report,
         ))
 
     for rid, adf, prov_r, tid, var_num in attack_runs:
@@ -528,27 +530,57 @@ def build_dataset(
             adf, baseline_index, prov_r, run_id=rid,
             technique_spec=tspec, variant_spec=vspec, is_control=False,
             runner_log_path=runner_log_path,
+            sanitization_report=sanitization_report,
         ))
 
     all_labelled = pd.concat(labelled_parts, ignore_index=True)
     dedup = deduplicate_and_assign_splits(all_labelled, catalog)
+
+    if "raw" in dedup.columns:
+        raw_series = dedup["raw"]
+        if "account_is_admin" not in dedup.columns:
+            def _ext_admin(r: Any) -> Any:
+                if isinstance(r, dict) and "is_admin" in r and r["is_admin"] is not None:
+                    return bool(r["is_admin"])
+                return pd.NA
+
+            dedup["account_is_admin"] = pd.Series(
+                [_ext_admin(v) for v in raw_series], index=dedup.index, dtype="boolean"
+            )
+        if "account_enabled" not in dedup.columns:
+            def _ext_enabled(r: Any) -> Any:
+                if isinstance(r, dict):
+                    if "enabled" in r and r["enabled"] is not None:
+                        return bool(r["enabled"])
+                    if "disabled" in r and r["disabled"] is not None:
+                        return not bool(r["disabled"])
+                return pd.NA
+
+            dedup["account_enabled"] = pd.Series(
+                [_ext_enabled(v) for v in raw_series], index=dedup.index, dtype="boolean"
+            )
 
     # 3. Deterministic rule counts + 20 locked features + isolated oracle columns
     _, rule_counts = deterministic_rules.evaluate_dataframe(dedup)
     # Compute features row-by-row with per-run window for oracle_features only
     feat_rows = []
     oracle_rows = []
-    sanitize.assert_clean(dedup)
+    sanitize.assert_clean(dedup, report_path=sanitization_report)
     for _, r in dedup.iterrows():
         feat_rows.append(features.row_features(r))
         oracle_rows.append(features.oracle_features(r, baseline_snapshot_utc, windows_by_run.get(str(r["run_id"]))))
 
     feat_df = pd.DataFrame(feat_rows, columns=config.FEATURES)
     oracle_df = pd.DataFrame(oracle_rows, columns=config.ORACLE_FEATURES)
-    meta_extra = ["run_id", "technique_id", "variant", "launcher", "artifact_key",
-                  "name", "path", "command_line", "registry_key", "registry_value",
-                  "signature_status", "attributes", "file_sha256", "record_sha256",
-                  "label", "label_reason", "split_pool", "dev_fold", "seen_run_ids", "seen_count"]
+    meta_extra = list(dict.fromkeys([
+        "run_id", "technique_id", "variant", "launcher", "artifact_key",
+        "name", "path", "command_line", "registry_key", "registry_value",
+        "signature_status", "attributes", "file_sha256", "record_sha256",
+        *config.RULE_EXPORT_COLUMNS,
+        *config.V2_PROVENANCE_COLUMNS,
+        *config.REFGRAPH_EDGE_COLUMNS,
+        "label", "label_reason", "split_pool", "dev_fold", "seen_run_ids", "seen_count",
+    ]))
     keep_meta = [c for c in meta_extra if c in dedup.columns]
     dataset = pd.concat([
         dedup[keep_meta].reset_index(drop=True),
