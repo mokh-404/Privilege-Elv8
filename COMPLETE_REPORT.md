@@ -20,8 +20,8 @@
   * **Random Forest (`rf`)** achieves the highest point PR-AUC in both configurations: **`0.8902`** (`[0.7605, 0.9887]` 95% `run_id` CI; [`results/tables/track_a_test_results.csv`](results/tables/track_a_test_results.csv)) in `full_20` and **`0.7078`** (`[0.5270, 0.8410]`; [`results/tables/no_content/track_a_test_results.csv`](results/tables/no_content/track_a_test_results.csv)) in `no_content`, with `P@10 = 0.9000` in both and `0.9821` (`full_20`) / `0.7586` (`no_content`) on the `file+run_key+task` hard-negative view ([`results/tables/track_a_test_by_artifact_type.csv`](results/tables/track_a_test_by_artifact_type.csv)).
   * **ML vs. Rules:** Both `rf` (`+0.6421` `full_20` / `+0.4597` `no_content`) and `xgb` (`+0.6071` / `+0.3768`) significantly outperform `rules_binary` (`0.2481`; [`results/tables/track_a_test_baselines.csv`](results/tables/track_a_test_baselines.csv)) across every evaluated slice in both configurations (`dual_verdict = a_better`; [`results/tables/track_a_test_dual_config_verdict.csv`](results/tables/track_a_test_dual_config_verdict.csv)).
   * **No Strict ML Overall Winner:** Under the dual-configuration paired bootstrap rule (`xgb vs rf` = `configuration-dependent`, `xgb vs mlp` = `not distinguishable`, `rf vs mlp` = `configuration-dependent`), no single ML architecture statistically dominates across both feature sets on `33` test positives / `5` techniques ([`results/tables/track_a_test_dual_config_verdict.csv`](results/tables/track_a_test_dual_config_verdict.csv)).
-* **Headline Track B (`CIC-MalMem-2022`) Benchmark:**
-  * Public memory-forensics dataset (`Obfuscated-MalMem2022.csv`, `58,596 x 57`, MD5 `7a969ce248207e80af81bdf73601601a`; [`results/logs/track_b_meta.json`](results/logs/track_b_meta.json)) shows saturated scores on leaky Split 1 (`1.0000` PR-AUC; [`results/tables/track_b_split1.csv`](results/tables/track_b_split1.csv)), while family-grouped Split 2 exposes benign-shift test-FPR inflation (`8.1%–22.3%` at nominal 1% benign-val FPR; [`results/tables/track_b_split2.csv`](results/tables/track_b_split2.csv)).
+* **Headline Track B (`CIC-MalMem-2022`, Secondary / Appendix Benchmark):**
+  * Public memory-forensics dataset (`Obfuscated-MalMem2022.csv`, `58,596 x 57`, MD5 `7a969ce248207e80af81bdf73601601a`; [`results/logs/track_b_meta.json`](results/logs/track_b_meta.json)) shows saturated scores on leaky Split 1 (`1.0000` PR-AUC; [`results/tables/track_b_split1.csv`](results/tables/track_b_split1.csv)), while family-grouped Split 2 exposes benign-shift test-FPR inflation (`8.1%–22.3%` at nominal 1% benign-val FPR; [`results/tables/track_b_split2.csv`](results/tables/track_b_split2.csv)). Track B is strictly a **secondary/appendix analysis** on a different task and data modality (memory-dump features, malware vs. benign classification) and is **not** part of the Track A host-artifact triage model ranking.
 
 ---
 
@@ -136,7 +136,7 @@ The 6 remaining `.pf` `os_or_background_drift` rows (`CMD.EXE-0BD30981.pf`, `CON
   * **Split 1 (`split1_stratified_leaky`, tagged `LEAKY: reproduction of published setup only`):** Stratified 80/20 (`46,876` train+val / `11,720` test, `seed=42`). Sibling 15-second dumps and SMOTE benign rows leak across train/test.
   * **Split 2 (`split2_family_grouped`, `draw_seed=42`, `kmeans_seed=42`):** Holds out `Ako|TIBS|Scar` (`1` family per category; `43,759` train / `3,219` benign val / `11,618` test) and groups benign rows via `50`-cluster `KMeans` approximation (SMOTE benign rows still cannot be perfectly separated).
   * **5-Rotation Sweep:** Holds out every one of the 15 families once: `0: Ako|180solutions|Emotet` (`43,202`/`12,175`), `1: Conti|CWS|Reconyc` (`43,611`/`11,766`), `2: Maze|Gator|Refroso` (`43,011`/`12,366`), `3: Pysa|TIBS|Scar` (`44,042`/`11,335`), `4: Shade|Transponder|Zeus` (`42,681`/`12,696`).
-* **Relationship Between Track A and Track B (`docs/specs/04_approaches_and_datasets.md` §1 & §2.2):** Track B is a public external benchmark that tests the 5 ML model families independently and exposes random-split leakage; Track A is our core host-artifact triage benchmark. Per protocol, algorithms are compared strictly *within* each track, never *across* Track A and Track B.
+* **Relationship Between Track A and Track B (Secondary / Appendix Framing, `docs/specs/04_approaches_and_datasets.md` §1 & §2.2):** Track B is strictly a **secondary/appendix analysis on a different task and data type** (55 Volatility memory-forensics features for malware-vs-benign family-grouped classification), **NOT part of the Track A host-artifact triage model ranking**. It tests the 5 ML model families independently on public memory telemetry and exposes random-split leakage; per protocol, algorithms are compared strictly *within* each track, never *across* Track A and Track B.
 
 ---
 
@@ -154,7 +154,7 @@ Sources: [`src/config.py`](src/config.py), [`data/processed/data_dictionary.md`]
 
 ### 4.2 Excluded Columns (`FORBIDDEN_MODEL_INPUTS`) & Rationale
 Enforced programmatically in [`src/models/preprocess.py`](src/models/preprocess.py) (`assert_no_forbidden_inputs`):
-* **`ORACLE_FEATURES` (`file_age_minutes`, `created_in_window`):** Encodes simulation execution-window timing ("collection-window artifact") rather than intrinsic artifact signals; barred from `X` and isolated solely to the `oracle_upper_bound` ablation (`docs/specs/07_evaluation_protocol.md`).
+* **`ORACLE_FEATURES` (`file_age_minutes`, `created_in_window`):** In our controlled lab runs, any artifact created inside the simulated attack window is attacker-made (or scripted noise injected inside that exact window) by construction, so any creation-time or file-age feature would **leak the label directly** rather than measure realistic host-artifact properties. Accordingly, `file_age_minutes` and `created_in_window` are barred from `X` and isolated solely to the `oracle_upper_bound` ablation (`docs/specs/07_evaluation_protocol.md`). The production triage model therefore **ranks host artifacts without a timeline**; incorporating timeline features safely is deferred to future work requiring a different, non-leaky evaluation design.
 * **`RULE_FEATURES` (`rule_hit_count`):** Layer-1 deterministic rule output; excluded so Layer-2 ML prioritization is evaluated independently of rules, and used only in `plus_rule_hit_count` and [`src/eval/export_findings.py`](src/eval/export_findings.py).
 * **`META_COLUMNS` & Labels (`run_id`, `technique_id`, `variant`, `launcher`, `artifact_key`, `label`, `label_reason`, `split_pool`, `dev_fold`, `seen_run_ids`, `seen_count`):** Direct identifiers, ground-truth labels, and split metadata; never permitted as model inputs.
 
@@ -310,8 +310,8 @@ Sources: [`results/tables/track_a_per_technique.csv`](results/tables/track_a_per
 
 * **REVENANT Exports:** [`results/findings.json`](results/findings.json) (`rf_full_20`, `run_id="frozen_test_full_20"`: `123` rule findings `F-0001..F-0123`, `20` unruled leads `L-0001..L-0020`, `manifest_sha256=0f1ff3ec...`; top `F-0001` = `T1036.005` `file|c:\programdata\svchost.exe|svchost.exe`, `RULE-009`+`RULE-010`, score `0.772`) and [`results/findings_no_content.json`](results/findings_no_content.json) (`rf_no_content`, `123` findings, `20` leads; top `F-0001` = `T1552.001` `msc_helper_v2.ps1`, score `0.87583`).
 
-### 6.9 Track B (`CIC-MalMem-2022`) Results Summary
-Sources: [`results/tables/track_b_split1.csv`](results/tables/track_b_split1.csv), [`results/tables/track_b_split2.csv`](results/tables/track_b_split2.csv), [`results/tables/track_b_split2_rotations_summary.csv`](results/tables/track_b_split2_rotations_summary.csv). *(SMOTE benign cluster-shift caveat applies: benign FPRs are optimistic yet still suffer 8.1%–22.3% FPR drift under shift.)*
+### 6.9 Track B (`CIC-MalMem-2022`) Results Summary *(Secondary / Appendix Analysis — Different Task & Modality)*
+Sources: [`results/tables/track_b_split1.csv`](results/tables/track_b_split1.csv), [`results/tables/track_b_split2.csv`](results/tables/track_b_split2.csv), [`results/tables/track_b_split2_rotations_summary.csv`](results/tables/track_b_split2_rotations_summary.csv). **Scope note:** Track B evaluates malware-vs-benign classification on Volatility memory-forensics features under family-grouped splits and is **not part of the Track A model ranking**. *(SMOTE benign cluster-shift caveat applies: benign FPRs are optimistic yet still suffer 8.1%–22.3% FPR drift under shift.)*
 
 | Arm | Split 1 (`LEAKY`) PR-AUC / ROC-AUC / Acc / F1 | Split 2 (`Ako\|TIBS\|Scar`) PR-AUC / R@1% Val FPR / Test FPR@1% | 5-Rotation PR-AUC Mean `[Min, Max]` \| R@1% Mean |
 | :--- | :---: | :---: | :---: |
@@ -320,6 +320,78 @@ Sources: [`results/tables/track_b_split1.csv`](results/tables/track_b_split1.csv
 | `mlp` | `1.0000` / `1.0000` / `0.9991` / `0.9991` | `0.9995` / `1.0000` / `0.1846` | `0.9998` `[0.9994, 1.0000]` \| `1.0000` |
 | `ae` | `0.9992` / `0.9994` / `0.9697` / `0.9706` | `0.9814` / `0.9018` / `0.0380` | `0.9920` `[0.9794, 0.9954]` \| `0.9677` |
 | `iforest` | `0.9474` / `0.9754` / `0.9695` / `0.9704` | `0.9516` / `0.3652` / `0.0058` | `0.9444` `[0.9377, 0.9498]` \| `0.2751` |
+
+### 6.10 Post-Hoc Supplementary Analyses *(Not Pre-Registered in `FINAL_EVAL_PLAN.md`)*
+
+> [!NOTE]
+> All analyses in §6.10 are **POST-HOC SUPPLEMENTARY** (computed solely from already-saved frozen `--final` per-row test predictions and existing `shap_summary_all.csv` outputs via [`src/eval/supp_posthoc.py`](src/eval/supp_posthoc.py), after verifying `test_sha256 = 0f1ff3ec054bf00c66875fb5d2466e3b8d35685d69c2f0203d6787b71852ffa8`; logged in [`results/logs/supp_posthoc_log.jsonl`](results/logs/supp_posthoc_log.jsonl)). Zero `--final` re-runs, zero model refits, and zero existing files were modified.
+
+#### A. Paired `run_id` Bootstrap & Dual-Config Verdicts vs. `rules_count` (Post-Hoc Supplementary)
+Source: [`results/tables/supp_posthoc_dual_config_vs_rules_count.csv`](results/tables/supp_posthoc_dual_config_vs_rules_count.csv) (`n_boot = 1000`, `seed = 42`). All 9 slices (all 3 ML arms tested: `rf`, `xgb`, `mlp`) achieve **`dual_verdict = a_better`** against `rules_count`, matching the pre-registered `rules_binary` verdict for `rf` and `xgb` (`a_better` in both configurations across all views):
+
+| Slice (`n_rows`, `n_pos`/`n_neg`) | Pair (`A vs rules_count`) | `full_20` Diff [95% CI] (`verdict`) | `no_content` Diff [95% CI] (`verdict`) | Dual-Config Verdict |
+| :--- | :--- | :--- | :--- | :---: |
+| `all` (`370`, `33`/`337`) | `rf vs rules_count` | `+0.6204 [+0.4941, +0.7513]` (`a_better`) | `+0.4380 [+0.3086, +0.5600]` (`a_better`) | **`a_better`** |
+| `all` | `xgb vs rules_count` | `+0.5854 [+0.4617, +0.6988]` (`a_better`) | `+0.3550 [+0.2084, +0.4935]` (`a_better`) | **`a_better`** |
+| `all` | `mlp vs rules_count` | `+0.4979 [+0.3527, +0.6266]` (`a_better`) | `+0.3923 [+0.2487, +0.5193]` (`a_better`) | **`a_better`** |
+| `file+run_key+task` (`228`, `24`/`204`) | `rf vs rules_count` | `+0.7408 [+0.6115, +0.8572]` (`a_better`) | `+0.5173 [+0.3378, +0.6558]` (`a_better`) | **`a_better`** |
+| `file+run_key+task` | `xgb vs rules_count` | `+0.6526 [+0.5087, +0.7967]` (`a_better`) | `+0.4731 [+0.2928, +0.6080]` (`a_better`) | **`a_better`** |
+| `file+run_key+task` | `mlp vs rules_count` | `+0.5765 [+0.4097, +0.7087]` (`a_better`) | `+0.4323 [+0.2726, +0.5675]` (`a_better`) | **`a_better`** |
+| `file+run_key+task_drift_only` (`111`, `24`/`87`) | `rf vs rules_count` | `+0.7370 [+0.6054, +0.8470]` (`a_better`) | `+0.5158 [+0.3531, +0.6642]` (`a_better`) | **`a_better`** |
+| `file+run_key+task_drift_only` | `xgb vs rules_count` | `+0.6547 [+0.5173, +0.7901]` (`a_better`) | `+0.4696 [+0.3044, +0.6139]` (`a_better`) | **`a_better`** |
+| `file+run_key+task_drift_only` | `mlp vs rules_count` | `+0.5704 [+0.4218, +0.7046]` (`a_better`) | `+0.4269 [+0.2800, +0.5622]` (`a_better`) | **`a_better`** |
+
+#### B. Operating-Point Comparison Against Rules & `P@k` / `R@k` (Post-Hoc Supplementary)
+Source: [`results/tables/supp_posthoc_operating_points.csv`](results/tables/supp_posthoc_operating_points.csv). **Threshold caveat:** *Every threshold-based operating-point number below is **descriptive, thresholds chosen on test, not a deployable operating point**.*
+
+* **Rules' Own Operating Points (`370` frozen test rows, `33` positives):**
+  * `rules_binary >= 1` *(identical set to `rules_count >= 1`)*: **`120`** flagged, `TP = 31 / 33`, Precision = **`0.2583`**, Recall = **`0.9394`**.
+  * `rules_count >= 2`: **`16`** flagged, `TP = 4 / 33`, Precision = **`0.2500`**, Recall = **`0.1212`**.
+  * `rules_count >= 3`: **`1`** flagged, `TP = 1 / 33`, Precision = **`1.0000`**, Recall = **`0.0303`**.
+
+* **Model Precision at Matched Rules Recall & Recall at Matched Flagged Count** *(all 6 ML arms retained, tie-expected handling; `full_20` \| `no_content`, descriptive thresholds chosen on test, not a deployable operating point)*:
+
+| Rules Operating Point (`Flagged`, `TP`, `P`, `R`) | Metric (`full_20` \| `no_content`) | `rf` | `xgb` | `mlp` | `lr` | `ae` | `iforest` |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`>= 1`** (`120` flag, `31` TP, `P=0.2583`, `R=0.9394`) | Precision at `R=0.9394` (`n_flagged`) | `0.7561` (`41`) \| `0.3924` (`79`) | `0.2650` (`117`) \| `0.2095` (`148`) | `0.2952` (`105`) \| `0.1435` (`216`) | `0.2214` (`140`) \| `0.2348` (`132`) | `0.1148` (`270`) \| `0.1250` (`248`) | `0.1119` (`277`) \| `0.1348` (`230`) |
+| **`>= 1`** (`120` flagged budget) | Recall at `120` flagged (`E[TP]`) | `0.9697` (`32.0`) \| `0.9394` (`31.0`) | `0.9394` (`31.0`) \| `0.9091` (`30.0`) | `0.9394` (`31.0`) \| `0.9091` (`30.0`) | `0.8788` (`29.0`) \| `0.9091` (`30.0`) | `0.6364` (`21.0`) \| `0.6364` (`21.0`) | `0.4848` (`16.0`) \| `0.5152` (`17.0`) |
+| **`>= 2`** (`16` flag, `4` TP, `P=0.2500`, `R=0.1212`) | Precision at `R=0.1212` (`n_flagged`) | `0.8000` (`5`) \| `1.0000` (`4`) | `1.0000` (`4`) \| `0.8000` (`5`) | `1.0000` (`4`) \| `1.0000` (`4`) | `1.0000` (`4`) \| `1.0000` (`4`) | `0.8000` (`5`) \| `1.0000` (`4`) | `0.2000` (`20`) \| `0.2500` (`16`) |
+| **`>= 2`** (`16` flagged budget) | Recall at `16` flagged (`E[TP]`) | `0.4545` (`15.0`) \| `0.3636` (`12.0`) | `0.4545` (`15.0`) \| `0.3939` (`13.0`) | `0.4545` (`15.0`) \| `0.3636` (`12.0`) | `0.3636` (`12.0`) \| `0.3939` (`13.0`) | `0.3636` (`12.0`) \| `0.3636` (`12.0`) | `0.0303` (`1.0`) \| `0.1212` (`4.0`) |
+| **`>= 3`** (`1` flag, `1` TP, `P=1.0000`, `R=0.0303`) | Precision at `R=0.0303` (`n_flagged`) | `1.0000` (`1`) \| `1.0000` (`1`) | `1.0000` (`1`) \| `1.0000` (`1`) | `1.0000` (`1`) \| `1.0000` (`1`) | `1.0000` (`1`) \| `1.0000` (`1`) | `1.0000` (`1`) \| `1.0000` (`1`) | `0.5000` (`2`) \| `0.1111` (`9`) |
+| **`>= 3`** (`1` flagged budget) | Recall at `1` flagged (`E[TP]`) | `0.0303` (`1.0`) \| `0.0303` (`1.0`) | `0.0303` (`1.0`) \| `0.0303` (`1.0`) | `0.0303` (`1.0`) \| `0.0303` (`1.0`) | `0.0303` (`1.0`) \| `0.0303` (`1.0`) | `0.0303` (`1.0`) \| `0.0303` (`1.0`) | `0.0000` (`0.0`) \| `0.0000` (`0.0`) |
+
+* **Top-`k` Ranking (`P@k` / `R@k` with tie-expected handling, `full_20` \| `no_content`, all 9 arms):**
+
+| `k` | `rf` | `xgb` | `mlp` | `lr` | `ae` | `iforest` | `rules_binary` | `rules_count` | `random` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`5`** | `0.8000 / 0.1212` \| `1.0000 / 0.1515` | `1.0000 / 0.1515` \| `0.8000 / 0.1212` | `1.0000 / 0.1515` \| `1.0000 / 0.1515` | `1.0000 / 0.1515` \| `1.0000 / 0.1515` | `0.8000 / 0.1212` \| `1.0000 / 0.1515` | `0.2000 / 0.0303` \| `0.0000 / 0.0000` | `0.2583 / 0.0391` | `0.3600 / 0.0545` | `0.4000 / 0.0606` |
+| **`10`** | `0.9000 / 0.2727` \| `0.9000 / 0.2727` | `0.9000 / 0.2727` \| `0.8000 / 0.2424` | `0.9000 / 0.2727` \| `1.0000 / 0.3030` | `0.9000 / 0.2727` \| `0.9000 / 0.2727` | `0.8000 / 0.2424` \| `0.9000 / 0.2727` | `0.1000 / 0.0303` \| `0.1000 / 0.0303` | `0.2583 / 0.0783` | `0.2800 / 0.0848` | `0.3000 / 0.0909` |
+| **`20`** | `0.9500 / 0.5758` \| `0.8000 / 0.4848` | `0.9500 / 0.5758` \| `0.6500 / 0.3939` | `0.8000 / 0.4848` \| `0.7000 / 0.4242` | `0.6500 / 0.3939` \| `0.7500 / 0.4545` | `0.6000 / 0.3636` \| `0.6500 / 0.3939` | `0.2000 / 0.1212` \| `0.2500 / 0.1515` | `0.2583 / 0.1566` | `0.2519 / 0.1527` | `0.1500 / 0.0909` |
+| **`50`** | `0.6200 / 0.9394` \| `0.5200 / 0.7879` | `0.5800 / 0.8788` \| `0.4800 / 0.7273` | `0.5800 / 0.8788` \| `0.4800 / 0.7273` | `0.5600 / 0.8485` \| `0.5200 / 0.7879` | `0.3200 / 0.4848` \| `0.3200 / 0.4848` | `0.1600 / 0.2424` \| `0.1600 / 0.2424` | `0.2583 / 0.3914` | `0.2565 / 0.3887` | `0.1200 / 0.1818` |
+
+*(At `k = 50` in `full_20`, RF already matches `rules_binary`'s full `31/33 = 0.9394` recall using 58% fewer alerts: `50` vs `120` flagged.)*
+
+#### C. SHAP Comparison by Rank & Normalized Share *(Post-Hoc Supplementary)*
+Sources: [`results/tables/supp_posthoc_shap_ranks.csv`](results/tables/supp_posthoc_shap_ranks.csv), [`results/tables/supp_posthoc_shap_spearman.csv`](results/tables/supp_posthoc_shap_spearman.csv), [`results/figures/supp_posthoc_shap_normalized_shares.png`](results/figures/supp_posthoc_shap_normalized_shares.png).
+
+> [!IMPORTANT]
+> **Raw SHAP magnitudes are on different scales across models (RF probability scale, XGBoost log-odds, MLP logit) and must not be compared directly.** All cross-model comparisons below use per-model ordinal **ranks** (`1` = largest `mean|SHAP|`) and **normalized shares** (`mean|SHAP| / sum(mean|SHAP|)` over all features in that config).
+
+* **Top-5 Features by Rank & Normalized Share (`full_20`: `n=20`, `no_content`: `n=18`):**
+  * `full_20`: `rf` (#1 `path_class 18.1%`, #2 `artifact_type 14.5%`, #3 `file_size_log 14.4%`, #4 `file_entropy 8.4%`, #5 `ext_class 7.7%`); `xgb` (#1 `path_class 19.6%`, #2 `file_size_log 17.7%`, #3 `artifact_type 13.6%`, #4 `name_entropy 9.4%`, #5 `name_length 8.9%`); `mlp` (#1 `artifact_type 25.5%`, #2 `path_class 11.5%`, #3 `registry_location_class 9.7%`, #4 `signature_state 8.0%`, #5 `path_depth 7.7%`).
+  * `no_content`: `rf` (#1 `path_class 20.3%`, #2 `artifact_type 17.1%`, #3 `name_entropy 14.6%`, #4 `path_depth 11.8%`, #5 `name_length 8.8%`); `xgb` (#1 `path_class 19.4%`, #2 `artifact_type 18.4%`, #3 `name_entropy 16.5%`, #4 `path_depth 15.7%`, #5 `name_length 9.8%`); `mlp` (#1 `path_class 23.3%`, #2 `artifact_type 22.6%`, #3 `path_depth 9.9%`, #4 `registry_location_class 8.2%`, #5 `cmdline_nonalnum_ratio 7.6%`).
+* **Recomputed Pairwise Spearman Rank Correlations (`all_features` vs. `top10_union`):**
+
+| Config | Model Pair | `all_features` (`n`) | Spearman $\rho$ (`p`-value) | `top10_union` (`n`) | Spearman $\rho$ (`p`-value) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `full_20` | `rf vs xgb` | `20` | **`0.9257`** (`5.02e-9`) | `12` | `0.7972` (`0.0019`) |
+| `full_20` | `rf vs mlp` | `20` | **`0.7812`** (`4.78e-5`) | `12` | `0.1818` (`0.5717`) |
+| `full_20` | `xgb vs mlp` | `20` | **`0.7086`** (`4.70e-4`) | `12` | `0.1538` (`0.6331`) |
+| `no_content` | `rf vs xgb` | `18` | **`0.9520`** (`1.23e-9`) | `12` | `0.9371` (`6.99e-6`) |
+| `no_content` | `rf vs mlp` | `18` | **`0.7863`** (`1.09e-4`) | `12` | `0.3566` (`0.2551`) |
+| `no_content` | `xgb vs mlp` | `18` | **`0.7429`** (`4.13e-4`) | `12` | `0.4126` (`0.1826`) |
+
+![Post-Hoc Normalized SHAP Shares](results/figures/supp_posthoc_shap_normalized_shares.png)
 
 ---
 
@@ -401,6 +473,7 @@ Items intentionally deferred or outside Phase 1 completion:
 7. **VSS / Amcache & Signed-Executable Prefetch Coverage:** Collecting Amcache (`51/51` skipped in Phase 1 due to `locked_hive_no_vss`) and adding dev-pool `prefetch` / `has_double_extension` positives.
 8. **Independently Audited Human Annotation Trail:** Multi-reviewer labeling logs recording reviewer ID, timestamps, and per-row disagreement notes rather than single-commit uniform flags.
 9. **Deferred Public Datasets:** EMBER, BODMAS, SOREL-20M, OTRF Security-Datasets, EVTX-ATTACK-SAMPLES, Splunk `attack_data`, and Volatility-3 memory images (`Triage-Memory`, `MemLabs`; marked cut/optional in `docs/specs/04_approaches_and_datasets.md`).
+10. **Non-Leaky Timeline-Aware Evaluation Design:** Designing realistic multi-day host noise schedules so timeline features (`file_age_minutes`, `created_in_window`, causal event ordering) do not trivially encode execution-window ground truth.
 
 ---
 

@@ -95,3 +95,18 @@ Both configurations are tuned strictly via grouped dev CV (`GroupKFold` over `11
 3. **"Best ML Model vs `rules_binary`" Selection Optimism:** Identifying the highest-PR-AUC ML model after observing test results slightly flatters that headline contrast; `rf vs rules_binary` and `xgb vs rules_binary` are therefore always reported separately alongside `"best ML vs rules_binary"`.
 4. **Statistical Power & Expected `no_content` Drop:** With only `33` test positives across `5` holdout techniques, `"not distinguishable"` between `xgb` and `rf` under paired `run_id` bootstrap is expected and reported as a legitimate empirical outcome, and `no_content` PR-AUC is expected to be lower than `full_20` due to removing `file_size_log` and `file_entropy`.
 
+---
+
+## Addendum: Post-Hoc Supplementary Analyses
+
+**Date:** 2026-11-22  
+**Status:** **POST-HOC SUPPLEMENTARY** (not part of the pre-registered `FINAL_EVAL_PLAN` executed once under `--final` at commit `69ad02e4545b5586c09b1216154cfe7d62dc3a45`).  
+**Base Evaluation Commit / Execution Log:** Prepared from base commit `a066e8b` (recorded alongside exact execution commit, timestamp, verified `test_sha256 = 0f1ff3ec054bf00c66875fb5d2466e3b8d35685d69c2f0203d6787b71852ffa8`, inputs, and outputs in `results/logs/supp_posthoc_log.jsonl`) and committed with script `src/eval/supp_posthoc.py`.
+
+**Constraints Honored:** Strictly read-only on saved per-row `--final` predictions (`results/tables/track_a_test_predictions.parquet`, `results/tables/no_content/track_a_test_predictions.parquet`) and existing SHAP tables (`shap_summary_all.csv`); zero `--final` re-runs, zero model retraining, zero edits to `final_eval_audit.jsonl`, features, labels, splits, or existing result files. Every output file is prefixed `supp_posthoc_` and labelled post-hoc.
+
+1. **Supplementary Analysis 1 — `rules_count` as Rule Baseline (`results/tables/supp_posthoc_dual_config_vs_rules_count.csv`):** Re-runs the same paired `run_id`-clustered bootstrap (`n_boot = 1000`, `seed = 42`, `alpha = 0.05`) and `combine_dual_config_verdicts` rule across `all`, `file+run_key+task`, and `file+run_key+task_drift_only` for `rf vs rules_count`, `xgb vs rules_count`, and `mlp vs rules_count` in both `full_20` and `no_content`.
+2. **Supplementary Analysis 2 — Descriptive Operating-Point Comparison (`results/tables/supp_posthoc_operating_points.csv`):** Reports rules' own operating points (`rules_binary >= 1` and `rules_count >= 1, >= 2, >= 3`), ML precision at matched rules recall and ML recall at matched flagged counts (with tie-expected handling across all 6 ML arms), plus `P@k` and `R@k` for `k in {5, 10, 20, 50}` across all 9 arms. Every threshold-based value is labelled `"descriptive, thresholds chosen on test, not a deployable operating point"`.
+3. **Supplementary Analysis 3 — Scale-Invariant SHAP Rank & Share Comparison (`results/tables/supp_posthoc_shap_ranks.csv`, `results/tables/supp_posthoc_shap_spearman.csv`, `results/figures/supp_posthoc_shap_normalized_shares.{png,pdf}`):** Reports per-model (`rf`, `xgb`, `mlp`) SHAP rank and normalized share (`mean_abs_shap / sum(mean_abs_shap)`) for `full_20` (`n = 20`) and `no_content` (`n = 18`), plus pairwise Spearman rank correlations across both all features (`n = 20` / `18`) and the union of each model's top 10 (`n = 12`), with explicit disclosure that raw SHAP magnitudes are on different model scales (RF probability, XGBoost log-odds, MLP logit).
+
+
