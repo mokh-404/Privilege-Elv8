@@ -17,6 +17,7 @@
 | [v2/OPERATOR_DECISIONS.md](v2/OPERATOR_DECISIONS.md) | Recorded v2 operator decisions (`OD-V2-01`..`OD-V2-19`: `01..06, 08..19` confirmed `2026-11-23`; `07` approval & Gate 0 pending) |
 | [v2/V2_PLAN.md](v2/V2_PLAN.md) | Single-source-of-truth pilot-first v2 plan (strata, safety gate, offline extraction, labeling, blind freeze, secondary refgraph/tail/execution-delta specs) |
 | [v2/FINAL_EVAL_PLAN_v2_SKELETON.md](v2/FINAL_EVAL_PLAN_v2_SKELETON.md) | Draft pre-registration skeleton for v2 (all `[TBD]` fields pending pilot & blind-test freeze) |
+| [v2/hardening/POINTER_CAPTURE_SPEC.md](v2/hardening/POINTER_CAPTURE_SPEC.md) | Offline unprivileged-container pointer-capture schema & v1 collector gap audit (`OD-V2-04`, `OD-V2-16`) |
 | [v2/plan.md](../v2/plan.md) | Reconciled Phase 1 implementation tracker and step checklist (`Steps A, B, C.1, Concept C, C.2, E1–E7`, deferred `C.3, C.4, C.6, D`) |
 
 ## Original Phase-1 Design Specifications (`docs/specs/`)
