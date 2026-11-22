@@ -166,6 +166,8 @@ def test_signature_state():
     assert F.signature_state("NotTrusted") == "signed_untrusted"
     assert F.signature_state("HashMismatch") == "signed_untrusted"
     assert F.signature_state("NotSigned") == "unsigned"
+    assert F.signature_state("UnknownError") == "na"
+    assert F.signature_state("unknownerror") == "na"
     assert F.signature_state("NotSupportedFileFormat") == "na"
     assert F.signature_state(None) == "na"
 

@@ -97,5 +97,3 @@ run_050_T1552_001_v2,prefetch|c:\windows\prefetch\sftp-server.exe-ed22a4de.pf|sf
 run_050_T1552_001_v2,prefetch|c:\windows\prefetch\sshd.exe-2b5f0e53.pf|sshd.exe-2b5f0e53.pf,prefetch,SSHD.EXE-2B5F0E53.pf,C:\WINDOWS\Prefetch\SSHD.EXE-2B5F0E53.pf,prefetch_runner:sshd.exe
 run_051_T1552_001_v3,prefetch|c:\windows\prefetch\sftp-server.exe-ed22a4de.pf|sftp-server.exe-ed22a4de.pf,prefetch,SFTP-SERVER.EXE-ED22A4DE.pf,C:\WINDOWS\Prefetch\SFTP-SERVER.EXE-ED22A4DE.pf,prefetch_runner:sftp-server.exe
 run_051_T1552_001_v3,prefetch|c:\windows\prefetch\sshd.exe-2b5f0e53.pf|sshd.exe-2b5f0e53.pf,prefetch,SSHD.EXE-2B5F0E53.pf,C:\WINDOWS\Prefetch\SSHD.EXE-2B5F0E53.pf,prefetch_runner:sshd.exe
-run_004_T1547_001_v1,process|c:\programdata\ssh\sshd.exe|sshd.exe,process,sshd.exe,C:\ProgramData\ssh\sshd.exe,path_prefix:c:\programdata\ssh
-run_004_T1547_001_v1,process|pid#999|powershell.exe,process,powershell.exe,C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe,pid:999

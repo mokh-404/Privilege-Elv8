@@ -288,7 +288,10 @@ def nonalnum_ratio(s: str) -> float:
 _SIG_MAP = {
     "valid": "signed_trusted",
     "nottrusted": "signed_untrusted",
-    "unknownerror": "signed_untrusted",
+    # Get-AuthenticodeSignature returns UnknownError (with SignerCertificate = $null)
+    # for unsupported/unreadable file types (.cmd, .bat, .hta, .pf, non-catalog .lnk,
+    # 0-byte WindowsApps aliases, non-PE stubs) or collector exceptions — not untrusted signatures.
+    "unknownerror": "na",
     "hashmismatch": "signed_untrusted",
     "notsigned": "unsigned",
 }

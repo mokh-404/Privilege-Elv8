@@ -1,7 +1,7 @@
 {
-  "commit": "30be588a15d102d07909f112973a69361d2c5ade-dirty",
+  "commit": "c0b7742bd7966fef3d6cdd926c68f2f4a491651e-dirty",
   "dataset_path": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/data/processed/dataset_v1.parquet",
-  "generated_at_utc": "2026-11-21T23:31:51Z",
+  "generated_at_utc": "2026-11-22T01:22:50Z",
   "holdout_draw_seed": 42,
   "holdout_techniques": [
     "T1036.005",
@@ -10,6 +10,17 @@
     "T1543.003",
     "T1548.002"
   ],
+  "human_review": {
+    "agreement_rate": 1.0,
+    "kept_os_drift_prefetch_approved": 6,
+    "label_corrections_approved": 8,
+    "n_agreed": 111,
+    "n_benign_drift_reviewed": 100,
+    "n_positives_reviewed": 11,
+    "n_reviewed": 111,
+    "reviewed_at_utc": "2026-11-21T23:53:52Z",
+    "status": "approved"
+  },
   "label_counts": {
     "attacker_induced": 103,
     "baseline": 1066,
@@ -18,23 +29,17 @@
   "n_attack_runs": 48,
   "n_control_runs": 3,
   "n_runs": 51,
+  "pre_final_bugfix": {
+    "change": "_SIG_MAP['unknownerror'] = 'na' in src/data/features.py (applied before any test-set evaluation)",
+    "labels_changed": 0,
+    "previous_test_sha256": "2046f3ffbcbb9bdbc05f5db0e97b8d7554e41179a6f46dadb77fe65506db9e07"
+  },
   "seed": 42,
   "split_counts": {
     "dev": 1179,
     "test": 370
   },
   "test_positives": 33,
-  "test_sha256": "2046f3ffbcbb9bdbc05f5db0e97b8d7554e41179a6f46dadb77fe65506db9e07",
-  "total_rows": 1549,
-  "human_review": {
-    "status": "approved",
-    "n_reviewed": 111,
-    "n_agreed": 111,
-    "agreement_rate": 1.0,
-    "n_positives_reviewed": 11,
-    "n_benign_drift_reviewed": 100,
-    "label_corrections_approved": 8,
-    "kept_os_drift_prefetch_approved": 6,
-    "reviewed_at_utc": "2026-11-21T23:53:52Z"
-  }
+  "test_sha256": "0f1ff3ec054bf00c66875fb5d2466e3b8d35685d69c2f0203d6787b71852ffa8",
+  "total_rows": 1549
 }
