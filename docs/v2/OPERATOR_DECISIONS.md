@@ -14,17 +14,17 @@
 | **`OD-V2-02`** | **v1 data reuse (`emulated` stratum)** | Reuse frozen `dataset_v1.parquet` strictly as a 3rd `"emulated"` training-pool stratum (`dev` only); v2 blind test is **100% new**; reuse disclosed in all tables/reports | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-03`** | **Fake-internet responder** | `INetSim` on a **separate isolated Linux VM** (`inetsim-vm`) attached to `win11-isolated` (never on host OS, never in-guest FakeNet-NG) | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-04`** | **Offline artifact extraction** | **User-space offline parsing inside an unprivileged container** (`--network=none`, `--read-only`, `--cap-drop=ALL`, pure user-space QCOW2/NTFS/registry/EVTX/Amcache/Prefetch parsing); **never host-kernel mounts** of infected images | **confirmed by Mokh 2026-11-23** |
-| **`OD-V2-05`** | **Stage A pilot scope** | `~3` clean control boots + `6–8` non-test malware families × `1–2` runs (`executed` + `dormant`); pilot families stay strictly out of blind test | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-05`** | **Stage A pilot scope** | `~3` clean control boots + `6–8` non-test malware families × paired `dormant` + `executed` runs per `sample_sha256` (`pair_group_id`, matching initial staging path); pilot families stay strictly out of blind test | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-06`** | **Multi-seed & tuning budget** | `K = 5` seeds (`[42, 43, 44, 45, 46]`) for `--final` and learning curves; `30` equal trials per tuned model arm in nested dev CV, **with a fallback to `20` trials if the pilot shows compute is too heavy** | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-07`** | **Malware sample sourcing & quarantine vault** | Authorized research feed (e.g., MalwareBazaar / institutional repo), encrypted non-executable host vault (`chmod 0700` dir, `0400` AES-256 archive), SHA-256 manifest preflight; zero acquisition until written professor/university approval & Gate 0 sign-off | **design confirmed by Mokh 2026-11-23; written professor/university approval & Gate 0 sign-off PENDING** |
 | **`OD-V2-08`** | **Malware categories, family normalization & clustering** | Multi-category mix (Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, Trojanized Installer), **preferring families that run without live C2 and leave persistence artifacts**; AVClass2/ClarAVy canonical family names + `ssdeep`/TLSH/imphash near-duplicate clustering | **confirmed by Mokh 2026-11-23** |
-| **`OD-V2-09`** | **Stratum mix (`executed` vs `dormant` vs `emulated`)** | Report `(a) executed` (~60–70% of real-malware runs), `(b) dormant` (~30–40% of real-malware runs), and `(c) emulated` (v1 `dev` only, 0% blind test) separately and pooled with weights disclosed | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-09`** | **Stratum mix (`executed` vs `dormant` vs `emulated`) & pairing** | Report `(a) executed` (~60–70% of real-malware runs), `(b) dormant` (~30–40% of real-malware runs), and `(c) emulated` (v1 `dev` only, 0% blind test) separately and pooled with weights disclosed; `dormant` and `executed` cross-stratum runs are **paired by `sample_sha256` (`pair_group_id`)** and never straddle `dev` and `blind_test` | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-10`** | **Independent blinded human review** | **CHANGED:** **Mokh's friend is the primary blinded reviewer; Mokh scores the 20% overlap slice for Cohen's $\kappa$** (because Mokh built the labeler and is not independent). Blinded exports hide `label`, `label_reason`, `launcher`, `technique_id`, `sample_family` and require `reviewer_id`, `reviewed_at_utc`, per-row notes | **CHANGED & confirmed by Mokh 2026-11-23** |
 | **`OD-V2-11`** | **Feature schema scope** | Keep locked v1 `full_20` (20) + `no_content` (18) as the primary dual-config benchmark; add a separate secondary arm for the referential graph (`v2_refgraph`, see `OD-V2-13`), keeping any non-v1 features strictly outside `full_20`/`no_content` and the primary winner rule | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-12`** | **Benign software roster & target test prevalence** | Varied real software (Git, Python, 7-Zip, Notepad++, Sysinternals, procedural scripts), benign services, varied-trigger tasks, benign registry edits, legitimate unsigned PEs; disjoint dev/test profiles; **report natural (full-host snapshot) prevalence as the main view and a subsampled view as secondary, with weights disclosed** | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-13`** | **Referential-graph secondary arm (`v2_refgraph`)** | Secondary, pre-registered `"v2_refgraph"` config built ONLY from static cross-references inside the artifacts themselves (`ref_targets`, `ref_type`, `linked_artifact_keys`). Never uses labeling provenance, process trees, Sysmon, or timestamps. Never part of `full_20`/`no_content` or primary winner rule | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-14`** | **Tail-risk & analyst-effort metrics** | Secondary pre-registered metrics: worst-ranked positive rank, recall at review budgets (`k = 10/20/50/100`), positives in bottom 50%/90%, and `effort@recall` (50%/80%/90%); document random tail-audit sample-size upper bound $1 - 0.05^{1/n}$ ($n=5 \to 45\%$, $n=59 \to 5\%$, $n=300 \to 1\%$) as **future work only** | **confirmed by Mokh 2026-11-23** |
-| **`OD-V2-15`** | **Dormant-vs-executed feature-group delta** | For the same malware families present across both strata, pre-register a secondary comparison of which feature groups carry the ranking in each stratum (`full_20`, `no_content`, `drop_signature`, `v2_refgraph`) | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-15`** | **Cross-Stratum Execution Delta (`executed` vs `dormant`)** | On paired `sample_sha256` binaries ($s \in \mathcal{S}_{\text{paired}}$ via `pair_group_id`), pre-register secondary comparison of $\Delta_{\text{exec}}(M, C)$ across `full_20`, `no_content`, `drop_signature`, `no_content_no_sig`, plus `Rank_min` ($\Delta_{\text{first\_hit}}$), Intrusion-Detection Recall@k, and the Byte/Signature Evasion Resilience Hypothesis ($|\Delta_{\text{ablation, executed}}| < |\Delta_{\text{ablation, dormant}}|$) *(and secondary `v2_refgraph`)* | **confirmed by Mokh 2026-11-23** |
 
 ---
 
@@ -47,7 +47,7 @@
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ### `OD-V2-05` — Stage A Pilot Scope
-- **Decision:** Run a dev-only calibration pilot of **`~3` clean control boots** + **`6–8` distinct non-test malware families × `1–2` runs** spanning both `executed` and `dormant` strata. Pilot families remain strictly outside the blind test pool.
+- **Decision:** Run a dev-only calibration pilot of **`~3` clean control boots** + **`6–8` distinct non-test malware families × paired `dormant` and `executed` runs per `sample_sha256` (`pair_group_id`)**, staging each binary at the identical initial path before detonation so cross-stratum execution shifts are measured on matched binaries. Pilot families and `sample_sha256` pairs remain strictly outside the blind test pool.
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ### `OD-V2-06` — Multi-Seed & Nested CV Compute Budget
@@ -62,8 +62,10 @@
 - **Decision:** Target balanced multi-category coverage across Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, and Trojanized Installer, **preferring families that execute meaningfully without live C2 infrastructure and leave host persistence artifacts**; normalize canonical family labels via AVClass2/ClarAVy consensus and group near-duplicate binaries/packers via `ssdeep`/TLSH/imphash clustering before assigning `dev` vs `blind_test` (`IMP-05`).
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-09` — Evaluation Stratum Mix (`executed` / `dormant` / `emulated`)
+### `OD-V2-09` — Evaluation Stratum Mix (`executed` / `dormant` / `emulated`) & Paired Binary Design
 - **Decision:** Report every headline table separately for `(a) executed` (~60–70% of new real-malware runs), `(b) dormant` (~30–40% of new real-malware runs, static pre-execution binaries), and `(c) emulated` (v1 `dev`-only continuity stratum, never in blind test), plus combined real-malware stratified summaries with exact weights disclosed.
+  - **Paired `sample_sha256` Design (Stage A Pilot & Stage B Full Collection):** Cross-stratum `dormant` and `executed` evaluations MUST pair runs by exact `sample_sha256` (linked by forbidden provenance column `pair_group_id`, barred from `X` via `META_COLUMNS` / `FORBIDDEN_MODEL_INPUTS`), evaluating each binary both `dormant` (staged at a realistic path without execution) and `executed` (detonated from the matching initial staging path).
+  - **Anti-Leakage Rule:** Both the `dormant` run and the `executed` run of any `sample_sha256` (along with its entire `sample_family` + `ssdeep`/TLSH cluster) MUST reside strictly in the same split pool (`dev` OR `blind_test` — never straddling `dev` and `blind_test`).
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ### `OD-V2-10` — Independent Blinded Human Review Ownership *(CHANGED)*
@@ -94,8 +96,11 @@
   - Document the random tail-audit sample-size calculator: observing `0` missed positives in `n` uniform random draws from the tail gives a 95% Clopper-Pearson upper-bound miss rate of $p_{\text{upper}}(n) = 1 - 0.05^{1/n}$ (e.g., $n = 5 \to 45.1\%$, $n = 59 \to 5.0\%$, $n = 300 \to 1.0\%$). Any live/field tail audit is explicitly documented as **future work only**.
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-15` — Dormant-vs-Executed Feature-Group Delta
-- **Decision:** For malware families represented in both the `dormant` and `executed` strata, pre-register a secondary cross-stratum diagnostic measuring which feature groups carry the ranking in each stratum across **`full_20`**, **`no_content`**, **`drop_signature`**, and **`v2_refgraph`** (quantifying how signal shifts from static byte/signature properties in `dormant` runs to command-line/persistence/reference signals in `executed` runs).
+### `OD-V2-15` — Cross-Stratum Execution Delta (`executed` vs `dormant` on Paired Binaries)
+- **Decision:** On `sample_sha256`-paired binaries ($s \in \mathcal{S}_{\text{paired}}$, linked by forbidden provenance column `pair_group_id`), pre-register a secondary Cross-Stratum Execution Delta analysis measuring how detonation shifts triage detectability relative to pre-execution dormant staging:
+  1. **Stratum-Conditional PR-AUC & Recall@k Delta ($\Delta_{\text{exec}}$):** $\Delta_{\text{exec}}(M, C) = \text{Metric}(M, C \mid \text{executed}) - \text{Metric}(M, C \mid \text{dormant})$ across $C \in \{\text{full\_20}, \text{no\_content}, \text{drop\_signature}, \text{no\_content\_no\_sig}\}$ (plus secondary `v2_refgraph`) with family-clustered paired bootstrap 95% CIs (resampling whole families/clusters so paired `executed` and `dormant` runs of family $f$ stay together).
+  2. **Sample-Level First-Detection Rank / Effort Delta ($\Delta_{\text{first\_hit}}$):** Prevalence-invariant intrusion-level comparison using $\text{Rank}_{\min}(s, \text{stratum})$ (rank and normalized percentile effort of the highest-scored `attacker_induced` artifact produced by sample $s$ within its host run), reporting median and IQR of $\text{Rank}_{\min}(s, \text{dormant}) - \text{Rank}_{\min}(s, \text{executed})$ alongside **Intrusion-Detection Recall@k** ($k \in \{5, 10, 20, 50\}$).
+  3. **Byte/Signature Evasion Resilience Hypothesis:** Pre-register the secondary test that removing byte/signature features causes severe degradation under `dormant` staging ($\Delta_{\text{ablation, dormant}}$) whereas post-detonation OS footprints preserve ranking performance ($|\Delta_{\text{ablation, executed}}| < |\Delta_{\text{ablation, dormant}}|$, tested via family-clustered paired bootstrap CI).
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ---
@@ -106,14 +111,14 @@
 - [x] `OD-V2-02` — v1 reuse strictly as `dev`-only `"emulated"` stratum; 100% new blind test *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-03` — INetSim on separate isolated Linux VM *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-04` — User-space offline parsing in unprivileged container (zero host-kernel mounts) *(confirmed by Mokh 2026-11-23)*
-- [x] `OD-V2-05` — Pilot scope (`~3` controls + `6–8` families × `1–2` runs) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-05` — Pilot scope (`~3` controls + `6–8` families × paired `dormant` + `executed` runs per `sample_sha256` / `pair_group_id`) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-06` — `K = 5` seeds and `30` equal trials per tuned model (`20`-trial fallback if pilot compute too heavy) *(confirmed by Mokh 2026-11-23)*
 - [ ] `OD-V2-07` — Quarantine vault & SHA-256 manifest design confirmed (`2026-11-23`); **written professor/university approval & Gate 0 sign-off PENDING**
 - [x] `OD-V2-08` — Categories, AVClass2/ClarAVy normalization, fuzzy-hash clustering, prefer no-live-C2 persistence families *(confirmed by Mokh 2026-11-23)*
-- [x] `OD-V2-09` — Stratum mix (`executed` ~60–70% / `dormant` ~30–40% / `emulated` `dev`-only) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-09` — Stratum mix (`executed` ~60–70% / `dormant` ~30–40%, paired by `sample_sha256` / `pair_group_id` within same split / `emulated` `dev`-only) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-10` — Friend primary blinded reviewer + Mokh scores 20% overlap for Cohen's $\kappa$ *(CHANGED & confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-11` — Primary `full_20`/`no_content` continuity + separate secondary `v2_refgraph` arm *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-12` — Varied benign roster; natural prevalence main view + subsampled secondary view (weights disclosed) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-13` — Static-only referential-graph arm (`v2_refgraph`), barred from `full_20`/`no_content` & winner rule *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-14` — Tail-risk & effort metrics + $1 - 0.05^{1/n}$ tail-audit calculator (tail audit = future work only) *(confirmed by Mokh 2026-11-23)*
-- [x] `OD-V2-15` — Dormant-vs-executed feature-group delta (`full_20`, `no_content`, `drop_signature`, `v2_refgraph`) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-15` — Cross-Stratum Execution Delta (`Delta_exec`, `Rank_min` / `Delta_first_hit`, Intrusion-Detection Recall@k, Byte/Signature Evasion Resilience Hypothesis across `full_20`, `no_content`, `drop_signature`, `no_content_no_sig`, `v2_refgraph`) *(confirmed by Mokh 2026-11-23)*
