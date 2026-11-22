@@ -22,7 +22,10 @@
 | [v2/NOVELTY_VERIFICATION.md](v2/NOVELTY_VERIFICATION.md) | Step E6 prior-art verification ledger from `v2/concept_a_gap_audit.md` (`[1]`–`[137]` cataloged with every row marked `UNVERIFIED` + 2026 anomaly flags) |
 | [v2/FEATURE_PARITY_AUDIT.md](v2/FEATURE_PARITY_AUDIT.md) | Step F0 live-v1 vs offline-v2 parity audit of all 20 locked `full_20` features, `OD-V2-02` `process`-row exclusion impact, and clean-image parity test procedure |
 | [v2/hardening/POINTER_CAPTURE_SPEC.md](v2/hardening/POINTER_CAPTURE_SPEC.md) | Offline unprivileged-container pointer-capture schema & v1 collector gap audit (`OD-V2-04`, `OD-V2-16`) |
-| [v2/plan.md](../v2/plan.md) | Reconciled Phase 1 implementation tracker and step checklist (`Steps A, B, C.1, Concept C, C.2, E1–E7`, deferred `C.3, C.4, C.6, D`) |
+| [v2/hardening/02_domain_xml_hardening.md](v2/hardening/02_domain_xml_hardening.md) | Step D libvirt domain/network XML hardening runbook (`win11` & `win11-isolated`) + `check_domain_xml.py` validator |
+| [v2/hardening/03_inetsim_vm_setup.md](v2/hardening/03_inetsim_vm_setup.md) | Step D separate isolated Linux `inetsim-vm` (`192.168.150.10`) fake-internet VM setup (`OD-V2-03`) |
+| [v2/hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md](v2/hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md) | Step D negative-egress verification checklist (`NEG-01`..`NEG-10`) and exact ordered Mokh run & Gate 0 sign-off list |
+| [v2/plan.md](../v2/plan.md) | Reconciled Phase 1 implementation tracker and step checklist (`Steps A, B, C.1, Concept C, C.2, E1–E7, F0, D..G`) |
 
 ## Original Phase-1 Design Specifications (`docs/specs/`)
 
