@@ -1,99 +1,119 @@
-# DFIR-Triage ML v2 — Operator Decisions & Onboarding Defaults
+# DFIR-Triage ML v2 — Operator Decisions & Onboarding Record
 
-**Status:** `ALL ITEMS BELOW ARE PENDING MOKH'S CONFIRMATION`  
-**Scope:** Phase 1 preparation defaults for v2. **Gate 0 is NOT signed off.** No malware may be acquired, downloaded, or executed, and no VM runs or host firewall/XML edits may be performed until Mokh confirms these decisions and completes Gate 0 verification.  
+**Status:** `OD-V2-01..06, 08, 09, 11..15 CONFIRMED BY MOKH (2026-11-23); OD-V2-10 CHANGED & CONFIRMED (2026-11-23); OD-V2-07 DESIGN CONFIRMED — WRITTEN PROFESSOR/UNIVERSITY APPROVAL & GATE 0 SIGN-OFF REMAIN PENDING`  
+**Single Source of Truth:** This document (decision records) together with [`docs/v2/V2_PLAN.md`](V2_PLAN.md) (v2 architecture, safety, methodology, and evaluation design) is the single source of truth for Phase v2.  
 **Related Docs:** [`V2_PLAN.md`](V2_PLAN.md) | [`FINAL_EVAL_PLAN_v2_SKELETON.md`](FINAL_EVAL_PLAN_v2_SKELETON.md) | [`v2/plan.md`](../../v2/plan.md) | [`IMPROVEMENT_ANALYSIS.md`](../IMPROVEMENT_ANALYSIS.md)
 
 ---
 
 ## Summary Table
 
-| ID | Topic | Proposed v2 Default | Status |
+| ID | Topic | Confirmed v2 Decision | Status |
 | :--- | :--- | :--- | :--- |
-| **`OD-V2-01`** | **Data targets (Families + Positives/Runs)** | `>= 25–30` total distinct malware families, `>= 10–15` distinct families in blind test (pilot decides feasibility); rough anchor `~300–500` positives across `100+` VM runs | **pending Mokh's confirmation** |
-| **`OD-V2-02`** | **v1 data reuse (`emulated` stratum)** | Reuse frozen `dataset_v1.parquet` strictly as a 3rd `"emulated"` training-pool stratum (`dev` only); v2 blind test is **100% new**; reuse disclosed in all tables/reports | **pending Mokh's confirmation** |
-| **`OD-V2-03`** | **Fake-internet responder** | `INetSim` on a **separate isolated Linux VM** (`inetsim-vm`) attached to `win11-isolated` (never on host OS, never in-guest FakeNet-NG) | **pending Mokh's confirmation** |
-| **`OD-V2-04`** | **Offline artifact extraction** | **User-space offline parsing inside an unprivileged container** (`--network=none`, `--read-only`, `--cap-drop=ALL`, pure user-space QCOW2/NTFS/registry/EVTX/Amcache/Prefetch parsing); **never host-kernel mounts** of infected images | **pending Mokh's confirmation** |
-| **`OD-V2-05`** | **Stage A pilot scope** | `~3` clean control boots + `6–8` non-test malware families × `1–2` runs (`executed` + `dormant`); pilot families stay strictly out of blind test | **pending Mokh's confirmation** |
-| **`OD-V2-06`** | **Multi-seed & tuning budget** | `K = 5` seeds (`[42, 43, 44, 45, 46]`) for `--final` and learning curves; `30` equal trials per tuned model arm in nested dev CV | **pending Mokh's confirmation** |
-| **`OD-V2-07`** | **Malware sample sourcing & quarantine vault** | Authorized research feed (e.g., MalwareBazaar / institutional repo), encrypted non-executable host vault (`chmod 0700` dir, `0400` AES-256 archive), SHA-256 manifest preflight; zero acquisition until Gate 0 sign-off | **pending Mokh's confirmation** |
-| **`OD-V2-08`** | **Malware categories, family normalization & clustering** | Multi-category mix (Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, Trojanized Installer); AVClass2/ClarAVy canonical family names + `ssdeep`/TLSH/imphash near-duplicate connected-component grouping | **pending Mokh's confirmation** |
-| **`OD-V2-09`** | **Stratum mix (`executed` vs `dormant` vs `emulated`)** | Report `(a) executed` (~60–70% of real-malware runs), `(b) dormant` (~30–40% of real-malware runs), and `(c) emulated` (v1 `dev` only, 0% blind test) separately and pooled with weights disclosed | **pending Mokh's confirmation** |
-| **`OD-V2-10`** | **Independent blinded human review** | Mokh + second independent reviewer on a stratified `20%` overlap slice for Cohen's $\kappa$; blinded exports hide `label`, `label_reason`, `launcher`, `technique_id`, `sample_family` and require `reviewer_id`, `reviewed_at_utc`, per-row notes | **pending Mokh's confirmation** |
-| **`OD-V2-11`** | **Feature schema scope** | Keep locked v1 `full_20` (20) + `no_content` (18) as the primary dual-config benchmark; any new PE/Sysmon/Amcache features stay strictly in a separately reported `v2_extended` config | **pending Mokh's confirmation** |
-| **`OD-V2-12`** | **Benign software roster & target test prevalence** | Varied real software (Git, Python, 7-Zip, Notepad++, Sysinternals, procedural scripts), benign services, varied-trigger tasks, benign registry edits, legitimate unsigned PEs; disjoint dev/test profiles; evaluate at full host-snapshot prevalence + hard-negative slices | **pending Mokh's confirmation** |
+| **`OD-V2-01`** | **Data targets (Families + Positives/Runs)** | `>= 25–30` total distinct malware families, `>= 10–15` distinct families in blind test (pilot decides what is feasible); rough anchor `~300–500` positives across `100+` VM runs | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-02`** | **v1 data reuse (`emulated` stratum)** | Reuse frozen `dataset_v1.parquet` strictly as a 3rd `"emulated"` training-pool stratum (`dev` only); v2 blind test is **100% new**; reuse disclosed in all tables/reports | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-03`** | **Fake-internet responder** | `INetSim` on a **separate isolated Linux VM** (`inetsim-vm`) attached to `win11-isolated` (never on host OS, never in-guest FakeNet-NG) | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-04`** | **Offline artifact extraction** | **User-space offline parsing inside an unprivileged container** (`--network=none`, `--read-only`, `--cap-drop=ALL`, pure user-space QCOW2/NTFS/registry/EVTX/Amcache/Prefetch parsing); **never host-kernel mounts** of infected images | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-05`** | **Stage A pilot scope** | `~3` clean control boots + `6–8` non-test malware families × `1–2` runs (`executed` + `dormant`); pilot families stay strictly out of blind test | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-06`** | **Multi-seed & tuning budget** | `K = 5` seeds (`[42, 43, 44, 45, 46]`) for `--final` and learning curves; `30` equal trials per tuned model arm in nested dev CV, **with a fallback to `20` trials if the pilot shows compute is too heavy** | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-07`** | **Malware sample sourcing & quarantine vault** | Authorized research feed (e.g., MalwareBazaar / institutional repo), encrypted non-executable host vault (`chmod 0700` dir, `0400` AES-256 archive), SHA-256 manifest preflight; zero acquisition until written professor/university approval & Gate 0 sign-off | **design confirmed by Mokh 2026-11-23; written professor/university approval & Gate 0 sign-off PENDING** |
+| **`OD-V2-08`** | **Malware categories, family normalization & clustering** | Multi-category mix (Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, Trojanized Installer), **preferring families that run without live C2 and leave persistence artifacts**; AVClass2/ClarAVy canonical family names + `ssdeep`/TLSH/imphash near-duplicate clustering | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-09`** | **Stratum mix (`executed` vs `dormant` vs `emulated`)** | Report `(a) executed` (~60–70% of real-malware runs), `(b) dormant` (~30–40% of real-malware runs), and `(c) emulated` (v1 `dev` only, 0% blind test) separately and pooled with weights disclosed | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-10`** | **Independent blinded human review** | **CHANGED:** **Mokh's friend is the primary blinded reviewer; Mokh scores the 20% overlap slice for Cohen's $\kappa$** (because Mokh built the labeler and is not independent). Blinded exports hide `label`, `label_reason`, `launcher`, `technique_id`, `sample_family` and require `reviewer_id`, `reviewed_at_utc`, per-row notes | **CHANGED & confirmed by Mokh 2026-11-23** |
+| **`OD-V2-11`** | **Feature schema scope** | Keep locked v1 `full_20` (20) + `no_content` (18) as the primary dual-config benchmark; add a separate secondary arm for the referential graph (`v2_refgraph`, see `OD-V2-13`), keeping any non-v1 features strictly outside `full_20`/`no_content` and the primary winner rule | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-12`** | **Benign software roster & target test prevalence** | Varied real software (Git, Python, 7-Zip, Notepad++, Sysinternals, procedural scripts), benign services, varied-trigger tasks, benign registry edits, legitimate unsigned PEs; disjoint dev/test profiles; **report natural (full-host snapshot) prevalence as the main view and a subsampled view as secondary, with weights disclosed** | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-13`** | **Referential-graph secondary arm (`v2_refgraph`)** | Secondary, pre-registered `"v2_refgraph"` config built ONLY from static cross-references inside the artifacts themselves (`ref_targets`, `ref_type`, `linked_artifact_keys`). Never uses labeling provenance, process trees, Sysmon, or timestamps. Never part of `full_20`/`no_content` or primary winner rule | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-14`** | **Tail-risk & analyst-effort metrics** | Secondary pre-registered metrics: worst-ranked positive rank, recall at review budgets (`k = 10/20/50/100`), positives in bottom 50%/90%, and `effort@recall` (50%/80%/90%); document random tail-audit sample-size upper bound $1 - 0.05^{1/n}$ ($n=5 \to 45\%$, $n=59 \to 5\%$, $n=300 \to 1\%$) as **future work only** | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-15`** | **Dormant-vs-executed feature-group delta** | For the same malware families present across both strata, pre-register a secondary comparison of which feature groups carry the ranking in each stratum (`full_20`, `no_content`, `drop_signature`, `v2_refgraph`) | **confirmed by Mokh 2026-11-23** |
 
 ---
 
 ## Detailed Decision Records
 
-### `OD-V2-01` — Data Targets Expressed in Families & Positives/Runs *(pending Mokh's confirmation)*
-- **Decision:** Express primary scale targets in **distinct malware families** (`>= 25–30` total families, with `>= 10–15` distinct families held out in the blind test) in addition to row/run targets (`~300–500` total positives across `100+` VM runs).
-- **Rationale:** v1 held out only `5` ATT&CK techniques (`33` test positives), limiting out-of-distribution generalization power. Because real malware variants of one family can exhibit multiple ATT&CK techniques, family-level sample size governs generalization variance (`IMP-05`). Stage A pilot yield measurements will determine final feasible counts before freezing Stage B targets.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-01` — Data Targets Expressed in Families & Positives/Runs
+- **Decision:** Express primary scale targets in **distinct malware families** (`>= 25–30` total families, with `>= 10–15` distinct families held out in the blind test) alongside rough run/positive anchors (`~300–500` total positives across `100+` VM runs). **The Stage A pilot decides what is feasible** before freezing Stage B targets.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-02` — v1 Data Reuse (`emulated` Training-Pool Stratum) *(pending Mokh's confirmation)*
-- **Decision:** Reuse v1 (`data/processed/dataset_v1.parquet`: `1,549` rows, `103` `attacker_induced` across 16 simulated ATT&CK techniques) strictly as a third **`"emulated"` training-pool (`dev`) stratum only**. Zero v1 rows, benign `artifact_key`s, or v1 emulated techniques may enter the v2 blind test — the v2 blind test is **100% new**. Every v2 table and report must explicitly disclose the v1 `emulated` reuse.
-- **Rationale:** Preserves v1 as a continuity/calibration anchor in training without contaminating the blind test with v1 template quantization or synthetic attack signatures.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-02` — v1 Data Reuse (`emulated` Training-Pool Stratum)
+- **Decision:** Reuse frozen v1 (`data/processed/dataset_v1.parquet`: `1,549` rows, `103` `attacker_induced` across 16 simulated ATT&CK techniques) strictly as a third **`"emulated"` training-pool (`dev`) stratum only**. Zero v1 rows, benign `artifact_key`s, or v1 emulated techniques enter the v2 blind test — the v2 blind test is **100% new**, and v1 reuse is explicitly disclosed in every v2 manifest, table, and report.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-03` — Fake-Internet Responder Architecture *(pending Mokh's confirmation)*
+### `OD-V2-03` — Fake-Internet Responder Architecture
 - **Decision:** Deploy **INetSim** on a **separate isolated Linux VM** (`inetsim-vm`, `192.168.150.10`) attached solely to `win11-isolated` (`virbr1`), with zero host-facing services and zero WAN forwarding (`IMP-02`).
-- **Rationale:** Avoids running network-facing fake services directly on the Linux host (eliminating host-exposed `INPUT` ports) and avoids in-guest FakeNet-NG interference/artifacts inside Windows 11 host telemetry.
-- **Status:** **`pending Mokh's confirmation`**
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-04` — Offline Overlay Extraction Toolchain *(pending Mokh's confirmation)*
-- **Decision:** Extract artifacts after `virsh destroy` exclusively via **user-space offline parsing inside an unprivileged container** (`--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges`, using user-space QCOW2/NTFS/registry/EVTX/Amcache/Prefetch parsers such as `dissect`, `regipy`, `evtx`, `libscca`), and **NEVER mount infected disk images in the host kernel** (`mount`, `qemu-nbd` kernel block mount, or host NTFS3/FUSE kernel paths).
-- **Rationale:** Prevents adversarial NTFS filesystem/image-parsing bugs or symlink attacks from affecting the host kernel while recovering `Amcache.hve` (`IMP-16`), `Sysmon` EVTX, registry hives, and `Prefetch` cleanly without VSS or live guest SSH (`IMP-02`).
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-04` — Offline Overlay Extraction Toolchain
+- **Decision:** Extract artifacts after `virsh destroy` exclusively via **user-space offline parsing inside an unprivileged container** (`--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges`, pure user-space QCOW2/NTFS/registry/EVTX/Amcache/Prefetch parsers such as `dissect`, `regipy`, `evtx`, `libscca`), and **NEVER mount infected disk images in the host kernel**.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-05` — Stage A Pilot Scope *(pending Mokh's confirmation)*
+### `OD-V2-05` — Stage A Pilot Scope
 - **Decision:** Run a dev-only calibration pilot of **`~3` clean control boots** + **`6–8` distinct non-test malware families × `1–2` runs** spanning both `executed` and `dormant` strata. Pilot families remain strictly outside the blind test pool.
-- **Rationale:** Empirically measures clean detonation rate, verified `attacker_induced` yield per run, `ambiguous_unattributed` quarantine rate, benign diversity, and per-run disk/time cost before committing full Stage B run quotas.
-- **Status:** **`pending Mokh's confirmation`**
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-06` — Multi-Seed & Nested CV Compute Budget *(pending Mokh's confirmation)*
-- **Decision:** Use **`K = 5` independent seeds** (`[42, 43, 44, 45, 46]`) for multi-seed `--final` evaluation (reporting per-seed mean ± std and the K-seed ensemble score) and learning curves, and **`30` equal trials per tuned model arm** (`rf`, `xgb`, `iforest`, `mlp`, `ae`, `lr`) in nested family-grouped dev CV (`IMP-08`, `IMP-09`).
-- **Rationale:** Quantifies neural/stochastic seed variance that v1's 1-seed `--final` masked (`std = 0.0600` on v1 dev MLP) and eliminates unequal hyperparameter search budgets across arms within ASUS TUF A15 (24 GB RAM) runtime limits.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-06` — Multi-Seed & Nested CV Compute Budget
+- **Decision:** Use **`K = 5` independent seeds** (`[42, 43, 44, 45, 46]`) for multi-seed `--final` evaluation (reporting per-seed mean ± std and the K-seed ensemble score) and learning curves, and **`30` equal trials per tuned model arm** (`rf`, `xgb`, `iforest`, `mlp`, `ae`, `lr`) in nested family-grouped dev CV, **with a pre-authorized fallback to `20` equal trials if the Stage A pilot shows compute is too heavy**.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-07` — Malware Sample Sourcing & Quarantine Vault *(pending Mokh's confirmation)*
-- **Decision:** Source samples exclusively from an authorized research/academic feed (e.g., MalwareBazaar or institutional malware collection) under recorded institutional/ethics approval; store outside the repository in an encrypted, non-executable quarantine vault (`chmod 0700` dir, `0400` AES-256 archive) with SHA-256 manifest preflight before injection. Zero acquisition prior to written Gate 0 sign-off.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-07` — Malware Sample Sourcing & Quarantine Vault
+- **Decision:** Source samples exclusively from an authorized research/academic feed under recorded institutional approvals; store outside the repository in an encrypted, non-executable quarantine vault (`chmod 0700` dir, `0400` AES-256 archive) with SHA-256 manifest preflight before injection. **Written professor/university approval is still required, and Gate 0 remains unsigned.** Zero malware acquisition or execution may occur until both are completed.
+- **Status:** **`design confirmed by Mokh 2026-11-23; written professor/university approval & Gate 0 sign-off PENDING`**
 
-### `OD-V2-08` — Malware Categories, Family Normalization & Deduplication *(pending Mokh's confirmation)*
-- **Decision:** Target balanced multi-category coverage across Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, and Trojanized Installer; normalize canonical family labels via AVClass2/ClarAVy consensus and group near-duplicate binaries/packers via `ssdeep`/TLSH/imphash clustering before assigning `dev` vs `blind_test` (`IMP-05`).
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-08` — Malware Categories, Family Normalization & Deduplication
+- **Decision:** Target balanced multi-category coverage across Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, and Trojanized Installer, **preferring families that execute meaningfully without live C2 infrastructure and leave host persistence artifacts**; normalize canonical family labels via AVClass2/ClarAVy consensus and group near-duplicate binaries/packers via `ssdeep`/TLSH/imphash clustering before assigning `dev` vs `blind_test` (`IMP-05`).
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-09` — Evaluation Stratum Mix (`executed` / `dormant` / `emulated`) *(pending Mokh's confirmation)*
-- **Decision:** Report every headline table separately for `(a) executed` (~60–70% of new real-malware runs), `(b) dormant` (~30–40% of new real-malware runs, static pre-execution binaries), and `(c) emulated` (v1 training-pool-only stratum, never in blind test), plus combined stratified summaries with exact weights disclosed.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-09` — Evaluation Stratum Mix (`executed` / `dormant` / `emulated`)
+- **Decision:** Report every headline table separately for `(a) executed` (~60–70% of new real-malware runs), `(b) dormant` (~30–40% of new real-malware runs, static pre-execution binaries), and `(c) emulated` (v1 `dev`-only continuity stratum, never in blind test), plus combined real-malware stratified summaries with exact weights disclosed.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-10` — Independent Blinded Human Review Ownership *(pending Mokh's confirmation)*
-- **Decision:** Mokh acts as primary blinded reviewer alongside a second independent reviewer scoring a stratified `20%` overlap slice for inter-rater Cohen's $\kappa$ (`IMP-04`). Review packs strip `label`, `label_reason`, `launcher`, `technique_id`, and `sample_family`; validation requires `reviewer_id`, `reviewed_at_utc`, `human_label`, and non-empty per-row `human_notes`.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-10` — Independent Blinded Human Review Ownership *(CHANGED)*
+- **Decision:** **Mokh's friend acts as the primary blinded reviewer, and Mokh scores the stratified `20%` overlap slice for inter-rater Cohen's $\kappa$** (because Mokh built the v2 labeler and is therefore not an independent primary reviewer). Review packs strip `label`, `label_reason`, `launcher`, `technique_id`, and `sample_family`; validation requires `reviewer_id`, `reviewed_at_utc`, `human_label`, and non-empty per-row `human_notes`.
+- **Status:** **`CHANGED & confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-11` — Feature Schema Scope (`full_20` / `no_content` vs `v2_extended`) *(pending Mokh's confirmation)*
-- **Decision:** Retain v1's exact 20 features (`full_20`) and 18 features (`no_content`) as the primary dual-configuration benchmark (`IMP-07`). Any additive v2 features (PE headers/imports, richer Sysmon lineage, Amcache fields) live strictly in a separately reported `v2_extended` evaluation and never alter the primary `full_20`/`no_content` winner rule.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-11` — Feature Schema Scope (`full_20` / `no_content` + Secondary `v2_refgraph`)
+- **Decision:** Retain v1's exact 20 features (`full_20`) and 18 features (`no_content`) as the primary dual-configuration benchmark (`IMP-07`). Add a separate secondary pre-registered arm for the static referential graph (`v2_refgraph`, `OD-V2-13`). Any additive features stay strictly outside `full_20`/`no_content` and never enter the primary dual-config winner rule.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-12` — Benign Software Roster & Target Test Prevalence *(pending Mokh's confirmation)*
-- **Decision:** Replace v1's 6-template benign script generator with varied real software workloads (Git, Python, 7-Zip, Notepad++, Sysinternals, procedural admin scripts), benign Windows services, varied-trigger scheduled tasks (`ONLOGON`, `DAILY`, `ONCE`), benign registry edits, and legitimate unsigned PE binaries (`IMP-06`), using disjoint dev vs blind-test host profiles (`IMP-05`). Evaluate the blind test at full realistic host-snapshot prevalence alongside balanced/hard-negative diagnostic slices.
-- **Status:** **`pending Mokh's confirmation`**
+### `OD-V2-12` — Benign Software Roster & Target Test Prevalence
+- **Decision:** Replace v1's 6-template benign script generator with varied real software workloads (Git, Python, 7-Zip, Notepad++, Sysinternals, procedural admin scripts), benign Windows services, varied-trigger scheduled tasks (`ONLOGON`, `DAILY`, `ONCE`), benign registry edits, and legitimate unsigned PE binaries (`IMP-06`), using disjoint dev vs blind-test host profiles (`IMP-05`). **Report natural (full-host snapshot) prevalence as the main blind-test evaluation view and a subsampled prevalence view as secondary, with stratum/sampling weights explicitly disclosed.**
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
+### `OD-V2-13` — Referential-Graph Secondary Arm (`v2_refgraph`)
+- **Decision:** Pre-register a secondary `"v2_refgraph"` configuration derived **strictly from static cross-references inside the artifacts themselves**:
+  - Normalized extraction targets stored in `ref_targets`, edge relation types in `ref_type`, and offline-resolved keys in `linked_artifact_keys` (e.g., Run key value -> target image path, service `ImagePath` -> binary, scheduled task action -> script/binary, Prefetch referenced files).
+  - **Strict anti-leakage constraint:** Links must **NEVER** inspect labeling provenance, Sysmon event logs, process trees, or timestamps (which would leak ground truth). Raw edge columns (`ref_targets`, `ref_type`, `linked_artifact_keys`) are barred from `full_20` and `no_content` via `FORBIDDEN_MODEL_INPUTS`; only the dedicated `v2_refgraph` feature builder may read them.
+  - Strictly secondary and **never** part of `full_20`/`no_content` or the primary dual-config winner rule.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
+### `OD-V2-14` — Tail-Risk & Analyst-Effort Metrics
+- **Decision:** Add pre-registered secondary tail-risk and analyst-effort metrics to evaluation outputs:
+  - Rank of the worst-ranked positive (`worst_positive_rank` and normalized rank percentile),
+  - Recall at analyst review budgets (`k in {10, 20, 50, 100}`),
+  - Positives falling in the bottom 50% and bottom 90% of model scores (`pos_in_bottom_50pct`, `pos_in_bottom_90pct`),
+  - Artifacts reviewed to reach target recall (`effort@recall` at 50%, 80%, and 90% recall, both absolute count and fraction of artifacts).
+  - Document the random tail-audit sample-size calculator: observing `0` missed positives in `n` uniform random draws from the tail gives a 95% Clopper-Pearson upper-bound miss rate of $p_{\text{upper}}(n) = 1 - 0.05^{1/n}$ (e.g., $n = 5 \to 45.1\%$, $n = 59 \to 5.0\%$, $n = 300 \to 1.0\%$). Any live/field tail audit is explicitly documented as **future work only**.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
+### `OD-V2-15` — Dormant-vs-Executed Feature-Group Delta
+- **Decision:** For malware families represented in both the `dormant` and `executed` strata, pre-register a secondary cross-stratum diagnostic measuring which feature groups carry the ranking in each stratum across **`full_20`**, **`no_content`**, **`drop_signature`**, and **`v2_refgraph`** (quantifying how signal shifts from static byte/signature properties in `dormant` runs to command-line/persistence/reference signals in `executed` runs).
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ---
 
 ## Operator Sign-Off Checklist (Mokh)
 
-- [ ] `OD-V2-01` — Family targets (`>= 25–30` total, `>= 10–15` blind test) & pilot-calibrated row targets *(pending Mokh's confirmation)*
-- [ ] `OD-V2-02` — v1 reuse strictly as `dev`-only `"emulated"` stratum; 100% new blind test *(pending Mokh's confirmation)*
-- [ ] `OD-V2-03` — INetSim on separate isolated Linux VM *(pending Mokh's confirmation)*
-- [ ] `OD-V2-04` — User-space offline parsing in unprivileged container (zero host-kernel mounts) *(pending Mokh's confirmation)*
-- [ ] `OD-V2-05` — Pilot scope (`~3` controls + `6–8` families × `1–2` runs) *(pending Mokh's confirmation)*
-- [ ] `OD-V2-06` — `K = 5` seeds and `30` equal trials per tuned model *(pending Mokh's confirmation)*
-- [ ] `OD-V2-07` — Authorized malware sourcing & Gate 0 quarantine vault rules *(pending Mokh's confirmation)*
-- [ ] `OD-V2-08` — Categories, AVClass2/ClarAVy normalization & fuzzy-hash clustering *(pending Mokh's confirmation)*
-- [ ] `OD-V2-09` — Stratum mix (`executed` / `dormant` / `emulated`) *(pending Mokh's confirmation)*
-- [ ] `OD-V2-10` — Blinded human review ownership & 20% dual-review Cohen's $\kappa$ *(pending Mokh's confirmation)*
-- [ ] `OD-V2-11` — Primary `full_20`/`no_content` continuity + isolated `v2_extended` *(pending Mokh's confirmation)*
-- [ ] `OD-V2-12` — Benign software roster, unsigned PEs, services/registry drift & full-host test prevalence *(pending Mokh's confirmation)*
+- [x] `OD-V2-01` — Family targets (`>= 25–30` total, `>= 10–15` blind test; pilot decides feasibility) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-02` — v1 reuse strictly as `dev`-only `"emulated"` stratum; 100% new blind test *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-03` — INetSim on separate isolated Linux VM *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-04` — User-space offline parsing in unprivileged container (zero host-kernel mounts) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-05` — Pilot scope (`~3` controls + `6–8` families × `1–2` runs) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-06` — `K = 5` seeds and `30` equal trials per tuned model (`20`-trial fallback if pilot compute too heavy) *(confirmed by Mokh 2026-11-23)*
+- [ ] `OD-V2-07` — Quarantine vault & SHA-256 manifest design confirmed (`2026-11-23`); **written professor/university approval & Gate 0 sign-off PENDING**
+- [x] `OD-V2-08` — Categories, AVClass2/ClarAVy normalization, fuzzy-hash clustering, prefer no-live-C2 persistence families *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-09` — Stratum mix (`executed` ~60–70% / `dormant` ~30–40% / `emulated` `dev`-only) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-10` — Friend primary blinded reviewer + Mokh scores 20% overlap for Cohen's $\kappa$ *(CHANGED & confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-11` — Primary `full_20`/`no_content` continuity + separate secondary `v2_refgraph` arm *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-12` — Varied benign roster; natural prevalence main view + subsampled secondary view (weights disclosed) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-13` — Static-only referential-graph arm (`v2_refgraph`), barred from `full_20`/`no_content` & winner rule *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-14` — Tail-risk & effort metrics + $1 - 0.05^{1/n}$ tail-audit calculator (tail audit = future work only) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-15` — Dormant-vs-executed feature-group delta (`full_20`, `no_content`, `drop_signature`, `v2_refgraph`) *(confirmed by Mokh 2026-11-23)*
