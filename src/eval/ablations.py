@@ -129,11 +129,18 @@ def run_all_ablations(
         ))
     for grp_name, drop_cols in config.FEATURE_GROUPS.items():
         kept = [f for f in config.FEATURES if f not in set(drop_cols)]
+        specs = kept
         ab_rows.extend(_eval_ablation_case(
             f"drop_{grp_name}", "feature_group_ablation", dev_df, test_df, arms,
-            features_override=kept, best_params=best_params,
+            features_override=specs, best_params=best_params,
             max_epochs_override=max_epochs_override,
         ))
+    no_content_cols = [f for f in config.FEATURES if f not in ("file_size_log", "file_entropy")]
+    ab_rows.extend(_eval_ablation_case(
+        "no_content", "feature_group_ablation", dev_df, test_df, arms,
+        features_override=no_content_cols, best_params=best_params,
+        max_epochs_override=max_epochs_override,
+    ))
 
     unsup_present = [a for a in arms if a in config.UNSUPERVISED_ARMS]
     if unsup_present:
@@ -168,14 +175,17 @@ def run_all_ablations(
 
 
 def main(argv: list[str] | None = None) -> int:
+    import json
     parser = argparse.ArgumentParser(description="Run Track A ablations and training-size curves.")
     parser.add_argument("--dataset", type=Path, default=config.PROCESSED_DIR / "dataset_v1.parquet")
     parser.add_argument("--out-dir", type=Path, default=config.TABLES_DIR)
+    parser.add_argument("--best-params", type=Path, default=config.TABLES_DIR / "track_a_best_params.json")
     parser.add_argument("--arms", nargs="+", default=list(config.ARMS), choices=config.ARMS + config.OPTIONAL_ARMS)
     args = parser.parse_args(argv)
 
     df = pd.read_parquet(args.dataset)
-    run_all_ablations(df, arms=args.arms, out_tables_dir=args.out_dir)
+    best_params = json.loads(args.best_params.read_text(encoding="utf-8")) if args.best_params and args.best_params.exists() else None
+    run_all_ablations(df, arms=args.arms, best_params=best_params, out_tables_dir=args.out_dir)
     return 0
 
 

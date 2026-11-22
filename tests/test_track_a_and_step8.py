@@ -309,3 +309,62 @@ def test_dev_baselines_type_slices_probes_ablations_and_holdout_isolation(tmp_pa
     ab = run_track_a.run_dev_ablations(ds, best_params=best1, arms=arms, seeds=[0], n_splits=3, out_tables_dir=d1, n_boot=20)
     assert "ORACLE UPPER BOUND, NOT A RESULT" in set(ab["ablation_tag"])
     assert {"primary_20", "plus_rule_hit_count", "unsup_baseline_only", "unsup_baseline_plus_drift"} <= set(ab["ablation"])
+
+
+def test_dual_config_verdicts_and_single_audit_final(tmp_path):
+    # 1. All 4 combine_dual_config_verdicts rules
+    base_cols = {
+        "artifact_slice": ["all"] * 4,
+        "arm_a": ["a1", "a2", "a3", "a4"],
+        "arm_b": ["b1", "b2", "b3", "b4"],
+        "arm_a_name": ["A1", "A2", "A3", "A4"],
+        "arm_b_name": ["B1", "B2", "B3", "B4"],
+        "n_rows": [100] * 4,
+        "n_pos": [10] * 4,
+        "n_neg": [90] * 4,
+        "pr_auc_a": [0.8, 0.4, 0.6, 0.7],
+        "pr_auc_b": [0.5, 0.7, 0.55, 0.5],
+        "diff": [0.3, -0.3, 0.05, 0.2],
+        "ci_lo": [0.1, -0.4, -0.05, 0.05],
+        "ci_hi": [0.4, -0.1, 0.15, 0.3],
+        "excludes_zero": [True, True, False, True],
+        "commit": ["deadbeef"] * 4,
+    }
+    pf = pd.DataFrame({**base_cols, "verdict": ["a_better", "b_better", "not distinguishable", "a_better"]})
+    pn = pd.DataFrame({**base_cols, "verdict": ["a_better", "b_better", "not distinguishable", "not distinguishable"]})
+    comb = run_track_a.combine_dual_config_verdicts(pf, pn)
+    assert list(comb["dual_verdict"]) == [
+        "a_better",
+        "b_better",
+        "not distinguishable",
+        "configuration-dependent",
+    ]
+
+    # 2. Single-audit dual-config --final run writes full_20 + no_content + verdict + metadata
+    ds, manifest = _make_synthetic_dataset(n_per_tech=6, n_benign=120)
+    tables_dir = tmp_path / "tables"
+    models_dir = tmp_path / "models"
+    logs_dir = tmp_path / "logs"
+    arms = ["rf", "xgb", "mlp"]
+    _, best_f = run_track_a.run_dev_cv(ds, arms=arms, n_trials=1, seeds=[0], n_splits=3, out_tables_dir=tables_dir, n_boot=20)
+    _, best_n = run_track_a.run_dev_cv(
+        ds, arms=arms, n_trials=1, seeds=[0], n_splits=3,
+        features_override=run_track_a.NO_CONTENT_FEATURES,
+        out_tables_dir=tables_dir / "no_content", n_boot=20,
+    )
+    res = run_track_a.run_final_eval(
+        ds, manifest, best_params=best_f, arms=arms, force=False,
+        out_tables_dir=tables_dir, models_dir=models_dir, logs_dir=logs_dir,
+        max_epochs_override=2, n_boot=20,
+        secondary_configs={"no_content": run_track_a.NO_CONTENT_FEATURES},
+        secondary_best_params={"no_content": best_n},
+    )
+    assert (tables_dir / "track_a_test_results.csv").exists()
+    assert (tables_dir / "no_content" / "track_a_test_results.csv").exists()
+    assert (tables_dir / "track_a_test_dual_config_verdict.csv").exists()
+    assert "dual_config_verdict" in res and "secondary" in res
+    assert {"name", "path", "command_line", "signature_status"} <= set(res["predictions"].columns)
+    audit_lines = [json.loads(l) for l in (logs_dir / "final_eval_audit.jsonl").read_text().splitlines()]
+    assert len(audit_lines) == 1
+    assert audit_lines[0]["status"] == "executed"
+    assert audit_lines[0]["configs"] == ["full_20", "no_content"]

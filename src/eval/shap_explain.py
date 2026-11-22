@@ -88,24 +88,25 @@ def explain_tree_arm(
     y_eval: np.ndarray,
     max_rows: int = 2000,
     seed: int = config.SEED,
+    orig_features: Sequence[str] = config.FEATURES,
 ) -> dict[str, Any]:
-    """Compute SHAP TreeExplainer values aggregated to the 20 original features."""
+    """Compute SHAP TreeExplainer values aggregated to `orig_features`."""
     idx = _stratified_sample_indices(y_eval, max_rows=max_rows, seed=seed)
     X_enc = pre.transform(eval_df.iloc[idx])
     explainer = shap.TreeExplainer(arm.model)
     raw_sv = explainer.shap_values(X_enc)
     sv_2d = _normalize_shap_2d(raw_sv)
-    signed_orig, abs_orig = aggregate_shap_to_original_features(sv_2d, pre.feature_origin_, config.FEATURES)
+    signed_orig, abs_orig = aggregate_shap_to_original_features(sv_2d, pre.feature_origin_, orig_features)
     mean_abs = abs_orig.mean(axis=0)
     summary = pd.DataFrame({
         "arm": arm.name,
-        "feature": config.FEATURES,
+        "feature": list(orig_features),
         "mean_abs_shap": mean_abs,
         "explainer": "TreeExplainer",
     }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
     return {
         "summary": summary,
-        "signed_df": pd.DataFrame(signed_orig, columns=config.FEATURES),
+        "signed_df": pd.DataFrame(signed_orig, columns=list(orig_features)),
         "sample_indices": idx,
         "explainer": "TreeExplainer",
     }
@@ -120,6 +121,7 @@ def explain_mlp_arm(
     bg_size: int = 100,
     max_rows: int = 500,
     seed: int = config.SEED,
+    orig_features: Sequence[str] = config.FEATURES,
 ) -> dict[str, Any]:
     """Compute SHAP GradientExplainer on CPU, falling back cleanly to KernelExplainer if needed."""
     set_global_seed(seed)
@@ -150,16 +152,16 @@ def explain_mlp_arm(
     finally:
         arm.net.to(orig_device).eval()
 
-    signed_orig, abs_orig = aggregate_shap_to_original_features(sv_2d, pre.feature_origin_, config.FEATURES)
+    signed_orig, abs_orig = aggregate_shap_to_original_features(sv_2d, pre.feature_origin_, orig_features)
     summary = pd.DataFrame({
         "arm": arm.name,
-        "feature": config.FEATURES,
+        "feature": list(orig_features),
         "mean_abs_shap": abs_orig.mean(axis=0),
         "explainer": explainer_used,
     }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
     return {
         "summary": summary,
-        "signed_df": pd.DataFrame(signed_orig, columns=config.FEATURES),
+        "signed_df": pd.DataFrame(signed_orig, columns=list(orig_features)),
         "sample_indices": idx,
         "explainer": explainer_used,
     }
@@ -199,18 +201,17 @@ def explain_autoencoder(
     pre: SharedPreprocessor,
     eval_df: pd.DataFrame,
     y_eval: np.ndarray,
+    orig_features: Sequence[str] = config.FEATURES,
 ) -> pd.DataFrame:
     """Per-feature mean reconstruction MSE on attacker_induced vs benign test rows."""
     X_enc = pre.transform(eval_df)
     pf_mse = arm.per_feature_mse(X_enc)
-    _, agg = aggregate_shap_to_original_features(pf_mse, pre.feature_origin_, config.FEATURES)
-    # Average over encoded columns per feature rather than sum? Actually sum of feature MSEs
-    # preserves exact additivity of total reconstruction MSE across the 20 original features.
+    _, agg = aggregate_shap_to_original_features(pf_mse, pre.feature_origin_, orig_features)
     y = np.asarray(y_eval).astype(int).ravel()
-    att = agg[y == 1].mean(axis=0) if (y == 1).any() else np.zeros(len(config.FEATURES))
-    ben = agg[y == 0].mean(axis=0) if (y == 0).any() else np.zeros(len(config.FEATURES))
+    att = agg[y == 1].mean(axis=0) if (y == 1).any() else np.zeros(len(orig_features))
+    ben = agg[y == 0].mean(axis=0) if (y == 0).any() else np.zeros(len(orig_features))
     return pd.DataFrame({
-        "feature": config.FEATURES,
+        "feature": list(orig_features),
         "mean_mse_attack": att,
         "mean_mse_benign": ben,
         "mse_diff_attack_minus_benign": att - ben,
@@ -225,6 +226,7 @@ def explain_iforest_permutation(
     y_eval: np.ndarray,
     n_repeats: int = 5,
     seed: int = config.SEED,
+    orig_features: Sequence[str] = config.FEATURES,
 ) -> pd.DataFrame:
     """Permutation importance on PR-AUC grouped by original feature (for Isolation Forest)."""
     rng = np.random.default_rng(seed)
@@ -236,7 +238,7 @@ def explain_iforest_permutation(
         col_map.setdefault(orig, []).append(idx)
 
     rows = []
-    for feat in config.FEATURES:
+    for feat in orig_features:
         idxs = col_map.get(feat, [])
         if not idxs:
             rows.append({"feature": feat, "pr_auc_drop_mean": 0.0, "pr_auc_drop_std": 0.0})
@@ -286,8 +288,10 @@ def run_all_explanations(
     max_mlp_rows: int = 500,
     mlp_bg_size: int = 100,
     seed: int = config.SEED,
+    features: Sequence[str] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Run SHAP (RF, XGB, MLP), AE reconstruction error, IF permutation importance, and error analysis."""
+    orig_features = list(features) if features is not None else list(config.FEATURES)
     dev_df = dataset_df[dataset_df["split_pool"] == "dev"].reset_index(drop=True)
     test_df = dataset_df[dataset_df["split_pool"] == "test"].reset_index(drop=True)
     y_test = (test_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
@@ -304,11 +308,13 @@ def run_all_explanations(
         pp = models_dir / f"track_a_final_{arm_key}_pre.joblib"
         if mp.exists() and pp.exists():
             arm, pre = loader(mp), joblib.load(pp)
-            res = explain_tree_arm(arm, pre, test_df, y_test, max_rows=max_tree_rows, seed=seed)
+            res = explain_tree_arm(
+                arm, pre, test_df, y_test, max_rows=max_tree_rows, seed=seed, orig_features=orig_features,
+            )
             summaries[arm_key] = res["summary"]
+            res["signed_df"].to_parquet(out_tables_dir / f"shap_{arm_key}_rows.parquet", index=False)
             if arm_key == "xgb":
-                res["signed_df"].to_parquet(out_tables_dir / "shap_xgb_rows.parquet", index=False)
-                test_df.iloc[res["sample_indices"]][config.FEATURES].reset_index(drop=True).to_parquet(
+                test_df.iloc[res["sample_indices"]][orig_features].reset_index(drop=True).to_parquet(
                     out_tables_dir / "shap_xgb_features.parquet", index=False
                 )
 
@@ -318,7 +324,7 @@ def run_all_explanations(
         arm_mlp, pre_mlp = TabularMLPArm.load(mp_mlp), joblib.load(pp_mlp)
         res_mlp = explain_mlp_arm(
             arm_mlp, pre_mlp, dev_df, test_df, y_test,
-            bg_size=mlp_bg_size, max_rows=max_mlp_rows, seed=seed,
+            bg_size=mlp_bg_size, max_rows=max_mlp_rows, seed=seed, orig_features=orig_features,
         )
         summaries["mlp"] = res_mlp["summary"]
 
@@ -334,14 +340,18 @@ def run_all_explanations(
     mp_ae = models_dir / "track_a_final_ae.bin"
     pp_ae = models_dir / "track_a_final_ae_pre.joblib"
     if mp_ae.exists() and pp_ae.exists():
-        ae_df = explain_autoencoder(DeepAutoencoderArm.load(mp_ae), joblib.load(pp_ae), test_df, y_test)
+        ae_df = explain_autoencoder(
+            DeepAutoencoderArm.load(mp_ae), joblib.load(pp_ae), test_df, y_test, orig_features=orig_features,
+        )
         ae_df.to_csv(out_tables_dir / "ae_recon_error.csv", index=False)
         outputs["ae_recon_error"] = ae_df
 
     mp_if = models_dir / "track_a_final_iforest.bin"
     pp_if = models_dir / "track_a_final_iforest_pre.joblib"
     if mp_if.exists() and pp_if.exists():
-        if_df = explain_iforest_permutation(IsolationForestArm.load(mp_if), joblib.load(pp_if), test_df, y_test, seed=seed)
+        if_df = explain_iforest_permutation(
+            IsolationForestArm.load(mp_if), joblib.load(pp_if), test_df, y_test, seed=seed, orig_features=orig_features,
+        )
         if_df.to_csv(out_tables_dir / "iforest_perm_importance.csv", index=False)
         outputs["iforest_perm"] = if_df
 
@@ -364,9 +374,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dataset", type=Path, default=config.PROCESSED_DIR / "dataset_v1.parquet")
     parser.add_argument("--models-dir", type=Path, default=config.MODELS_DIR)
     parser.add_argument("--out-dir", type=Path, default=config.TABLES_DIR)
+    parser.add_argument("--config", choices=["full_20", "no_content"], default="full_20")
     args = parser.parse_args(argv)
     df = pd.read_parquet(args.dataset)
-    run_all_explanations(df, models_dir=args.models_dir, out_tables_dir=args.out_dir)
+    feats = list(config.FEATURES) if args.config == "full_20" else [
+        f for f in config.FEATURES if f not in ("file_size_log", "file_entropy")
+    ]
+    run_all_explanations(df, models_dir=args.models_dir, out_tables_dir=args.out_dir, features=feats)
     return 0
 
 

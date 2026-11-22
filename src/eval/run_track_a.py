@@ -52,6 +52,14 @@ PROBE_FEATURE_SETS: dict[str, list[str]] = {
     "probe_content": ["file_size_log", "file_entropy", "signature_state"],
     "probe_artifact_type": ["artifact_type"],
 }
+NO_CONTENT_FEATURES: list[str] = [
+    f for f in config.FEATURES if f not in ("file_size_log", "file_entropy")
+]
+assert len(NO_CONTENT_FEATURES) == 18
+EVAL_CONFIGS: dict[str, list[str]] = {
+    "full_20": list(config.FEATURES),
+    "no_content": list(NO_CONTENT_FEATURES),
+}
 
 
 def _build_arm(arm_key: str, seed: int = config.SEED, params: dict[str, Any] | None = None,
@@ -324,6 +332,59 @@ def evaluate_score_vector(
     return row
 
 
+def _default_paired_pairs(score_map: dict[str, np.ndarray], y: np.ndarray) -> list[tuple[str, str]]:
+    """Build ordered unique paired comparison list for one score map."""
+    ml_keys = [k for k in score_map if k not in BASELINE_DISPLAY]
+    best_ml = max(ml_keys, key=lambda k: M.pr_auc(y, score_map[k])) if ml_keys else None
+    raw_pairs: list[tuple[str, str]] = [("xgb", "rf")]
+    if best_ml is not None:
+        raw_pairs.append((best_ml, "rules_binary"))
+    if best_ml != "rf":
+        raw_pairs.append(("rf", "rules_binary"))
+    if best_ml != "xgb":
+        raw_pairs.append(("xgb", "rules_binary"))
+    raw_pairs.extend([("rf", "mlp"), ("xgb", "mlp")])
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for a, b in raw_pairs:
+        if (a, b) not in seen and a != b and a in score_map and b in score_map:
+            seen.add((a, b))
+            out.append((a, b))
+    return out
+
+
+def combine_dual_config_verdicts(paired_full: pd.DataFrame, paired_no_content: pd.DataFrame) -> pd.DataFrame:
+    """Apply pre-registered dual-configuration winner rule across full_20 & no_content."""
+    keep_cols = [
+        "artifact_slice", "arm_a", "arm_b",
+        "pr_auc_a", "pr_auc_b", "diff", "ci_lo", "ci_hi", "excludes_zero", "verdict",
+    ]
+    a_df = paired_full[keep_cols + [c for c in ("arm_a_name", "arm_b_name", "n_rows", "n_pos", "n_neg") if c in paired_full.columns]]
+    b_df = paired_no_content[keep_cols]
+    merged = a_df.merge(
+        b_df,
+        on=["artifact_slice", "arm_a", "arm_b"],
+        how="inner",
+        suffixes=("_full_20", "_no_content"),
+    )
+    verdicts: list[str] = []
+    for _, r in merged.iterrows():
+        vf = str(r["verdict_full_20"])
+        vn = str(r["verdict_no_content"])
+        if vf == "a_better" and vn == "a_better":
+            verdicts.append("a_better")
+        elif vf == "b_better" and vn == "b_better":
+            verdicts.append("b_better")
+        elif vf == "not distinguishable" and vn == "not distinguishable":
+            verdicts.append("not distinguishable")
+        else:
+            verdicts.append("configuration-dependent")
+    merged["dual_verdict"] = verdicts
+    if "commit" in paired_full.columns and len(paired_full):
+        merged["commit"] = str(paired_full["commit"].iloc[0])
+    return merged
+
+
 def compute_paired_comparisons(
     df: pd.DataFrame,
     y: np.ndarray,
@@ -337,22 +398,7 @@ def compute_paired_comparisons(
     """Paired cluster bootstrap PR-AUC comparisons across all / hard-negative views."""
     names = arm_names or {**config.ARM_DISPLAY, **BASELINE_DISPLAY}
     if pairs is None:
-        ml_keys = [k for k in score_map if k not in BASELINE_DISPLAY]
-        best_ml = max(ml_keys, key=lambda k: M.pr_auc(y, score_map[k])) if ml_keys else None
-        raw_pairs: list[tuple[str, str]] = [("xgb", "rf")]
-        if best_ml is not None:
-            raw_pairs.append((best_ml, "rules_binary"))
-        if best_ml != "rf":
-            raw_pairs.append(("rf", "rules_binary"))
-        if best_ml != "xgb":
-            raw_pairs.append(("xgb", "rules_binary"))
-        raw_pairs.extend([("rf", "mlp"), ("xgb", "mlp")])
-        seen: set[tuple[str, str]] = set()
-        use_pairs: list[tuple[str, str]] = []
-        for a, b in raw_pairs:
-            if (a, b) not in seen and a != b and a in score_map and b in score_map:
-                seen.add((a, b))
-                use_pairs.append((a, b))
+        use_pairs = _default_paired_pairs(score_map, y)
     else:
         use_pairs = [(a, b) for a, b in pairs if a in score_map and b in score_map]
 
@@ -775,66 +821,39 @@ def _append_audit(audit_path: Path, entry: dict[str, Any]) -> None:
         f.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
-def run_final_eval(
-    df: pd.DataFrame,
-    manifest: dict[str, Any],
-    best_params: dict[str, dict[str, Any]] | None = None,
-    arms: Sequence[str] = config.ARMS,
-    force: bool = False,
-    out_tables_dir: Path = config.TABLES_DIR,
-    models_dir: Path = config.MODELS_DIR,
-    logs_dir: Path = config.LOGS_DIR,
-    allowed_extra: Sequence[str] = (),
-    features_override: Sequence[str] | None = None,
+def _eval_single_config_on_test(
+    dev_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    y_dev: np.ndarray,
+    y_test: np.ndarray,
+    arms: Sequence[str],
+    best_params: dict[str, dict[str, Any]],
+    features_override: Sequence[str] | None,
+    allowed_extra: Sequence[str],
+    out_tables_dir: Path,
+    models_dir: Path,
+    actual_hash: str,
+    commit: str,
     max_epochs_override: int | None = None,
     n_boot: int = config.N_BOOTSTRAP,
-) -> dict[str, pd.DataFrame]:
-    """Refit on ALL dev data with chosen params and evaluate ONCE on the frozen test set."""
+    run_probes: bool = True,
+) -> dict[str, Any]:
+    """Fit all arms for one feature configuration on dev_df and score frozen test_df."""
     out_tables_dir = Path(out_tables_dir)
     models_dir = Path(models_dir)
-    logs_dir = Path(logs_dir)
     out_tables_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
-    audit_path = logs_dir / "final_eval_audit.jsonl"
-    commit = get_commit_hash()
 
-    # Verify frozen test-set hash before evaluating
-    actual_hash = labeler.compute_frozen_test_hash(df)
-    expected_hash = manifest.get("test_sha256")
-    if expected_hash and actual_hash != expected_hash:
-        raise AssertionError(
-            f"Frozen test-set hash mismatch! expected={expected_hash}, actual={actual_hash}"
-        )
-
-    prior_executed = False
-    if audit_path.exists():
-        for line in audit_path.read_text(encoding="utf-8").splitlines():
-            if line.strip() and json.loads(line).get("status") == "executed":
-                prior_executed = True
-                break
-
-    if prior_executed and not force:
-        _append_audit(audit_path, {
-            "timestamp_utc": utc_now_iso(),
-            "commit": commit,
-            "status": "refused_duplicate_final",
-            "test_sha256": actual_hash,
-        })
-        raise RuntimeError(
-            "Final evaluation has already run on this frozen test set (audit guard). "
-            "Pass --force to run again."
-        )
-
-    dev_df = df[df["split_pool"] == "dev"].reset_index(drop=True)
-    test_df = df[df["split_pool"] == "test"].reset_index(drop=True)
-    y_dev = (dev_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
-    y_test = (test_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
     cat_cols, num_cols, bin_cols = _resolve_feature_lists(features_override, allowed_extra)
-    best_params = best_params or {}
-
     set_global_seed(config.SEED)
+
     test_meta_cols = [
-        c for c in ("run_id", "technique_id", "variant", "artifact_type", "artifact_key", config.LABEL_COL, "rule_hit_count")
+        c for c in (
+            "run_id", "technique_id", "variant", "artifact_type", "artifact_key",
+            "name", "path", "command_line", "registry_key", "registry_value",
+            "signature_status", "attributes", "file_sha256", "record_sha256",
+            config.LABEL_COL, "rule_hit_count",
+        )
         if c in test_df.columns
     ]
     preds_df = test_df[test_meta_cols].copy()
@@ -885,7 +904,6 @@ def run_final_eval(
         })
         t1_rows.append(row_t1)
 
-        # T5: per-technique performance against all test benign rows
         for tid in test_techniques:
             t_pos = (y_test == 1) & (test_df["technique_id"].astype(str).to_numpy() == tid)
             t_mask = ben_mask | t_pos
@@ -901,7 +919,6 @@ def run_final_eval(
                 "commit": commit,
             })
 
-        # PR curve points (subsampled cleanly to <= 200 points)
         prec, rec, _ = precision_recall_curve(y_test, scores)
         if len(prec) > 200:
             idx = np.linspace(0, len(prec) - 1, 200, dtype=int)
@@ -939,23 +956,26 @@ def run_final_eval(
         test_df, y_test, score_map, arm_names, group_by="run_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED,
     )
 
-    # Feature-subset probes evaluated once on frozen test set (fitted on full dev_df)
-    probe_rows: list[dict[str, Any]] = []
-    for probe_name, feat_cols in PROBE_FEATURE_SETS.items():
-        p_cat, p_num, p_bin = _resolve_feature_lists(feat_cols, ())
-        for arm_key in arms:
-            arm_p, pre_p = _fit_arm_on_split(
-                arm_key, dev_df, y_dev, None, None,
-                p_cat, p_num, p_bin, (),
-                seed=config.SEED, params=best_params.get(arm_key, {}),
-                max_epochs_override=max_epochs_override, inner_val_seed=config.SEED,
-            )
-            p_scores = arm_p.predict_scores(pre_p.transform(test_df))
-            probe_rows.append(_eval_feature_probes(
-                test_df, y_test, arm_key, probe_name, feat_cols, p_scores,
-                n_boot=n_boot, seed_mean=float("nan"), seed_std=float("nan"), commit=commit,
-            ))
-    probes_df = pd.DataFrame(probe_rows)
+    if run_probes:
+        probe_rows: list[dict[str, Any]] = []
+        for probe_name, feat_cols in PROBE_FEATURE_SETS.items():
+            p_cat, p_num, p_bin = _resolve_feature_lists(feat_cols, ())
+            for arm_key in arms:
+                arm_p, pre_p = _fit_arm_on_split(
+                    arm_key, dev_df, y_dev, None, None,
+                    p_cat, p_num, p_bin, (),
+                    seed=config.SEED, params=best_params.get(arm_key, {}),
+                    max_epochs_override=max_epochs_override, inner_val_seed=config.SEED,
+                )
+                p_scores = arm_p.predict_scores(pre_p.transform(test_df))
+                probe_rows.append(_eval_feature_probes(
+                    test_df, y_test, arm_key, probe_name, feat_cols, p_scores,
+                    n_boot=n_boot, seed_mean=float("nan"), seed_std=float("nan"), commit=commit,
+                ))
+        probes_df = pd.DataFrame(probe_rows)
+        probes_df.to_csv(out_tables_dir / "track_a_test_probes.csv", index=False)
+    else:
+        probes_df = pd.DataFrame()
 
     t1_df.to_csv(out_tables_dir / "track_a_test_results.csv", index=False)
     t5_df.to_csv(out_tables_dir / "track_a_per_technique.csv", index=False)
@@ -963,24 +983,7 @@ def run_final_eval(
     baselines_df.to_csv(out_tables_dir / "track_a_test_baselines.csv", index=False)
     by_type_df.to_csv(out_tables_dir / "track_a_test_by_artifact_type.csv", index=False)
     paired_df.to_csv(out_tables_dir / "track_a_test_paired_bootstrap.csv", index=False)
-    probes_df.to_csv(out_tables_dir / "track_a_test_probes.csv", index=False)
     preds_df.to_parquet(out_tables_dir / "track_a_test_predictions.parquet", index=False)
-
-    _append_audit(audit_path, {
-        "timestamp_utc": utc_now_iso(),
-        "commit": commit,
-        "status": "executed",
-        "forced": bool(force and prior_executed),
-        "arms": list(arms),
-        "test_sha256": actual_hash,
-    })
-    write_json(run_metadata({
-        "track": "A_final",
-        "arms": list(arms),
-        "test_sha256": actual_hash,
-        "forced": bool(force),
-        "best_params": best_params,
-    }), logs_dir / "track_a_final_meta.json")
 
     return {
         "t1": t1_df,
@@ -991,7 +994,137 @@ def run_final_eval(
         "by_artifact_type": by_type_df,
         "paired_bootstrap": paired_df,
         "probes": probes_df,
+        "score_map": score_map,
     }
+
+
+def run_final_eval(
+    df: pd.DataFrame,
+    manifest: dict[str, Any],
+    best_params: dict[str, dict[str, Any]] | None = None,
+    arms: Sequence[str] = config.ARMS,
+    force: bool = False,
+    out_tables_dir: Path = config.TABLES_DIR,
+    models_dir: Path = config.MODELS_DIR,
+    logs_dir: Path = config.LOGS_DIR,
+    allowed_extra: Sequence[str] = (),
+    features_override: Sequence[str] | None = None,
+    max_epochs_override: int | None = None,
+    n_boot: int = config.N_BOOTSTRAP,
+    secondary_configs: dict[str, Sequence[str]] | None = None,
+    secondary_best_params: dict[str, dict[str, dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Refit on ALL dev data with chosen params and evaluate ONCE on the frozen test set."""
+    out_tables_dir = Path(out_tables_dir)
+    models_dir = Path(models_dir)
+    logs_dir = Path(logs_dir)
+    out_tables_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = logs_dir / "final_eval_audit.jsonl"
+    commit = get_commit_hash()
+
+    # Verify frozen test-set hash before evaluating
+    actual_hash = labeler.compute_frozen_test_hash(df)
+    expected_hash = manifest.get("test_sha256")
+    if expected_hash and actual_hash != expected_hash:
+        raise AssertionError(
+            f"Frozen test-set hash mismatch! expected={expected_hash}, actual={actual_hash}"
+        )
+
+    prior_executed = False
+    if audit_path.exists():
+        for line in audit_path.read_text(encoding="utf-8").splitlines():
+            if line.strip() and json.loads(line).get("status") == "executed":
+                prior_executed = True
+                break
+
+    if prior_executed and not force:
+        _append_audit(audit_path, {
+            "timestamp_utc": utc_now_iso(),
+            "commit": commit,
+            "status": "refused_duplicate_final",
+            "test_sha256": actual_hash,
+        })
+        raise RuntimeError(
+            "Final evaluation has already run on this frozen test set (audit guard). "
+            "Pass --force to run again."
+        )
+
+    dev_df = df[df["split_pool"] == "dev"].reset_index(drop=True)
+    test_df = df[df["split_pool"] == "test"].reset_index(drop=True)
+    y_dev = (dev_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
+    y_test = (test_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
+    best_params = best_params or {}
+
+    primary = _eval_single_config_on_test(
+        dev_df, test_df, y_dev, y_test, arms, best_params,
+        features_override, allowed_extra, out_tables_dir, models_dir,
+        actual_hash, commit, max_epochs_override=max_epochs_override, n_boot=n_boot, run_probes=True,
+    )
+
+    sec_out: dict[str, dict[str, Any]] = {}
+    evaluated_configs = ["full_20" if features_override is None else "primary"]
+    if secondary_configs:
+        sec_params_map = secondary_best_params or {}
+        arm_names = {**config.ARM_DISPLAY, **BASELINE_DISPLAY}
+        for cfg_name, cfg_feats in secondary_configs.items():
+            cfg_params = sec_params_map.get(cfg_name, best_params)
+            res_s = _eval_single_config_on_test(
+                dev_df, test_df, y_dev, y_test, arms, cfg_params,
+                cfg_feats, (), out_tables_dir / cfg_name, models_dir / cfg_name,
+                actual_hash, commit, max_epochs_override=max_epochs_override, n_boot=n_boot, run_probes=False,
+            )
+            sec_out[cfg_name] = res_s
+            evaluated_configs.append(cfg_name)
+
+        if "no_content" in sec_out:
+            # Ensure paired comparisons include the union of best-vs-rules pairs across both configs
+            union_pairs = list(dict.fromkeys(
+                _default_paired_pairs(primary["score_map"], y_test)
+                + _default_paired_pairs(sec_out["no_content"]["score_map"], y_test)
+            ))
+            pf = compute_paired_comparisons(
+                test_df, y_test, primary["score_map"], arm_names, pairs=union_pairs,
+                group_by="run_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED,
+            )
+            pnc = compute_paired_comparisons(
+                test_df, y_test, sec_out["no_content"]["score_map"], arm_names, pairs=union_pairs,
+                group_by="run_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED,
+            )
+            pf.to_csv(out_tables_dir / "track_a_test_paired_bootstrap.csv", index=False)
+            pnc.to_csv(out_tables_dir / "no_content" / "track_a_test_paired_bootstrap.csv", index=False)
+            primary["paired_bootstrap"] = pf
+            sec_out["no_content"]["paired_bootstrap"] = pnc
+            dual_df = combine_dual_config_verdicts(pf, pnc)
+            dual_df.to_csv(out_tables_dir / "track_a_test_dual_config_verdict.csv", index=False)
+            primary["dual_config_verdict"] = dual_df
+
+    primary.pop("score_map", None)
+    for v in sec_out.values():
+        v.pop("score_map", None)
+    if sec_out:
+        primary["secondary"] = sec_out
+
+    _append_audit(audit_path, {
+        "timestamp_utc": utc_now_iso(),
+        "commit": commit,
+        "status": "executed",
+        "forced": bool(force and prior_executed),
+        "arms": list(arms),
+        "configs": evaluated_configs,
+        "test_sha256": actual_hash,
+    })
+    write_json(run_metadata({
+        "track": "A_final",
+        "arms": list(arms),
+        "configs": evaluated_configs,
+        "test_sha256": actual_hash,
+        "forced": bool(force),
+        "best_params": best_params,
+        "secondary_best_params": secondary_best_params or {},
+    }), logs_dir / "track_a_final_meta.json")
+
+    return primary
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1001,6 +1134,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dev", action="store_true", help="Run dev grouped CV random search.")
     parser.add_argument("--final", action="store_true", help="Run one-time frozen test evaluation.")
     parser.add_argument("--force", action="store_true", help="Allow re-running --final (logged to audit).")
+    parser.add_argument("--dual-config", action="store_true", help="Evaluate both full_20 and no_content configurations.")
     parser.add_argument("--n-trials", type=int, default=config.MAX_SEARCH_TRIALS)
     parser.add_argument("--arms", nargs="+", default=list(config.ARMS), choices=config.ARMS + config.OPTIONAL_ARMS)
     parser.add_argument("--include-lr", action="store_true")
@@ -1015,18 +1149,58 @@ def main(argv: list[str] | None = None) -> int:
         args.dev = True
 
     best_params: dict[str, dict[str, Any]] = {}
+    secondary_best: dict[str, dict[str, dict[str, Any]]] = {}
     if args.dev:
         _, best_params = run_dev_cv(df, arms=arms, n_trials=args.n_trials)
         if not args.skip_probes:
             run_dev_probes(df, best_params=best_params, arms=arms)
         if not args.skip_dev_ablations:
             run_dev_ablations(df, best_params=best_params, arms=arms)
-    elif (config.TABLES_DIR / "track_a_best_params.json").exists():
-        best_params = json.loads((config.TABLES_DIR / "track_a_best_params.json").read_text(encoding="utf-8"))
+        if args.dual_config:
+            _, nc_best = run_dev_cv(
+                df,
+                arms=arms,
+                n_trials=args.n_trials,
+                features_override=NO_CONTENT_FEATURES,
+                out_tables_dir=config.TABLES_DIR / "no_content",
+            )
+            secondary_best["no_content"] = nc_best
+            oof_f = pd.read_parquet(config.TABLES_DIR / "track_a_dev_oof_predictions.parquet")
+            oof_n = pd.read_parquet(config.TABLES_DIR / "no_content" / "track_a_dev_oof_predictions.parquet")
+            y_dev_oof = oof_f["y"].to_numpy()
+            s_f = {c[len("score_"):]: oof_f[c].to_numpy() for c in oof_f.columns if c.startswith("score_")}
+            s_n = {c[len("score_"):]: oof_n[c].to_numpy() for c in oof_n.columns if c.startswith("score_")}
+            union_pairs = list(dict.fromkeys(
+                _default_paired_pairs(s_f, y_dev_oof) + _default_paired_pairs(s_n, y_dev_oof)
+            ))
+            arm_names = {**config.ARM_DISPLAY, **BASELINE_DISPLAY}
+            pf = compute_paired_comparisons(oof_f, y_dev_oof, s_f, arm_names, pairs=union_pairs)
+            pn = compute_paired_comparisons(oof_n, y_dev_oof, s_n, arm_names, pairs=union_pairs)
+            pf.to_csv(config.TABLES_DIR / "track_a_dev_paired_bootstrap.csv", index=False)
+            pn.to_csv(config.TABLES_DIR / "no_content" / "track_a_dev_paired_bootstrap.csv", index=False)
+            combine_dual_config_verdicts(pf, pn).to_csv(
+                config.TABLES_DIR / "track_a_dev_dual_config_verdict.csv", index=False
+            )
+    else:
+        if (config.TABLES_DIR / "track_a_best_params.json").exists():
+            best_params = json.loads((config.TABLES_DIR / "track_a_best_params.json").read_text(encoding="utf-8"))
+        if args.dual_config and (config.TABLES_DIR / "no_content" / "track_a_best_params.json").exists():
+            secondary_best["no_content"] = json.loads(
+                (config.TABLES_DIR / "no_content" / "track_a_best_params.json").read_text(encoding="utf-8")
+            )
 
     if args.final:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest.exists() else {}
-        run_final_eval(df, manifest, best_params=best_params, arms=arms, force=args.force)
+        sec_cfgs = {"no_content": NO_CONTENT_FEATURES} if args.dual_config else None
+        run_final_eval(
+            df,
+            manifest,
+            best_params=best_params,
+            arms=arms,
+            force=args.force,
+            secondary_configs=sec_cfgs,
+            secondary_best_params=secondary_best if sec_cfgs else None,
+        )
     return 0
 
 
