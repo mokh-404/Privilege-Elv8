@@ -85,3 +85,13 @@ Both configurations are tuned strictly via grouped dev CV (`GroupKFold` over `11
 .venv/bin/python -u -m src.eval.figures --tables-dir results/tables --figures-dir results/figures
 .venv/bin/python -u -m src.eval.figures --tables-dir results/tables/no_content --figures-dir results/figures/no_content
 ```
+
+---
+
+## 7. Methodological Reporting Notes
+
+1. **Ablations (`src/eval/ablations.py`) Fit Strictly on Dev Data:** Every ablation model and preprocessing pipeline (`primary_20`, `plus_rule_hit_count`, `oracle_upper_bound`, `drop_<group>`, `no_content`, unsupervised benign-scope runs, and `frac_*`) fits exclusively on `split_pool == "dev"` using dev-frozen hyperparameters (`track_a_best_params.json`), with zero tuning on `split_pool == "test"`. The `oracle_upper_bound` row remains explicitly tagged `"ORACLE UPPER BOUND, NOT A RESULT"`.
+2. **FPR at 90% Recall Is Descriptive, Not a Deployable Operating Point:** `threshold_at_recall(y_test, scores, 0.9)` picks the score threshold on the test set's positives themselves (`n_pos = 33`), so `fpr_at_recall_0.9_*` characterizes the test ranking curve rather than a pre-calibrated deployment threshold (which must be selected on dev data).
+3. **"Best ML Model vs `rules_binary`" Selection Optimism:** Identifying the highest-PR-AUC ML model after observing test results slightly flatters that headline contrast; `rf vs rules_binary` and `xgb vs rules_binary` are therefore always reported separately alongside `"best ML vs rules_binary"`.
+4. **Statistical Power & Expected `no_content` Drop:** With only `33` test positives across `5` holdout techniques, `"not distinguishable"` between `xgb` and `rf` under paired `run_id` bootstrap is expected and reported as a legitimate empirical outcome, and `no_content` PR-AUC is expected to be lower than `full_20` due to removing `file_size_log` and `file_entropy`.
+
