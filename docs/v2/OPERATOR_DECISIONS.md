@@ -1,6 +1,6 @@
 # DFIR-Triage ML v2 — Operator Decisions & Onboarding Record
 
-**Status:** `OD-V2-01..06, 08, 09, 11..15 CONFIRMED BY MOKH (2026-11-23); OD-V2-10 CHANGED & CONFIRMED (2026-11-23); OD-V2-07 DESIGN CONFIRMED — WRITTEN PROFESSOR/UNIVERSITY APPROVAL & GATE 0 SIGN-OFF REMAIN PENDING`  
+**Status:** `OD-V2-01..06, 08, 09, 11..19 CONFIRMED BY MOKH (2026-11-23); OD-V2-10 CHANGED & CONFIRMED (2026-11-23); OD-V2-07 DESIGN CONFIRMED — WRITTEN PROFESSOR/UNIVERSITY APPROVAL & GATE 0 SIGN-OFF REMAIN PENDING`  
 **Single Source of Truth:** This document (decision records) together with [`docs/v2/V2_PLAN.md`](V2_PLAN.md) (v2 architecture, safety, methodology, and evaluation design) is the single source of truth for Phase v2.  
 **Related Docs:** [`V2_PLAN.md`](V2_PLAN.md) | [`FINAL_EVAL_PLAN_v2_SKELETON.md`](FINAL_EVAL_PLAN_v2_SKELETON.md) | [`v2/plan.md`](../../v2/plan.md) | [`IMPROVEMENT_ANALYSIS.md`](../IMPROVEMENT_ANALYSIS.md)
 
@@ -25,6 +25,10 @@
 | **`OD-V2-13`** | **Referential-graph secondary arm (`v2_refgraph`)** | Secondary, pre-registered `"v2_refgraph"` config built ONLY from static cross-references inside the artifacts themselves (`ref_targets`, `ref_type`, `linked_artifact_keys`). Never uses labeling provenance, process trees, Sysmon, or timestamps. Never part of `full_20`/`no_content` or primary winner rule | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-14`** | **Tail-risk & analyst-effort metrics** | Secondary pre-registered metrics: worst-ranked positive rank, recall at review budgets (`k = 10/20/50/100`), positives in bottom 50%/90%, and `effort@recall` (50%/80%/90%); document random tail-audit sample-size upper bound $1 - 0.05^{1/n}$ ($n=5 \to 45\%$, $n=59 \to 5\%$, $n=300 \to 1\%$) as **future work only** | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-15`** | **Cross-Stratum Execution Delta (`executed` vs `dormant`)** | On paired `sample_sha256` binaries ($s \in \mathcal{S}_{\text{paired}}$ via `pair_group_id`), pre-register secondary comparison of $\Delta_{\text{exec}}(M, C)$ across `full_20`, `no_content`, `drop_signature`, `no_content_no_sig`, plus `Rank_min` ($\Delta_{\text{first\_hit}}$), Intrusion-Detection Recall@k, and the Byte/Signature Evasion Resilience Hypothesis ($|\Delta_{\text{ablation, executed}}| < |\Delta_{\text{ablation, dormant}}|$) *(and secondary `v2_refgraph`)* | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-16`** | **Offline pointer capture (`v2_refgraph`)** | Offline unprivileged-container extractor MUST store raw static pointer fields as schema-validated structured records (Prefetch file metrics, MFT records/seq, Tasks XML/TaskCache, Registry Run/Winlogon/IFEO/CLSID/Services, WMI, LNK, Amcache), extracting **zero executable payloads** and barred strictly from `full_20`/`no_content` via `FORBIDDEN_MODEL_INPUTS` | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-17`** | **Propagation baselines for `v2_refgraph`** | Pre-register 3 interpretable propagation baselines for secondary `v2_refgraph`: `(a)` base ranker alone, `(b)` naive undirected propagation, and `(c)` hub-attenuated typed propagation (context-split + training-pool IHF weights) — all transparent & traceable | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-18`** | **Heterogeneous GNNs deferred** | Heterogeneous Graph Neural Networks (`R-GCN`, `GAT`) are **deferred** and explicitly excluded from v2 core | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-19`** | **Deferred post-v2-final stretch items** | Strictly post-`--final` stretch experiments (never delaying or gating v2 core): timestomp / temporal-baseline comparison, Prefetch-disabled server ablation, and external corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`) as qualitative case studies with **zero tuning** | **confirmed by Mokh 2026-11-23** |
 
 ---
 
@@ -103,6 +107,25 @@
   3. **Byte/Signature Evasion Resilience Hypothesis:** Pre-register the secondary test that removing byte/signature features causes severe degradation under `dormant` staging ($\Delta_{\text{ablation, dormant}}$) whereas post-detonation OS footprints preserve ranking performance ($|\Delta_{\text{ablation, executed}}| < |\Delta_{\text{ablation, dormant}}|$, tested via family-clustered paired bootstrap CI).
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
+### `OD-V2-16` — Offline Pointer Capture Schema (`v2_refgraph`)
+- **Decision:** Extend the offline user-space container extractor (`OD-V2-04`) to capture raw static pointer fields as **schema-validated structured records** (no executable payloads copied out of overlays) spanning Prefetch, `$MFT`, Scheduled Tasks (`XML` + `TaskCache`), Registry (`Run`/`RunOnce`/`Winlogon`/`IFEO`, `CLSID` `InprocServer32`/`LocalServer32`, `Services` + `ServiceDll`), WMI (`OBJECTS.DATA` filters/consumers/bindings), LNK (`BEEF0004` MFT ref / `ObjectId` / volume serial), and Amcache (`FileId`, `LowerCaseLongPath`). All extracted pointer columns and raw edge attributes remain strictly barred from `full_20` and `no_content` via `FORBIDDEN_MODEL_INPUTS`.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
+### `OD-V2-17` — Interpretable Propagation Baselines for `v2_refgraph`
+- **Decision:** Evaluate the secondary `v2_refgraph` arm using three interpretable, traceable propagation variants: `(a)` base ranker alone (out-of-fold local node scores, unpropagated), `(b)` naive undirected propagation over unsplit merged nodes, and `(c)` hub-attenuated typed propagation (context-scoped virtual node splitting + unidirectional `EXECUTES_IMAGE` + training-pool-only Inverse Host Frequency weighted directed edges).
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
+### `OD-V2-18` — Deferment of Heterogeneous GNNs (`R-GCN`, `GAT`)
+- **Decision:** Heterogeneous GNN architectures (`R-GCN`, `GAT`) are **deferred** and excluded from v2 core so that every `v2_refgraph` score remains forensically transparent and traceable to explicit static pointer paths.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
+### `OD-V2-19` — Deferred Post-v2-Final Stretch Items
+- **Decision:** Strictly **only after** the v2 `--final` evaluation completes, reserve the following as optional post-v2 stretch items (never gating v2 core):
+  1. Timestomp / temporal-windowed baseline sensitivity experiment,
+  2. Prefetch-disabled Windows Server ablation,
+  3. Public external forensic corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`) as **qualitative case studies with zero model tuning**.
+- **Status:** **`confirmed by Mokh 2026-11-23`**
+
 ---
 
 ## Operator Sign-Off Checklist (Mokh)
@@ -122,3 +145,7 @@
 - [x] `OD-V2-13` — Static-only referential-graph arm (`v2_refgraph`), barred from `full_20`/`no_content` & winner rule *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-14` — Tail-risk & effort metrics + $1 - 0.05^{1/n}$ tail-audit calculator (tail audit = future work only) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-15` — Cross-Stratum Execution Delta (`Delta_exec`, `Rank_min` / `Delta_first_hit`, Intrusion-Detection Recall@k, Byte/Signature Evasion Resilience Hypothesis across `full_20`, `no_content`, `drop_signature`, `no_content_no_sig`, `v2_refgraph`) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-16` — Offline pointer capture as schema-validated structured records (no payloads), barred from `full_20`/`no_content` *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-17` — Three interpretable propagation baselines for `v2_refgraph` (base alone, naive undirected, hub-attenuated typed) *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-18` — Heterogeneous GNNs (`R-GCN`, `GAT`) deferred, outside v2 core *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-19` — Post-v2-final deferred stretch (timestomp experiment, Prefetch-disabled server ablation, `ADFIR`/`NIST CFReDS`/`Magnet CTF` qualitative case studies with zero tuning) *(confirmed by Mokh 2026-11-23)*
