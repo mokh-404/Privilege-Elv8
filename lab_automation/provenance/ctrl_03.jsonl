@@ -1,0 +1,2 @@
+{"action": "idle_baseline_window", "expected_artifact_keys": [], "launcher": "control", "run_id": "ctrl_03", "seed": 45, "timestamp_utc": "2026-11-21T21:16:45Z"}
+{"action": "captured_runner_pids", "exclude_pids": [3008, 4244, 4272], "expected_artifact_keys": [], "launcher": "runner_meta", "run_id": "ctrl_03", "seed": 45, "sshd_pids": [3008, 4244, 4272], "timestamp_utc": "2026-11-21T21:17:30Z", "wrapper_pids": []}

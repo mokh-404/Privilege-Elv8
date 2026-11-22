@@ -1,11 +1,131 @@
 {
-  "commit": "a157c67765d7f620d8c1eab2a8123b9f43cc93bf-dirty",
+  "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
   "figures": [
     {
-      "commit": "a157c67765d7f620d8c1eab2a8123b9f43cc93bf-dirty",
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig1_pr_curves",
+      "file": "results/figures/fig1_pr_curves.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_pr_curves.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig1_pr_curves",
+      "file": "results/figures/fig1_pr_curves.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_pr_curves.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig2_precision_at_k",
+      "file": "results/figures/fig2_precision_at_k.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig2_precision_at_k",
+      "file": "results/figures/fig2_precision_at_k.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig3_fpr_at_recall",
+      "file": "results/figures/fig3_fpr_at_recall.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig3_fpr_at_recall",
+      "file": "results/figures/fig3_fpr_at_recall.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig4_training_size_curve",
+      "file": "results/figures/fig4_training_size_curve.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_train_size.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig4_training_size_curve",
+      "file": "results/figures/fig4_training_size_curve.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_train_size.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig5_shap_xgb_summary",
+      "file": "results/figures/fig5_shap_xgb_summary.png",
+      "format": "png",
+      "source_csvs": [
+        "shap_xgb_rows.parquet"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig5_shap_xgb_summary",
+      "file": "results/figures/fig5_shap_xgb_summary.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "shap_xgb_rows.parquet"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig6_shap_rank_comparison",
+      "file": "results/figures/fig6_shap_rank_comparison.png",
+      "format": "png",
+      "source_csvs": [
+        "shap_summary_all.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+      "dpi": 300,
+      "figure": "fig6_shap_rank_comparison",
+      "file": "results/figures/fig6_shap_rank_comparison.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "shap_summary_all.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
       "dpi": 300,
       "figure": "fig7_track_b_comparison",
-      "file": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/results/figures/fig7_track_b_comparison.png",
+      "file": "results/figures/fig7_track_b_comparison.png",
       "format": "png",
       "source_csvs": [
         "track_b_split1.csv",
@@ -13,16 +133,56 @@
       ]
     },
     {
-      "commit": "a157c67765d7f620d8c1eab2a8123b9f43cc93bf-dirty",
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
       "dpi": 300,
       "figure": "fig7_track_b_comparison",
-      "file": "/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/results/figures/fig7_track_b_comparison.pdf",
+      "file": "results/figures/fig7_track_b_comparison.pdf",
       "format": "pdf",
       "source_csvs": [
         "track_b_split1.csv",
         "track_b_split2.csv"
       ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig8_ablation_bars",
+      "file": "results/figures/fig8_ablation_bars.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_ablations.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig8_ablation_bars",
+      "file": "results/figures/fig8_ablation_bars.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_ablations.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig9_ae_recon_error",
+      "file": "results/figures/fig9_ae_recon_error.png",
+      "format": "png",
+      "source_csvs": [
+        "ae_recon_error.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig9_ae_recon_error",
+      "file": "results/figures/fig9_ae_recon_error.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "ae_recon_error.csv"
+      ]
     }
   ],
-  "generated_at_utc": "2026-11-21T02:56:54Z"
+  "generated_at_utc": "2026-11-22T02:05:40Z"
 }

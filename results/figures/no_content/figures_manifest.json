@@ -1,0 +1,126 @@
+{
+  "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+  "figures": [
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig1_pr_curves",
+      "file": "results/figures/no_content/fig1_pr_curves.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_pr_curves.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig1_pr_curves",
+      "file": "results/figures/no_content/fig1_pr_curves.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_pr_curves.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig2_precision_at_k",
+      "file": "results/figures/no_content/fig2_precision_at_k.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig2_precision_at_k",
+      "file": "results/figures/no_content/fig2_precision_at_k.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig3_fpr_at_recall",
+      "file": "results/figures/no_content/fig3_fpr_at_recall.png",
+      "format": "png",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig3_fpr_at_recall",
+      "file": "results/figures/no_content/fig3_fpr_at_recall.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "track_a_test_results.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig5_shap_xgb_summary",
+      "file": "results/figures/no_content/fig5_shap_xgb_summary.png",
+      "format": "png",
+      "source_csvs": [
+        "shap_xgb_rows.parquet"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig5_shap_xgb_summary",
+      "file": "results/figures/no_content/fig5_shap_xgb_summary.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "shap_xgb_rows.parquet"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig6_shap_rank_comparison",
+      "file": "results/figures/no_content/fig6_shap_rank_comparison.png",
+      "format": "png",
+      "source_csvs": [
+        "shap_summary_all.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig6_shap_rank_comparison",
+      "file": "results/figures/no_content/fig6_shap_rank_comparison.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "shap_summary_all.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig9_ae_recon_error",
+      "file": "results/figures/no_content/fig9_ae_recon_error.png",
+      "format": "png",
+      "source_csvs": [
+        "ae_recon_error.csv"
+      ]
+    },
+    {
+      "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45-dirty",
+      "dpi": 300,
+      "figure": "fig9_ae_recon_error",
+      "file": "results/figures/no_content/fig9_ae_recon_error.pdf",
+      "format": "pdf",
+      "source_csvs": [
+        "ae_recon_error.csv"
+      ]
+    }
+  ],
+  "generated_at_utc": "2026-11-22T02:05:42Z"
+}

@@ -1,0 +1,29 @@
+{
+  "ae": {
+    "batch_size": 256,
+    "lr": 0.005,
+    "weight_decay": 0.0
+  },
+  "iforest": {
+    "max_samples": "auto",
+    "n_estimators": 100
+  },
+  "lr": {
+    "C": 100.0
+  },
+  "mlp": {
+    "batch_size": 512,
+    "lr": 0.003,
+    "weight_decay": 0.01
+  },
+  "rf": {
+    "max_depth": 20,
+    "min_samples_leaf": 1,
+    "n_estimators": 500
+  },
+  "xgb": {
+    "learning_rate": 0.15,
+    "max_depth": 3,
+    "n_estimators": 500
+  }
+}

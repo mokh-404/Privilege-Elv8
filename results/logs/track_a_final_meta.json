@@ -1,0 +1,89 @@
+{
+  "arms": [
+    "rf",
+    "xgb",
+    "iforest",
+    "mlp",
+    "ae",
+    "lr"
+  ],
+  "best_params": {
+    "ae": {
+      "batch_size": 256,
+      "lr": 0.005,
+      "weight_decay": 0.0
+    },
+    "iforest": {
+      "max_samples": "auto",
+      "n_estimators": 100
+    },
+    "lr": {
+      "C": 100.0
+    },
+    "mlp": {
+      "batch_size": 256,
+      "lr": 0.005,
+      "weight_decay": 0.0003
+    },
+    "rf": {
+      "max_depth": 20,
+      "min_samples_leaf": 1,
+      "n_estimators": 500
+    },
+    "xgb": {
+      "learning_rate": 0.15,
+      "max_depth": 3,
+      "n_estimators": 500
+    }
+  },
+  "commit": "69ad02e4545b5586c09b1216154cfe7d62dc3a45",
+  "configs": [
+    "full_20",
+    "no_content"
+  ],
+  "device": "cuda",
+  "forced": false,
+  "generated_at_utc": "2026-11-22T02:04:38Z",
+  "numpy_version": "2.5.5",
+  "pandas_version": "3.1.1",
+  "platform": "Linux-7.2.8-9-omarchy-x86_64-with-glibc2.44",
+  "python": "3.12.16",
+  "secondary_best_params": {
+    "no_content": {
+      "ae": {
+        "batch_size": 256,
+        "lr": 0.005,
+        "weight_decay": 0.0
+      },
+      "iforest": {
+        "max_samples": "auto",
+        "n_estimators": 100
+      },
+      "lr": {
+        "C": 100.0
+      },
+      "mlp": {
+        "batch_size": 512,
+        "lr": 0.003,
+        "weight_decay": 0.01
+      },
+      "rf": {
+        "max_depth": 20,
+        "min_samples_leaf": 1,
+        "n_estimators": 500
+      },
+      "xgb": {
+        "learning_rate": 0.15,
+        "max_depth": 3,
+        "n_estimators": 500
+      }
+    }
+  },
+  "seed": 42,
+  "shap_version": "0.54.1",
+  "sklearn_version": "1.9.1",
+  "test_sha256": "0f1ff3ec054bf00c66875fb5d2466e3b8d35685d69c2f0203d6787b71852ffa8",
+  "torch_version": "2.15.0+cu132",
+  "track": "A_final",
+  "xgboost_version": "3.4.1"
+}

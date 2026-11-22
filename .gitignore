@@ -3,20 +3,23 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Data is never committed (raw guest output, external datasets, processed parquet)
+# Raw Win11 collector snapshots (644 MB total) and scratch dry runs stay excluded;
+# reproduce dataset_v1.parquet directly or archive data/raw/runs/ separately.
 data/raw/runs/*
 !data/raw/runs/.gitkeep
 data/raw/dry_runs/
+
+# Third-party CIC-MalMem-2022 CSV (~19 MB); download separately to re-run Track B.
 data/external/**/*.csv
+
+# Scratch interim outputs
 data/interim/*
 !data/interim/.gitkeep
-data/processed/*.parquet
 
-# Large model artefacts
-results/models/*
-!results/models/.gitkeep
+# Note: frozen Track A dataset (data/processed/dataset_v1.parquet, 296 KB),
+# production provenance logs (lab_automation/provenance/*.jsonl, 204 KB),
+# and trained Track A model binaries (results/models/, 16 MB, max 6.8 MB) ARE tracked.
 
-# Host-side provenance logs stay on the host (they are committed only if the operator decides)
-lab_automation/provenance/*.jsonl
+# Dry-run provenance and machine-local lab credentials/paths stay private.
 lab_automation/provenance/dry_runs/
 lab_automation/lab_config.yaml

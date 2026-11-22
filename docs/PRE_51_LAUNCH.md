@@ -1,7 +1,7 @@
 # Pre-51-Run Final Stratified Shortcut Audit & Launch Readiness
 
 **Generated:** 2026-11-21  
-**Repository:** [dfir-triage-ml](file:///home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/)  
+**Repository:** [dfir-triage-ml](..)  
 **Status:** ALL STRATIFIED CRITERIA PASSED & VERIFIED LIVE — AWAITING OPERATOR LAUNCH GO-AHEAD  
 
 ---
@@ -362,12 +362,12 @@ Executed fresh live dry run `dry_T1053_005_v1` on `win11` (145.45s runtime):
 To launch the full 51-run Track A batch in the background with power/sleep inhibition and persistent tmux session:
 
 ```bash
-tmux new-session -d -s batch51 'systemd-inhibit --why="Track A 51-run VM collection benchmark" /home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/.venv/bin/python -m lab_automation.run_all --resume 2>&1 | tee /home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/results/logs/batch51.log'
+tmux new-session -d -s batch51 'systemd-inhibit --why="Track A 51-run VM collection benchmark" .venv/bin/python -m lab_automation.run_all --resume 2>&1 | tee results/logs/batch51.log'
 ```
 
 To monitor progress:
 ```bash
 tmux attach -t batch51
 # or follow log:
-tail -f /home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/results/logs/batch51.log
+tail -f results/logs/batch51.log
 ```
