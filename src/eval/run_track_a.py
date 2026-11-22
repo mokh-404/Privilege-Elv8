@@ -1,7 +1,8 @@
-"""Track A five-arm evaluation: grouped dev CV, hyperparameter search, and one-time final eval.
+"""Track A five-arm evaluation: grouped dev CV, hyperparameter search, probes, and one-time final eval.
 
 Rules (doc 07 & doc 10 section 3):
-  - X uses config.FEATURES only (ORACLE_FEATURES, RULE_FEATURES, META_COLUMNS, LABEL_COL excluded).
+  - X uses config.FEATURES only (ORACLE_FEATURES, RULE_FEATURES, META_COLUMNS, LABEL_COL excluded),
+    except explicitly tagged probe/ablation runs.
   - Grouping: attacker_induced by technique_id; benign keys by hash bucket (75/25 dev/test,
     dev fold = bucket % 5). Zero key or technique overlap across folds or dev/test.
   - Unsupervised arms (iforest, ae) fit preprocessor & model on benign training rows ONLY.
@@ -35,6 +36,22 @@ from src.models.sklearn_models import (
     build_logistic_regression_arm,
 )
 from src.utils.repro import get_commit_hash, run_metadata, set_global_seed, utc_now_iso, write_json
+
+BASELINE_DISPLAY: dict[str, str] = {
+    "rules_binary": "Rules only (rule_hit_count > 0)",
+    "rules_count": "Rules only (rank by rule_hit_count)",
+    "random": "Random baseline",
+}
+HARD_NEG_ARTIFACT_TYPES: tuple[str, ...] = ("file", "run_key", "task")
+PROBE_FEATURE_SETS: dict[str, list[str]] = {
+    "full_20": list(config.FEATURES),
+    "probe_name_path": [
+        "path_class", "path_depth", "ext_class",
+        "has_double_extension", "name_length", "name_entropy",
+    ],
+    "probe_content": ["file_size_log", "file_entropy", "signature_state"],
+    "probe_artifact_type": ["artifact_type"],
+}
 
 
 def _build_arm(arm_key: str, seed: int = config.SEED, params: dict[str, Any] | None = None,
@@ -231,9 +248,177 @@ def _resolve_feature_lists(
     base = list(features_override) if features_override is not None else list(config.FEATURES)
     assert_no_forbidden_inputs(base + list(allowed_extra), allowed_extra=allowed_extra)
     cat_cols = [c for c in config.CATEGORICAL_FEATURES if c in base]
-    num_cols = [c for c in config.NUMERIC_FEATURES if c in base] + [c for c in allowed_extra if c not in config.CATEGORICAL_FEATURES + config.BINARY_FEATURES]
+    num_cols = [c for c in config.NUMERIC_FEATURES if c in base] + [
+        c for c in allowed_extra if c not in config.CATEGORICAL_FEATURES + config.BINARY_FEATURES
+    ]
     bin_cols = [c for c in config.BINARY_FEATURES if c in base]
     return cat_cols, num_cols, bin_cols
+
+
+def compute_baseline_scores(df: pd.DataFrame, seed: int = config.SEED) -> dict[str, np.ndarray]:
+    """Deterministic score vectors for non-ML baselines (rules + random)."""
+    scores: dict[str, np.ndarray] = {}
+    if "rule_hit_count" in df.columns:
+        rh = df["rule_hit_count"].fillna(0.0).to_numpy(dtype=float)
+        scores["rules_binary"] = (rh > 0).astype(float)
+        scores["rules_count"] = rh
+    scores["random"] = np.random.default_rng(seed).random(len(df))
+    return scores
+
+
+def evaluate_score_vector(
+    arm_key: str,
+    arm_name: str,
+    df: pd.DataFrame,
+    y: np.ndarray,
+    scores: np.ndarray,
+    n_boot: int = config.N_BOOTSTRAP,
+) -> dict[str, Any]:
+    """Compute ranking metrics, tie-expected @k, and run+technique bootstrap CIs on one slice."""
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    has_label = config.LABEL_COL in df.columns
+    clean_baseline_mask = (df[config.LABEL_COL].astype(str) == "baseline").to_numpy() if has_label else np.zeros(len(df), dtype=bool)
+    drift_mask = (df[config.LABEL_COL].astype(str) == "benign_drift").to_numpy() if has_label else np.zeros(len(df), dtype=bool)
+
+    if n_pos > 0 and n_neg > 0:
+        pr = M.pr_auc(y, scores)
+        roc = M.roc_auc(y, scores)
+        boot_run = M.bootstrap_track_a(M.pr_auc, y, scores, df, group_by="run_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED)
+        boot_tech = M.bootstrap_track_a(M.pr_auc, y, scores, df, group_by="technique_id", n_boot=n_boot, seed=config.BOOTSTRAP_SEED)
+        fpr_all = M.fpr_at_recall(y, scores, config.FIXED_RECALL)
+        fpr_base = M.fpr_at_recall(y, scores, config.FIXED_RECALL, negative_mask=clean_baseline_mask) if clean_baseline_mask.any() else float("nan")
+        fpr_drift = M.fpr_at_recall(y, scores, config.FIXED_RECALL, negative_mask=drift_mask) if drift_mask.any() else float("nan")
+    else:
+        pr = float("nan")
+        roc = float("nan")
+        boot_run = {"lo": float("nan"), "hi": float("nan")}
+        boot_tech = {"lo": float("nan"), "hi": float("nan")}
+        fpr_all = float("nan")
+        fpr_base = float("nan")
+        fpr_drift = float("nan")
+
+    row: dict[str, Any] = {
+        "arm": arm_key,
+        "arm_name": arm_name,
+        "n_rows": int(len(df)),
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+        "n_baseline": int(clean_baseline_mask.sum()),
+        "n_benign_drift": int(drift_mask.sum()),
+        "pr_auc": float(pr),
+        "pr_auc_ci_lo": float(boot_run["lo"]),
+        "pr_auc_ci_hi": float(boot_run["hi"]),
+        "pr_auc_run_ci_lo": float(boot_run["lo"]),
+        "pr_auc_run_ci_hi": float(boot_run["hi"]),
+        "pr_auc_tech_ci_lo": float(boot_tech["lo"]),
+        "pr_auc_tech_ci_hi": float(boot_tech["hi"]),
+        "roc_auc": float(roc),
+        "fpr_at_recall_0.9_all_benign": float(fpr_all),
+        "fpr_at_recall_0.9_clean_baseline": float(fpr_base),
+        "fpr_at_recall_0.9_benign_drift": float(fpr_drift),
+    }
+    for k in config.K_VALUES:
+        row[f"precision_at_{k}"] = M.tie_expected_precision_at_k(y, scores, k)
+        row[f"recall_at_{k}"] = M.tie_expected_recall_at_k(y, scores, k)
+    return row
+
+
+def evaluate_by_artifact_type(
+    df: pd.DataFrame,
+    y: np.ndarray,
+    score_map: dict[str, np.ndarray],
+    arm_names: dict[str, str],
+    n_boot: int = config.N_BOOTSTRAP,
+) -> pd.DataFrame:
+    """Evaluate all arms/baselines overall, on file+run_key+task hard negatives, and per artifact_type."""
+    slices: list[tuple[str, np.ndarray]] = [("all", np.ones(len(df), dtype=bool))]
+    if "artifact_type" in df.columns:
+        at = df["artifact_type"].astype(str)
+        hn_mask = at.isin(HARD_NEG_ARTIFACT_TYPES).to_numpy()
+        if hn_mask.any():
+            slices.append(("file+run_key+task", hn_mask))
+            if config.LABEL_COL in df.columns:
+                hn_drift = hn_mask & (df[config.LABEL_COL].astype(str) != "baseline").to_numpy()
+                if hn_drift.any():
+                    slices.append(("file+run_key+task_drift_only", hn_drift))
+        pos_types = (
+            df.loc[y == 1, "artifact_type"].astype(str).value_counts()
+        )
+        for atype in sorted(pos_types.index, key=lambda k: (-int(pos_types[k]), k)):
+            slices.append((atype, (at == atype).to_numpy()))
+
+    rows: list[dict[str, Any]] = []
+    commit = get_commit_hash()
+    for slice_name, mask in slices:
+        sub_df = df.iloc[mask].reset_index(drop=True)
+        y_sub = y[mask]
+        for key, scores in score_map.items():
+            rec = evaluate_score_vector(
+                key,
+                arm_names.get(key, key),
+                sub_df,
+                y_sub,
+                scores[mask],
+                n_boot=n_boot,
+            )
+            rec["artifact_slice"] = slice_name
+            rec["commit"] = commit
+            rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def _run_dev_oof(
+    dev_df: pd.DataFrame,
+    y_dev: np.ndarray,
+    arm_key: str,
+    cat_cols: Sequence[str],
+    num_cols: Sequence[str],
+    bin_cols: Sequence[str],
+    allowed_extra: Sequence[str],
+    seeds: Sequence[int],
+    n_splits: int,
+    params: dict[str, Any],
+    max_epochs_override: int | None = None,
+    unsup_baseline_only: bool = False,
+) -> tuple[list[np.ndarray], list[float]]:
+    """Run grouped dev CV across `seeds` for one arm/config; returns OOF vectors & per-seed PR-AUCs."""
+    seed_oof_list: list[np.ndarray] = []
+    seed_scores: list[float] = []
+    for cv_seed in seeds:
+        folds = make_dev_folds(dev_df, n_splits=n_splits, seed=cv_seed)
+        oof_scores = np.zeros(len(dev_df), dtype=float)
+        seen_val = np.zeros(len(dev_df), dtype=bool)
+        for tr_idx, va_idx in folds:
+            tr_sub = dev_df.iloc[tr_idx]
+            y_tr_sub = y_dev[tr_idx]
+            va_fit = dev_df.iloc[va_idx]
+            y_va_fit = y_dev[va_idx]
+
+            if unsup_baseline_only and arm_key in config.UNSUPERVISED_ARMS and config.LABEL_COL in dev_df.columns:
+                tr_bmask = (tr_sub[config.LABEL_COL].astype(str) == "baseline").to_numpy()
+                if tr_bmask.any():
+                    tr_sub = tr_sub.iloc[tr_bmask].reset_index(drop=True)
+                    y_tr_sub = np.zeros(len(tr_sub), dtype=int)
+                va_bmask = (va_fit[config.LABEL_COL].astype(str) == "baseline").to_numpy()
+                if va_bmask.any():
+                    va_fit = va_fit.iloc[va_bmask].reset_index(drop=True)
+                    y_va_fit = np.zeros(len(va_fit), dtype=int)
+
+            arm, pre = _fit_arm_on_split(
+                arm_key,
+                tr_sub, y_tr_sub,
+                va_fit, y_va_fit,
+                cat_cols, num_cols, bin_cols, allowed_extra,
+                seed=cv_seed, params=params, max_epochs_override=max_epochs_override,
+                inner_val_seed=cv_seed,
+            )
+            oof_scores[va_idx] = arm.predict_scores(pre.transform(dev_df.iloc[va_idx]))
+            seen_val[va_idx] = True
+        assert seen_val.all()
+        seed_oof_list.append(oof_scores)
+        seed_scores.append(M.pr_auc(y_dev, oof_scores))
+    return seed_oof_list, seed_scores
 
 
 def run_dev_cv(
@@ -246,8 +431,9 @@ def run_dev_cv(
     features_override: Sequence[str] | None = None,
     max_epochs_override: int | None = None,
     out_tables_dir: Path = config.TABLES_DIR,
+    n_boot: int = config.N_BOOTSTRAP,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
-    """Repeated grouped CV random search on the development split ONLY."""
+    """Repeated grouped CV random search + full OOF dev evaluation on the development split ONLY."""
     dev_df = df[df["split_pool"] == "dev"].reset_index(drop=True)
     y_dev = (dev_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
     cat_cols, num_cols, bin_cols = _resolve_feature_lists(features_override, allowed_extra)
@@ -257,32 +443,23 @@ def run_dev_cv(
 
     trial_rows: list[dict[str, Any]] = []
     best_params: dict[str, dict[str, Any]] = {}
+    best_oof_mean: dict[str, np.ndarray] = {}
+    best_seed_stats: dict[str, tuple[float, float]] = {}
 
     for arm_key in arms:
         param_cands = _sample_param_configs(arm_key, n_trials=n_trials, seed=config.SEED)
         best_score = -float("inf")
         best_cfg = param_cands[0]
+        best_oof_list: list[np.ndarray] = []
+        best_seeds_arr: list[float] = []
 
         for t_idx, p_cfg in enumerate(param_cands):
-            seed_scores = []
-            for cv_seed in seeds:
-                folds = make_dev_folds(dev_df, n_splits=n_splits, seed=cv_seed)
-                oof_scores = np.zeros(len(dev_df), dtype=float)
-                seen_val = np.zeros(len(dev_df), dtype=bool)
-                for tr_idx, va_idx in folds:
-                    arm, pre = _fit_arm_on_split(
-                        arm_key,
-                        dev_df.iloc[tr_idx], y_dev[tr_idx],
-                        dev_df.iloc[va_idx], y_dev[va_idx],
-                        cat_cols, num_cols, bin_cols, allowed_extra,
-                        seed=cv_seed, params=p_cfg, max_epochs_override=max_epochs_override,
-                        inner_val_seed=cv_seed,
-                    )
-                    oof_scores[va_idx] = arm.predict_scores(pre.transform(dev_df.iloc[va_idx]))
-                    seen_val[va_idx] = True
-                assert seen_val.all()
-                seed_scores.append(M.pr_auc(y_dev, oof_scores))
-
+            seed_oof_list, seed_scores = _run_dev_oof(
+                dev_df, y_dev, arm_key,
+                cat_cols, num_cols, bin_cols, allowed_extra,
+                seeds=seeds, n_splits=n_splits, params=p_cfg,
+                max_epochs_override=max_epochs_override,
+            )
             mean_pr = float(np.mean(seed_scores))
             std_pr = float(np.std(seed_scores))
             trial_rows.append({
@@ -297,12 +474,209 @@ def run_dev_cv(
             if mean_pr > best_score:
                 best_score = mean_pr
                 best_cfg = p_cfg
+                best_oof_list = seed_oof_list
+                best_seeds_arr = seed_scores
         best_params[arm_key] = dict(best_cfg)
+        best_oof_mean[arm_key] = np.mean(np.vstack(best_oof_list), axis=0)
+        best_seed_stats[arm_key] = (float(np.mean(best_seeds_arr)), float(np.std(best_seeds_arr)))
 
     trials_df = pd.DataFrame(trial_rows)
     trials_df.to_csv(out_tables_dir / "track_a_dev_trials.csv", index=False)
     write_json(best_params, out_tables_dir / "track_a_best_params.json")
+
+    # Combine tuned ML OOF scores + non-ML baselines strictly on dev_df
+    baseline_scores = compute_baseline_scores(dev_df, seed=config.SEED)
+    score_map: dict[str, np.ndarray] = dict(best_oof_mean)
+    score_map.update(baseline_scores)
+    arm_names = {**config.ARM_DISPLAY, **BASELINE_DISPLAY}
+
+    meta_cols = [
+        c for c in ("run_id", "technique_id", "variant", "artifact_type", "artifact_key", config.LABEL_COL, "rule_hit_count")
+        if c in dev_df.columns
+    ]
+    oof_df = dev_df[meta_cols].copy()
+    oof_df["y"] = y_dev
+    for key, vec in score_map.items():
+        oof_df[f"score_{key}"] = vec
+    oof_df.to_parquet(out_tables_dir / "track_a_dev_oof_predictions.parquet", index=False)
+
+    summary_rows: list[dict[str, Any]] = []
+    for key, scores in score_map.items():
+        rec = evaluate_score_vector(key, arm_names.get(key, key), dev_df, y_dev, scores, n_boot=n_boot)
+        s_mean, s_std = best_seed_stats.get(key, (float(rec["pr_auc"]), 0.0))
+        rec["cv_seed_pr_auc_mean"] = s_mean
+        rec["cv_seed_pr_auc_std"] = s_std
+        rec["params_json"] = json.dumps(best_params.get(key, {}), sort_keys=True)
+        rec["commit"] = commit
+        summary_rows.append(rec)
+    pd.DataFrame(summary_rows).to_csv(out_tables_dir / "track_a_dev_summary.csv", index=False)
+
+    by_type_df = evaluate_by_artifact_type(dev_df, y_dev, score_map, arm_names, n_boot=n_boot)
+    by_type_df.to_csv(out_tables_dir / "track_a_dev_by_artifact_type.csv", index=False)
+
+    # Per-technique dev OOF breakdown against all dev benign rows
+    dev_techniques = sorted(dev_df.loc[y_dev == 1, "technique_id"].astype(str).unique())
+    ben_mask = y_dev == 0
+    tech_rows: list[dict[str, Any]] = []
+    for key, scores in score_map.items():
+        for tid in dev_techniques:
+            t_pos = (y_dev == 1) & (dev_df["technique_id"].astype(str).to_numpy() == tid)
+            t_mask = ben_mask | t_pos
+            tech_rows.append({
+                "arm": key,
+                "arm_name": arm_names.get(key, key),
+                "technique_id": tid,
+                "n_positives": int(t_pos.sum()),
+                "pr_auc": M.pr_auc(y_dev[t_mask], scores[t_mask]),
+                "roc_auc": M.roc_auc(y_dev[t_mask], scores[t_mask]),
+                "precision_at_10": M.tie_expected_precision_at_k(y_dev[t_mask], scores[t_mask], 10),
+                "recall_at_50": M.tie_expected_recall_at_k(y_dev[t_mask], scores[t_mask], 50),
+                "commit": commit,
+            })
+    pd.DataFrame(tech_rows).to_csv(out_tables_dir / "track_a_dev_per_technique.csv", index=False)
     return trials_df, best_params
+
+
+def _eval_feature_probes(
+    probe_df: pd.DataFrame,
+    y: np.ndarray,
+    arm_key: str,
+    probe_name: str,
+    feat_cols: Sequence[str],
+    scores: np.ndarray,
+    n_boot: int,
+    seed_mean: float,
+    seed_std: float,
+    commit: str,
+) -> dict[str, Any]:
+    rec = evaluate_score_vector(arm_key, config.ARM_DISPLAY.get(arm_key, arm_key), probe_df, y, scores, n_boot=n_boot)
+    hn_pr, hn_drift_pr = float("nan"), float("nan")
+    if "artifact_type" in probe_df.columns:
+        at = probe_df["artifact_type"].astype(str)
+        hn_mask = at.isin(HARD_NEG_ARTIFACT_TYPES).to_numpy()
+        if hn_mask.any() and (y[hn_mask] == 1).any() and (y[hn_mask] == 0).any():
+            hn_pr = M.pr_auc(y[hn_mask], scores[hn_mask])
+        if config.LABEL_COL in probe_df.columns:
+            hn_drift = hn_mask & (probe_df[config.LABEL_COL].astype(str) != "baseline").to_numpy()
+            if hn_drift.any() and (y[hn_drift] == 1).any() and (y[hn_drift] == 0).any():
+                hn_drift_pr = M.pr_auc(y[hn_drift], scores[hn_drift])
+    rec["probe"] = probe_name
+    rec["n_features"] = int(len(feat_cols))
+    rec["features_json"] = json.dumps(list(feat_cols))
+    rec["cv_seed_pr_auc_mean"] = seed_mean
+    rec["cv_seed_pr_auc_std"] = seed_std
+    rec["hard_neg_pr_auc"] = float(hn_pr)
+    rec["hard_neg_drift_only_pr_auc"] = float(hn_drift_pr)
+    rec["commit"] = commit
+    return rec
+
+
+def run_dev_probes(
+    df: pd.DataFrame,
+    best_params: dict[str, dict[str, Any]] | None = None,
+    arms: Sequence[str] = config.ARMS,
+    seeds: Sequence[int] = config.DEV_CV_SEEDS,
+    n_splits: int = config.N_DEV_FOLDS,
+    max_epochs_override: int | None = None,
+    out_tables_dir: Path = config.TABLES_DIR,
+    n_boot: int = config.N_BOOTSTRAP,
+    probe_sets: dict[str, list[str]] | None = None,
+) -> pd.DataFrame:
+    """Feature-subset probe models trained & evaluated strictly via grouped CV on split_pool == 'dev'."""
+    dev_df = df[df["split_pool"] == "dev"].reset_index(drop=True)
+    y_dev = (dev_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
+    best_params = best_params or {}
+    probe_sets = probe_sets or PROBE_FEATURE_SETS
+    out_tables_dir = Path(out_tables_dir)
+    out_tables_dir.mkdir(parents=True, exist_ok=True)
+    commit = get_commit_hash()
+
+    rows: list[dict[str, Any]] = []
+    for probe_name, feat_cols in probe_sets.items():
+        cat_cols, num_cols, bin_cols = _resolve_feature_lists(feat_cols, ())
+        for arm_key in arms:
+            seed_oof_list, seed_scores = _run_dev_oof(
+                dev_df, y_dev, arm_key,
+                cat_cols, num_cols, bin_cols, (),
+                seeds=seeds, n_splits=n_splits,
+                params=best_params.get(arm_key, {}),
+                max_epochs_override=max_epochs_override,
+            )
+            oof_mean = np.mean(np.vstack(seed_oof_list), axis=0)
+            rows.append(_eval_feature_probes(
+                dev_df, y_dev, arm_key, probe_name, feat_cols, oof_mean,
+                n_boot=n_boot,
+                seed_mean=float(np.mean(seed_scores)),
+                seed_std=float(np.std(seed_scores)),
+                commit=commit,
+            ))
+
+    probe_df = pd.DataFrame(rows)
+    probe_df.to_csv(out_tables_dir / "track_a_dev_probes.csv", index=False)
+    return probe_df
+
+
+def run_dev_ablations(
+    df: pd.DataFrame,
+    best_params: dict[str, dict[str, Any]] | None = None,
+    arms: Sequence[str] = config.ARMS,
+    seeds: Sequence[int] = config.DEV_CV_SEEDS,
+    n_splits: int = config.N_DEV_FOLDS,
+    max_epochs_override: int | None = None,
+    out_tables_dir: Path = config.TABLES_DIR,
+    n_boot: int = config.N_BOOTSTRAP,
+) -> pd.DataFrame:
+    """Dev-only OOF ablations (rule_hit_count, oracle upper bound, drop feature groups, unsup baseline scope)."""
+    dev_df = df[df["split_pool"] == "dev"].reset_index(drop=True)
+    y_dev = (dev_df[config.LABEL_COL] == config.POSITIVE_LABEL).astype(int).to_numpy()
+    best_params = best_params or {}
+    out_tables_dir = Path(out_tables_dir)
+    out_tables_dir.mkdir(parents=True, exist_ok=True)
+    commit = get_commit_hash()
+
+    specs: list[tuple[str, str, Sequence[str] | None, Sequence[str], Sequence[str], bool]] = [
+        ("primary_20", "standard", None, (), arms, False),
+    ]
+    if all(c in dev_df.columns for c in config.RULE_FEATURES):
+        specs.append(("plus_rule_hit_count", "rule_ablation", None, config.RULE_FEATURES, arms, False))
+    if all(c in dev_df.columns for c in config.ORACLE_FEATURES):
+        specs.append(("oracle_upper_bound", "ORACLE UPPER BOUND, NOT A RESULT", None, config.ORACLE_FEATURES, arms, False))
+    for grp_name, drop_cols in config.FEATURE_GROUPS.items():
+        kept = [f for f in config.FEATURES if f not in set(drop_cols)]
+        specs.append((f"drop_{grp_name}", "feature_group_ablation", kept, (), arms, False))
+    unsup_arms = [a for a in arms if a in config.UNSUPERVISED_ARMS]
+    if unsup_arms:
+        specs.append(("unsup_baseline_only", "benign_scope_ablation", None, (), unsup_arms, True))
+        specs.append(("unsup_baseline_plus_drift", "benign_scope_ablation", None, (), unsup_arms, False))
+
+    rows: list[dict[str, Any]] = []
+    for ab_name, tag, feat_ovr, extra_cols, target_arms, unsup_only in specs:
+        cat_cols, num_cols, bin_cols = _resolve_feature_lists(feat_ovr, extra_cols)
+        for arm_key in target_arms:
+            seed_oof_list, seed_scores = _run_dev_oof(
+                dev_df, y_dev, arm_key,
+                cat_cols, num_cols, bin_cols, extra_cols,
+                seeds=seeds, n_splits=n_splits,
+                params=best_params.get(arm_key, {}),
+                max_epochs_override=max_epochs_override,
+                unsup_baseline_only=unsup_only,
+            )
+            oof_mean = np.mean(np.vstack(seed_oof_list), axis=0)
+            rec = _eval_feature_probes(
+                dev_df, y_dev, arm_key, ab_name,
+                list(feat_ovr) if feat_ovr is not None else list(config.FEATURES) + list(extra_cols),
+                oof_mean, n_boot=n_boot,
+                seed_mean=float(np.mean(seed_scores)),
+                seed_std=float(np.std(seed_scores)),
+                commit=commit,
+            )
+            rec["ablation"] = ab_name
+            rec["ablation_tag"] = tag
+            rows.append(rec)
+
+    ab_df = pd.DataFrame(rows)
+    ab_df.to_csv(out_tables_dir / "track_a_dev_ablations.csv", index=False)
+    return ab_df
 
 
 def _append_audit(audit_path: Path, entry: dict[str, Any]) -> None:
@@ -369,16 +743,19 @@ def run_final_eval(
     best_params = best_params or {}
 
     set_global_seed(config.SEED)
-    test_meta_cols = [c for c in ("run_id", "technique_id", "variant", "artifact_key", config.LABEL_COL) if c in test_df.columns]
+    test_meta_cols = [
+        c for c in ("run_id", "technique_id", "variant", "artifact_type", "artifact_key", config.LABEL_COL, "rule_hit_count")
+        if c in test_df.columns
+    ]
     preds_df = test_df[test_meta_cols].copy()
     preds_df["y"] = y_test
 
     t1_rows: list[dict[str, Any]] = []
     t5_rows: list[dict[str, Any]] = []
     pr_rows: list[dict[str, Any]] = []
+    score_map: dict[str, np.ndarray] = {}
 
-    clean_baseline_mask = (test_df[config.LABEL_COL] == "baseline").to_numpy()
-    run_groups = test_df["run_id"].astype(str).to_numpy()
+    ben_mask = y_test == 0
     test_techniques = sorted(test_df.loc[y_test == 1, "technique_id"].astype(str).unique())
 
     for arm_key in arms:
@@ -397,24 +774,15 @@ def run_final_eval(
         scores = arm.predict_scores(X_te)
         infer_per_1k = ((time.perf_counter() - t1) / max(1, len(test_df))) * 1000.0
         preds_df[f"score_{arm_key}"] = scores
+        score_map[arm_key] = scores
 
         arm.save(models_dir / f"track_a_final_{arm_key}.bin")
         joblib.dump(pre, models_dir / f"track_a_final_{arm_key}_pre.joblib")
 
-        pr = M.pr_auc(y_test, scores)
-        if pr > 0.98:
-            print(f"[WARNING] Track A arm {arm_key} reached PR-AUC={pr:.4f} (> 0.98); inspect for leakage!")
-
-        boot = M.bootstrap_by_group(M.pr_auc, y_test, scores, run_groups, n_boot=n_boot, seed=config.BOOTSTRAP_SEED)
-        row_t1 = {
-            "arm": arm_key,
-            "arm_name": config.ARM_DISPLAY[arm_key],
-            "pr_auc": pr,
-            "pr_auc_ci_lo": boot["lo"],
-            "pr_auc_ci_hi": boot["hi"],
-            "roc_auc": M.roc_auc(y_test, scores),
-            "fpr_at_recall_0.9_all_benign": M.fpr_at_recall(y_test, scores, config.FIXED_RECALL),
-            "fpr_at_recall_0.9_clean_baseline": M.fpr_at_recall(y_test, scores, config.FIXED_RECALL, negative_mask=clean_baseline_mask),
+        row_t1 = evaluate_score_vector(arm_key, config.ARM_DISPLAY[arm_key], test_df, y_test, scores, n_boot=n_boot)
+        if row_t1["pr_auc"] > 0.98:
+            print(f"[WARNING] Track A arm {arm_key} reached PR-AUC={row_t1['pr_auc']:.4f} (> 0.98); inspect for leakage!")
+        row_t1.update({
             "train_time_s": float(train_time_s),
             "infer_time_per_1k_s": float(infer_per_1k),
             "n_dev": int(len(dev_df)),
@@ -424,25 +792,22 @@ def run_final_eval(
             "seed": config.SEED,
             "bootstrap_seed": config.BOOTSTRAP_SEED,
             "commit": commit,
-        }
-        for k in config.K_VALUES:
-            row_t1[f"precision_at_{k}"] = M.precision_at_k(y_test, scores, k)
-            row_t1[f"recall_at_{k}"] = M.recall_at_k(y_test, scores, k)
+        })
         t1_rows.append(row_t1)
 
         # T5: per-technique performance against all test benign rows
-        ben_mask = y_test == 0
         for tid in test_techniques:
-            t_mask = ben_mask | ((y_test == 1) & (test_df["technique_id"].astype(str).to_numpy() == tid))
+            t_pos = (y_test == 1) & (test_df["technique_id"].astype(str).to_numpy() == tid)
+            t_mask = ben_mask | t_pos
             t5_rows.append({
                 "arm": arm_key,
                 "arm_name": config.ARM_DISPLAY[arm_key],
                 "technique_id": tid,
-                "n_positives": int(((y_test == 1) & (test_df["technique_id"].astype(str).to_numpy() == tid)).sum()),
+                "n_positives": int(t_pos.sum()),
                 "pr_auc": M.pr_auc(y_test[t_mask], scores[t_mask]),
                 "roc_auc": M.roc_auc(y_test[t_mask], scores[t_mask]),
-                "precision_at_10": M.precision_at_k(y_test[t_mask], scores[t_mask], 10),
-                "recall_at_50": M.recall_at_k(y_test[t_mask], scores[t_mask], 50),
+                "precision_at_10": M.tie_expected_precision_at_k(y_test[t_mask], scores[t_mask], 10),
+                "recall_at_50": M.tie_expected_recall_at_k(y_test[t_mask], scores[t_mask], 50),
                 "commit": commit,
             })
 
@@ -455,13 +820,56 @@ def run_final_eval(
             pr_rows.append({"arm": arm_key, "arm_name": config.ARM_DISPLAY[arm_key],
                             "recall": float(r_v), "precision": float(p_v)})
 
+    baseline_scores = compute_baseline_scores(test_df, seed=config.SEED)
+    for b_key, b_scores in baseline_scores.items():
+        preds_df[f"score_{b_key}"] = b_scores
+        score_map[b_key] = b_scores
+
+    arm_names = {**config.ARM_DISPLAY, **BASELINE_DISPLAY}
+    baseline_rows = []
+    for b_key, b_scores in baseline_scores.items():
+        rec = evaluate_score_vector(b_key, BASELINE_DISPLAY[b_key], test_df, y_test, b_scores, n_boot=n_boot)
+        rec.update({
+            "n_dev": int(len(dev_df)),
+            "n_test": int(len(test_df)),
+            "n_test_pos": int(y_test.sum()),
+            "test_sha256": actual_hash,
+            "seed": config.SEED,
+            "bootstrap_seed": config.BOOTSTRAP_SEED,
+            "commit": commit,
+        })
+        baseline_rows.append(rec)
+
     t1_df = pd.DataFrame(t1_rows)
     t5_df = pd.DataFrame(t5_rows)
     pr_df = pd.DataFrame(pr_rows)
+    baselines_df = pd.DataFrame(baseline_rows)
+    by_type_df = evaluate_by_artifact_type(test_df, y_test, score_map, arm_names, n_boot=n_boot)
+
+    # Feature-subset probes evaluated once on frozen test set (fitted on full dev_df)
+    probe_rows: list[dict[str, Any]] = []
+    for probe_name, feat_cols in PROBE_FEATURE_SETS.items():
+        p_cat, p_num, p_bin = _resolve_feature_lists(feat_cols, ())
+        for arm_key in arms:
+            arm_p, pre_p = _fit_arm_on_split(
+                arm_key, dev_df, y_dev, None, None,
+                p_cat, p_num, p_bin, (),
+                seed=config.SEED, params=best_params.get(arm_key, {}),
+                max_epochs_override=max_epochs_override, inner_val_seed=config.SEED,
+            )
+            p_scores = arm_p.predict_scores(pre_p.transform(test_df))
+            probe_rows.append(_eval_feature_probes(
+                test_df, y_test, arm_key, probe_name, feat_cols, p_scores,
+                n_boot=n_boot, seed_mean=float("nan"), seed_std=float("nan"), commit=commit,
+            ))
+    probes_df = pd.DataFrame(probe_rows)
 
     t1_df.to_csv(out_tables_dir / "track_a_test_results.csv", index=False)
     t5_df.to_csv(out_tables_dir / "track_a_per_technique.csv", index=False)
     pr_df.to_csv(out_tables_dir / "track_a_pr_curves.csv", index=False)
+    baselines_df.to_csv(out_tables_dir / "track_a_test_baselines.csv", index=False)
+    by_type_df.to_csv(out_tables_dir / "track_a_test_by_artifact_type.csv", index=False)
+    probes_df.to_csv(out_tables_dir / "track_a_test_probes.csv", index=False)
     preds_df.to_parquet(out_tables_dir / "track_a_test_predictions.parquet", index=False)
 
     _append_audit(audit_path, {
@@ -480,7 +888,15 @@ def run_final_eval(
         "best_params": best_params,
     }), logs_dir / "track_a_final_meta.json")
 
-    return {"t1": t1_df, "t5": t5_df, "pr_curves": pr_df, "predictions": preds_df}
+    return {
+        "t1": t1_df,
+        "t5": t5_df,
+        "pr_curves": pr_df,
+        "predictions": preds_df,
+        "baselines": baselines_df,
+        "by_artifact_type": by_type_df,
+        "probes": probes_df,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -493,10 +909,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-trials", type=int, default=config.MAX_SEARCH_TRIALS)
     parser.add_argument("--arms", nargs="+", default=list(config.ARMS), choices=config.ARMS + config.OPTIONAL_ARMS)
     parser.add_argument("--include-lr", action="store_true")
+    parser.add_argument("--skip-probes", action="store_true")
+    parser.add_argument("--skip-dev-ablations", action="store_true")
     args = parser.parse_args(argv)
 
     df = pd.read_parquet(args.dataset)
-    manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest.exists() else {}
     arms = list(args.arms) + (["lr"] if args.include_lr and "lr" not in args.arms else [])
 
     if not args.dev and not args.final:
@@ -505,10 +922,15 @@ def main(argv: list[str] | None = None) -> int:
     best_params: dict[str, dict[str, Any]] = {}
     if args.dev:
         _, best_params = run_dev_cv(df, arms=arms, n_trials=args.n_trials)
+        if not args.skip_probes:
+            run_dev_probes(df, best_params=best_params, arms=arms)
+        if not args.skip_dev_ablations:
+            run_dev_ablations(df, best_params=best_params, arms=arms)
     elif (config.TABLES_DIR / "track_a_best_params.json").exists():
         best_params = json.loads((config.TABLES_DIR / "track_a_best_params.json").read_text(encoding="utf-8"))
 
     if args.final:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest.exists() else {}
         run_final_eval(df, manifest, best_params=best_params, arms=arms, force=args.force)
     return 0
 

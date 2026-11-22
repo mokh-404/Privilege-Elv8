@@ -131,3 +131,54 @@ def test_preprocessor_keeps_all_nan_numeric_column():
     pre = SharedPreprocessor(categorical=[], numeric=["a", "b"], binary=[]).fit(df)
     X = pre.transform(df)
     assert X.shape[1] == len(pre.feature_origin_) == len(pre.feature_names_) == 3
+
+
+def test_tie_expected_at_k_row_order_invariant():
+    # Positives-first vs positives-last under identical tied scores must produce exact expectation
+    y_pos_first = np.array([1, 1, 0, 0, 0, 1, 0, 0])
+    s_pos_first = np.array([1, 1, 1, 1, 0, 0, 0, 0], dtype=float)
+    y_neg_first = np.array([0, 0, 1, 1, 0, 0, 0, 1])
+    s_neg_first = np.array([1, 1, 1, 1, 0, 0, 0, 0], dtype=float)
+
+    for k, exp_p, exp_r in [(2, 0.5, 1 / 3), (4, 0.5, 2 / 3), (6, 2.5 / 6, 2.5 / 3)]:
+        assert M.tie_expected_precision_at_k(y_pos_first, s_pos_first, k) == pytest.approx(exp_p)
+        assert M.tie_expected_precision_at_k(y_neg_first, s_neg_first, k) == pytest.approx(exp_p)
+        assert M.tie_expected_recall_at_k(y_pos_first, s_pos_first, k) == pytest.approx(exp_r)
+        assert M.tie_expected_recall_at_k(y_neg_first, s_neg_first, k) == pytest.approx(exp_r)
+
+    # Without ties, matches standard precision_at_k and recall_at_k
+    for k in (1, 2, 4, 5, 100):
+        assert M.tie_expected_precision_at_k(Y, S, k) == pytest.approx(M.precision_at_k(Y, S, k))
+        assert M.tie_expected_recall_at_k(Y, S, k) == pytest.approx(M.recall_at_k(Y, S, k))
+
+
+def test_bootstrap_track_a_run_and_technique():
+    rows = []
+    for i in range(60):
+        rows.append({"run_id": "ctrl_01", "technique_id": None, "label": "baseline"})
+    for r in range(6):
+        rid = f"run_{r}"
+        for _ in range(5):
+            rows.append({"run_id": rid, "technique_id": None, "label": "benign_drift"})
+        for k in range(3):
+            rows.append({"run_id": rid, "technique_id": f"T{r % 3}", "label": "attacker_induced"})
+    df = pd.DataFrame(rows)
+    y = (df["label"] == "attacker_induced").astype(int).to_numpy()
+    rng = np.random.default_rng(7)
+    s = np.clip(rng.normal(0.2 + 0.5 * y, 0.15), 0.0, 1.0)
+
+    r1 = M.bootstrap_track_a(M.pr_auc, y, s, df, group_by="run_id", n_boot=40, seed=42)
+    r2 = M.bootstrap_track_a(M.pr_auc, y, s, df, group_by="run_id", n_boot=40, seed=42)
+    t1 = M.bootstrap_track_a(M.pr_auc, y, s, df, group_by="technique_id", n_boot=40, seed=42)
+    assert r1 == r2
+    assert r1["group_by"] == "run_id" and t1["group_by"] == "technique_id"
+    assert r1["n_boot_valid"] == 40 and t1["n_boot_valid"] == 40
+    assert 0.0 <= r1["lo"] <= r1["point"] <= r1["hi"] <= 1.0 + 1e-12
+    assert 0.0 <= t1["lo"] <= t1["point"] <= t1["hi"] <= 1.0 + 1e-12
+
+    # Drift-only subset (no baseline rows) still works without error
+    no_base = df[df["label"] != "baseline"].reset_index(drop=True)
+    y_nb = (no_base["label"] == "attacker_induced").astype(int).to_numpy()
+    s_nb = s[(df["label"] != "baseline").to_numpy()]
+    nb_ci = M.bootstrap_track_a(M.pr_auc, y_nb, s_nb, no_base, group_by="run_id", n_boot=25, seed=1)
+    assert nb_ci["n_boot_valid"] > 0 and nb_ci["lo"] <= nb_ci["point"] <= nb_ci["hi"]

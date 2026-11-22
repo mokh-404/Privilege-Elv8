@@ -120,10 +120,14 @@ def test_track_a_end_to_end_final_guard_ablations_shap_and_figures(tmp_path):
     # 1. Dev CV (1 trial, 1 seed, 2 epochs)
     trials, best = run_track_a.run_dev_cv(
         ds, arms=config.ARMS, n_trials=1, seeds=[0], n_splits=3,
-        max_epochs_override=2, out_tables_dir=tables_dir,
+        max_epochs_override=2, out_tables_dir=tables_dir, n_boot=20,
     )
     assert set(trials["arm"]) == set(config.ARMS)
     assert set(best) == set(config.ARMS)
+    assert (tables_dir / "track_a_dev_summary.csv").exists()
+    assert (tables_dir / "track_a_dev_by_artifact_type.csv").exists()
+    assert (tables_dir / "track_a_dev_per_technique.csv").exists()
+    assert (tables_dir / "track_a_dev_oof_predictions.parquet").exists()
 
     # 2. Tampered test hash must fail
     tampered = ds.copy()
@@ -143,6 +147,11 @@ def test_track_a_end_to_end_final_guard_ablations_shap_and_figures(tmp_path):
         max_epochs_override=2, n_boot=20,
     )
     assert set(res["t1"]["arm"]) == set(config.ARMS)
+    for col in ("pr_auc_run_ci_lo", "pr_auc_run_ci_hi", "pr_auc_tech_ci_lo", "pr_auc_tech_ci_hi", "fpr_at_recall_0.9_benign_drift"):
+        assert col in res["t1"].columns
+    assert set(res["baselines"]["arm"]) == {"rules_binary", "rules_count", "random"}
+    assert {"all", "file+run_key+task", "file+run_key+task_drift_only"} <= set(res["by_artifact_type"]["artifact_slice"])
+    assert set(res["probes"]["probe"]) == set(run_track_a.PROBE_FEATURE_SETS)
     assert len(res["t5"]) == 5 * 5   # 5 holdout techniques x 5 arms
 
     with pytest.raises(RuntimeError, match="--force"):
@@ -253,3 +262,44 @@ def test_export_findings_schema_and_no_ground_truth_technique_leak(tmp_path):
     assert l0["ml_rank"] == 2
     assert l0["artifact_ref"]["file_sha256"] is None
     assert len(l0["artifact_ref"]["record_sha256"]) == 64
+
+
+def test_dev_baselines_type_slices_probes_ablations_and_holdout_isolation(tmp_path):
+    ds, _ = _make_synthetic_dataset(n_per_tech=6, n_benign=120)
+
+    # Single-class slice (run_key has positives only, 0 benign in synthetic fixture) must stay NaN cleanly
+    y_all = (ds["label"] == "attacker_induced").astype(int).to_numpy()
+    bscores = run_track_a.compute_baseline_scores(ds, seed=42)
+    assert set(bscores) == {"rules_binary", "rules_count", "random"}
+    by_type = run_track_a.evaluate_by_artifact_type(
+        ds, y_all, bscores, run_track_a.BASELINE_DISPLAY, n_boot=20,
+    )
+    rk_rows = by_type[by_type["artifact_slice"] == "run_key"]
+    assert len(rk_rows) == 3
+    assert rk_rows["pr_auc"].isna().all()
+    assert {"all", "file+run_key+task", "file+run_key+task_drift_only", "file", "run_key"} <= set(by_type["artifact_slice"])
+
+    # Strict holdout isolation: mutating split_pool == 'test' must not alter dev CV, probes, or ablations
+    ds_corrupt_test = ds.copy()
+    test_mask = ds_corrupt_test["split_pool"] == "test"
+    ds_corrupt_test.loc[test_mask, "label"] = "baseline"
+    ds_corrupt_test.loc[test_mask, "name_length"] = -999.0
+
+    d1, d2 = tmp_path / "clean", tmp_path / "corrupt"
+    arms = ["rf", "iforest", "lr"]
+    _, best1 = run_track_a.run_dev_cv(ds, arms=arms, n_trials=1, seeds=[0], n_splits=3, out_tables_dir=d1, n_boot=20)
+    _, best2 = run_track_a.run_dev_cv(ds_corrupt_test, arms=arms, n_trials=1, seeds=[0], n_splits=3, out_tables_dir=d2, n_boot=20)
+    assert best1 == best2
+    s1 = pd.read_csv(d1 / "track_a_dev_summary.csv")
+    s2 = pd.read_csv(d2 / "track_a_dev_summary.csv")
+    assert set(s1["arm"]) == set(arms) | {"rules_binary", "rules_count", "random"}
+    assert np.allclose(s1["pr_auc"].fillna(-1), s2["pr_auc"].fillna(-1))
+
+    p1 = run_track_a.run_dev_probes(ds, best_params=best1, arms=arms, seeds=[0], n_splits=3, out_tables_dir=d1, n_boot=20)
+    p2 = run_track_a.run_dev_probes(ds_corrupt_test, best_params=best2, arms=arms, seeds=[0], n_splits=3, out_tables_dir=d2, n_boot=20)
+    assert set(p1["probe"]) == set(run_track_a.PROBE_FEATURE_SETS)
+    assert np.allclose(p1["pr_auc"].fillna(-1), p2["pr_auc"].fillna(-1))
+
+    ab = run_track_a.run_dev_ablations(ds, best_params=best1, arms=arms, seeds=[0], n_splits=3, out_tables_dir=d1, n_boot=20)
+    assert "ORACLE UPPER BOUND, NOT A RESULT" in set(ab["ablation_tag"])
+    assert {"primary_20", "plus_rule_hit_count", "unsup_baseline_only", "unsup_baseline_plus_drift"} <= set(ab["ablation"])

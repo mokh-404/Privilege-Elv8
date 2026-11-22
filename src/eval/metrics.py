@@ -63,6 +63,38 @@ def recall_at_k(y, scores, k: int) -> float:
     return float(y[top].sum() / n_pos)
 
 
+def _expected_positives_in_top_k(y: np.ndarray, s: np.ndarray, k: int) -> float:
+    """Expected number of positives in top-k under uniform random tie breaking."""
+    k_eff = min(int(k), len(y))
+    _, inv, counts = np.unique(-s, return_inverse=True, return_counts=True)
+    pos_counts = np.bincount(inv, weights=y, minlength=len(counts))
+    cum_n = np.cumsum(counts)
+    cum_pos = np.cumsum(pos_counts)
+    boundary = int(np.searchsorted(cum_n, k_eff, side="left"))
+    prev_n = int(cum_n[boundary - 1]) if boundary > 0 else 0
+    prev_pos = float(cum_pos[boundary - 1]) if boundary > 0 else 0.0
+    rem = k_eff - prev_n
+    return float(prev_pos + rem * (pos_counts[boundary] / counts[boundary]))
+
+
+def tie_expected_precision_at_k(y, scores, k: int) -> float:
+    """Order-invariant Precision@k computing exact expectation across tied score groups."""
+    y, s = _arr(y, scores)
+    if len(y) == 0 or k <= 0:
+        return float("nan")
+    k_eff = min(int(k), len(y))
+    return float(_expected_positives_in_top_k(y, s, k_eff) / k_eff)
+
+
+def tie_expected_recall_at_k(y, scores, k: int) -> float:
+    """Order-invariant Recall@k computing exact expectation across tied score groups."""
+    y, s = _arr(y, scores)
+    n_pos = int(y.sum())
+    if len(y) == 0 or n_pos == 0 or k <= 0:
+        return float("nan")
+    return float(_expected_positives_in_top_k(y, s, k) / n_pos)
+
+
 def grouped_at_k(fn: Callable, y, scores, groups, k: int) -> float:
     """Mean of a per-group @k metric (e.g. per host / run_id), ignoring NaN groups."""
     y, s = _arr(y, scores)
@@ -164,6 +196,113 @@ def bootstrap_by_group(
         return {"point": point, "lo": float("nan"), "hi": float("nan"), "n_boot_valid": 0}
     lo, hi = np.quantile(vals, [alpha / 2, 1 - alpha / 2])
     return {"point": point, "lo": float(lo), "hi": float(hi), "n_boot_valid": len(vals)}
+
+
+def _build_group_map(indices: np.ndarray, keys: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    sub_keys = keys[indices].astype(str)
+    uniq = np.unique(sub_keys)
+    return uniq, {k: indices[sub_keys == k] for k in uniq}
+
+
+def bootstrap_track_a(
+    metric: Callable[[np.ndarray, np.ndarray], float],
+    y,
+    scores,
+    df,
+    group_by: str = "run_id",
+    n_boot: int = 1000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> dict:
+    """Stratified percentile bootstrap CI for Track A by 'run_id' or 'technique_id'.
+
+    Because deduplicated `baseline` rows are anchored largely to ctrl_01 and benign rows
+    have no technique_id:
+      - group_by='run_id': cluster non-baseline rows (label != 'baseline') by `run_id`
+        and resample baseline rows independently with replacement.
+      - group_by='technique_id': cluster positive rows (y == 1) by `technique_id`,
+        cluster `benign_drift` rows by `run_id`, and resample `baseline` rows by row.
+    """
+    if group_by not in ("run_id", "technique_id"):
+        raise ValueError(f"group_by must be 'run_id' or 'technique_id', got {group_by!r}")
+    y, s = _arr(y, scores)
+    if len(y) != len(df):
+        raise ValueError(f"df length ({len(df)}) != y length ({len(y)})")
+
+    point = float(metric(y, s))
+    has_label = "label" in df.columns
+    has_run = "run_id" in df.columns
+    has_tech = "technique_id" in df.columns
+
+    if has_label:
+        lbl = df["label"].astype(str).to_numpy()
+        base_idx = np.flatnonzero(lbl == "baseline")
+        drift_idx = np.flatnonzero((lbl != "baseline") & (y == 0))
+        non_base_idx = np.flatnonzero(lbl != "baseline")
+    else:
+        base_idx = np.flatnonzero(y == 0)
+        drift_idx = np.empty(0, dtype=int)
+        non_base_idx = np.flatnonzero(y == 1)
+
+    pos_idx = np.flatnonzero(y == 1)
+    run_vals = df["run_id"].fillna("UNKNOWN").astype(str).to_numpy() if has_run else np.empty(0, dtype=str)
+    tech_vals = df["technique_id"].fillna("UNKNOWN").astype(str).to_numpy() if has_tech else np.empty(0, dtype=str)
+
+    if group_by == "run_id":
+        if has_run and len(non_base_idx):
+            nb_uniq, nb_map = _build_group_map(non_base_idx, run_vals)
+        else:
+            nb_uniq, nb_map = np.empty(0, dtype=str), {}
+    else:
+        if has_tech and len(pos_idx):
+            pos_uniq, pos_map = _build_group_map(pos_idx, tech_vals)
+        else:
+            pos_uniq, pos_map = np.empty(0, dtype=str), {}
+        if has_run and len(drift_idx):
+            dr_uniq, dr_map = _build_group_map(drift_idx, run_vals)
+        else:
+            dr_uniq, dr_map = np.empty(0, dtype=str), {}
+
+    rng = np.random.default_rng(seed)
+    vals: list[float] = []
+    for _ in range(int(n_boot)):
+        parts: list[np.ndarray] = []
+        if group_by == "run_id":
+            if len(nb_uniq):
+                pick = rng.choice(nb_uniq, size=len(nb_uniq), replace=True)
+                parts.extend(nb_map[p] for p in pick)
+            elif len(non_base_idx):
+                parts.append(rng.choice(non_base_idx, size=len(non_base_idx), replace=True))
+            if len(base_idx):
+                parts.append(rng.choice(base_idx, size=len(base_idx), replace=True))
+        else:
+            if len(pos_uniq):
+                pick_t = rng.choice(pos_uniq, size=len(pos_uniq), replace=True)
+                parts.extend(pos_map[p] for p in pick_t)
+            elif len(pos_idx):
+                parts.append(rng.choice(pos_idx, size=len(pos_idx), replace=True))
+            if len(dr_uniq):
+                pick_d = rng.choice(dr_uniq, size=len(dr_uniq), replace=True)
+                parts.extend(dr_map[p] for p in pick_d)
+            elif len(drift_idx):
+                parts.append(rng.choice(drift_idx, size=len(drift_idx), replace=True))
+            if len(base_idx):
+                parts.append(rng.choice(base_idx, size=len(base_idx), replace=True))
+
+        if not parts:
+            continue
+        idx = np.concatenate(parts)
+        y_b = y[idx]
+        if (y_b == 1).sum() == 0 or (y_b == 0).sum() == 0:
+            continue
+        v = float(metric(y_b, s[idx]))
+        if not np.isnan(v):
+            vals.append(v)
+
+    if not vals or np.isnan(point):
+        return {"point": point, "lo": float("nan"), "hi": float("nan"), "n_boot_valid": 0, "group_by": group_by}
+    lo, hi = np.quantile(vals, [alpha / 2, 1 - alpha / 2])
+    return {"point": point, "lo": float(lo), "hi": float(hi), "n_boot_valid": len(vals), "group_by": group_by}
 
 
 def ranking_report(y, scores, ks: Sequence[int] = (10, 50, 100), recall: float = 0.9,
