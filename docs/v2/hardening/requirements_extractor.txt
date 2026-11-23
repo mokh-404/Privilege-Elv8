@@ -1,0 +1,10 @@
+# Pure user-space forensic parser dependencies for the offline extractor (Step F / OD-V2-04).
+# Installed strictly via pip in user space; zero host-kernel filesystem mounts required.
+dissect.target>=3.18
+dissect.cim>=3.13
+dissect.shellitem>=3.13
+pefile>=2024.8.26
+signify>=0.6.1
+LnkParse3>=1.6.0
+pandas>=2.2.0
+pyarrow>=16.0.0
