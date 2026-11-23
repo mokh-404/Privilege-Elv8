@@ -75,6 +75,10 @@ def test_bake_scripts_exist_and_have_valid_syntax():
     sh_path = repo / "docs" / "v2" / "hardening" / "00_bake_v2_base_image.sh"
     ps_path = repo / "docs" / "v2" / "hardening" / "Install-V2BaseBootstrap.ps1"
     assert sh_path.exists() and ps_path.exists()
+    sh_txt = sh_path.read_text(encoding="utf-8")
+    assert "prepare-overlay)" in sh_txt
+    assert "qemu-img commit" in sh_txt
+    assert "chown 956:956" in sh_txt
     ps_txt = ps_path.read_text(encoding="utf-8")
     assert "Microsoft-Windows-Sysmon/Operational" in ps_txt
     assert "67108864" in ps_txt

@@ -1,32 +1,69 @@
 #!/usr/bin/env bash
-# 00_bake_v2_base_image.sh — Deterministic One-Time Clean Base Image Bake & Verification Helper
+# 00_bake_v2_base_image.sh — Deterministic One-Time Clean Base Image Bake, Overlay Prep & Seal Helper
 #
 # Why this script exists:
-#   Read-only inspection of /var/lib/libvirt/images/win11_base.qcow2 (4,364 extracted records) confirmed:
-#     - Sysmon / Sysmon64 / SysmonDrv and Microsoft-Windows-Sysmon%4Operational.evtx are ABSENT;
-#     - C:\DFIR-Bootstrap\Invoke-StagePayload.ps1 and scheduled task \DFIR-StageRunner are ABSENT;
-#     - OpenSSH Server (sshd) is PRESENT and set to Auto-start (Start=2).
+#   1. Libvirt domain `win11` boots from CoW overlay `/var/lib/libvirt/images/win11_overlay.qcow2`
+#      backed by read-only `win11_base.qcow2` (0444). If no overlay exists (cleaned after last run),
+#      virt-manager / virsh fails with "Cannot access storage file ... win11_overlay.qcow2: No such file or directory".
+#   2. Read-only inspection of `/var/lib/libvirt/images/win11_base.qcow2` confirmed:
+#      - Sysmon / Sysmon64 / SysmonDrv and Microsoft-Windows-Sysmon%4Operational.evtx are ABSENT;
+#      - C:\DFIR-Bootstrap\Invoke-StagePayload.ps1 and scheduled task \DFIR-StageRunner are ABSENT;
+#      - OpenSSH Server (sshd) is PRESENT and set to Auto-start (Start=2).
 #
-#   Run this script BEFORE locking chattr +i on win11_base.qcow2 and BEFORE applying 01_firewall_win11_isolated.sh:
-#     1. `verify-image` — Read-only user-space check of win11_base.qcow2 for Sysmon, \DFIR-StageRunner, and sshd Disabled.
-#     2. `build-bake-iso <sysmon64_exe_path> [out_iso]` — Package Install-V2BaseBootstrap.ps1 + Sysmon64.exe into a read-only ISO (DFIR_BAKE).
-#     3. `seal-and-cache` — After the clean maintenance boot shuts down: verify bake via dissect.target, set chmod 0444 + chattr +i,
-#        record the new golden win11_base.sha256, and rebuild the immutable base-image cache (--build-base-cache).
+# Usage:
+#   1. `prepare-overlay` — Create fresh `/var/lib/libvirt/images/win11_overlay.qcow2` (uid 956:956, 0660) + NVRAM.
+#   2. `build-bake-iso <sysmon64_exe_path> [out_iso]` — Package Install-V2BaseBootstrap.ps1 + Sysmon64.exe into DFIR_BAKE ISO.
+#   3. `seal-and-cache` — After clean maintenance boot shuts down: verify bake in overlay, commit overlay into
+#      win11_base.qcow2 (`qemu-img commit`), verify base image, set 0444 + `chattr +i`, record win11_base.sha256,
+#      rebuild `--build-base-cache`, and recreate a fresh clean overlay ready for `virsh start win11`.
+#   4. `verify-image [qcow2_path]` — Read-only user-space check for Sysmon, \DFIR-StageRunner, and sshd Disabled.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BASE_IMG="${BASE_IMG:-/var/lib/libvirt/images/win11_base.qcow2}"
+OVERLAY_IMG="${OVERLAY_IMG:-/var/lib/libvirt/images/win11_overlay.qcow2}"
+VARS_BASE="${VARS_BASE:-/var/lib/libvirt/qemu/nvram/win11_VARS.fd.base}"
+VARS_LIVE="${VARS_LIVE:-/var/lib/libvirt/qemu/nvram/win11_VARS.fd}"
 BASE_CACHE="${BASE_CACHE:-/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz}"
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 
 usage() {
     cat <<EOF
 Usage:
+  $0 prepare-overlay [base_qcow2] [overlay_qcow2]
   $0 verify-image [qcow2_path]
   $0 build-bake-iso <path_to_Sysmon64.exe> [out_iso_path]
-  $0 seal-and-cache [qcow2_path] [base_cache_path]
+  $0 seal-and-cache [base_qcow2] [base_cache_path]
 EOF
+}
+
+prepare_overlay() {
+    local base="${1:-$BASE_IMG}"
+    local overlay="${2:-$OVERLAY_IMG}"
+    if [[ -n "$(pgrep -a qemu || true)" ]]; then
+        echo "ERROR: Active QEMU process detected. Shut down running VMs before modifying overlays." >&2
+        exit 1
+    fi
+    if [[ ! -f "$base" ]]; then
+        echo "ERROR: Base image not found at: $base" >&2
+        exit 1
+    fi
+    if [[ -f "$overlay" ]]; then
+        echo "Removing stale overlay before fresh CoW creation: $overlay"
+        sudo rm -f "$overlay"
+    fi
+    sudo qemu-img create -f qcow2 -F qcow2 -b "$base" "$overlay"
+    sudo chown 956:956 "$overlay"
+    sudo chmod 0660 "$overlay"
+
+    if [[ -f "$VARS_BASE" ]]; then
+        sudo cp -f "$VARS_BASE" "$VARS_LIVE"
+        sudo chown 956:956 "$VARS_LIVE"
+        sudo chmod 0600 "$VARS_LIVE"
+    fi
+    ls -la "$overlay" "$VARS_LIVE"
+    echo "OVERLAY_READY: $overlay (backed by $base)"
 }
 
 verify_image_readonly() {
@@ -61,7 +98,7 @@ print(f"  sshd Start mode (4=Disabled): {sshd_start}")
 
 ok = has_sysmon_svc and has_sysmon_drv and has_evtx and has_bootstrap_ps1 and has_task_xml and has_task_tree and (sshd_start in (4, None))
 if not ok:
-    print("V2_BASE_BAKE_VERIFY: FAIL (base image has not been baked with Sysmon + \\DFIR-StageRunner + sshd=Disabled yet)")
+    print("V2_BASE_BAKE_VERIFY: FAIL (base image/overlay has not been baked with Sysmon + \\DFIR-StageRunner + sshd=Disabled yet)")
     sys.exit(1)
 print("V2_BASE_BAKE_VERIFY: PASS")
 PY
@@ -99,8 +136,19 @@ seal_and_cache() {
         echo "ERROR: Active QEMU process detected. Shut down the maintenance VM cleanly before sealing." >&2
         exit 1
     fi
+
+    # If changes were written into win11_overlay.qcow2 during the maintenance boot, verify & commit them to base
+    if [[ -f "$OVERLAY_IMG" ]]; then
+        echo "Verifying baked overlay before committing into base: $OVERLAY_IMG"
+        verify_image_readonly "$OVERLAY_IMG"
+        sudo chattr -i "$img" 2>/dev/null || true
+        sudo chmod 0644 "$img"
+        sudo qemu-img commit "$OVERLAY_IMG"
+        sudo rm -f "$OVERLAY_IMG"
+    fi
+
     verify_image_readonly "$img"
-    chmod 0444 "$img"
+    sudo chmod 0444 "$img"
     sudo chattr +i "$img"
     "${REPO_ROOT}/docs/v2/hardening/04_watchdog_and_base_hash.sh" record-base "$img"
     local new_sha
@@ -115,10 +163,14 @@ seal_and_cache() {
         --expected-base-sha256 "$new_sha"
     rm -rf /tmp/v2_baked_base_verify
     echo "V2_BASE_SEAL_AND_CACHE: PASS (cache written to ${cache_p})"
+    prepare_overlay "$img" "$OVERLAY_IMG"
 }
 
 cmd="${1:-}"
 case "$cmd" in
+    prepare-overlay)
+        prepare_overlay "${2:-$BASE_IMG}" "${3:-$OVERLAY_IMG}"
+        ;;
     verify-image)
         verify_image_readonly "${2:-$BASE_IMG}"
         ;;

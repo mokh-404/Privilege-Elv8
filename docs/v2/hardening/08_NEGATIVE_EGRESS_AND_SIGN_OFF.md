@@ -35,12 +35,14 @@ Verify each condition empirically and record PASS/FAIL + packet-capture evidence
 Execute strictly **in this numbered order** (all host `sudo` operations executed manually by Mokh):
 
 0. **One-Time Clean Base Image Bake (`Sysmon` + `\DFIR-StageRunner` + Disable `sshd`, BEFORE `chattr +i`):**
+   - Create a fresh disposable overlay `/var/lib/libvirt/images/win11_overlay.qcow2` (`uid 956:956`, `0660`) + NVRAM so `win11` boots cleanly (`win11_base.qcow2` stays `0444` and `win11` domain XML points to `win11_overlay.qcow2`):
+     `./docs/v2/hardening/00_bake_v2_base_image.sh prepare-overlay`
    - Build the read-only `DFIR_BAKE` maintenance ISO containing [`Install-V2BaseBootstrap.ps1`](Install-V2BaseBootstrap.ps1) and `Sysmon64.exe`:
      `./docs/v2/hardening/00_bake_v2_base_image.sh build-bake-iso /path/to/Sysmon64.exe /tmp/v2_base_bake.iso`
-   - Boot a clean maintenance session of `win11` with `/tmp/v2_base_bake.iso` attached (or copy `Install-V2BaseBootstrap.ps1` + `Sysmon64.exe` over the existing v1 SSH channel before `sshd` is disabled) and run as Administrator inside the guest:
+   - Boot the clean maintenance session of `win11` with `/tmp/v2_base_bake.iso` attached (or copy `Install-V2BaseBootstrap.ps1` + `Sysmon64.exe` over the existing v1 SSH channel before `sshd` is disabled) and run as Administrator inside the guest:
      `powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\INSTALL.PS1`
      *(Installs `Sysmon64` with the v2 config & 64 MB EVTX buffer, installs `C:\DFIR-Bootstrap\Invoke-StagePayload.ps1`, registers `\DFIR-StageRunner` as `SYSTEM` `ONSTART`, disables `sshd`, clears transient setup logs, flushes `C:`, and powers off cleanly).*
-   - Once the guest powers off, verify the baked image in user space, seal `chmod 0444` + `chattr +i`, record the new golden `win11_base.sha256`, and rebuild `--build-base-cache`:
+   - Once the guest powers off, run `seal-and-cache` to verify the baked overlay, commit it back into `win11_base.qcow2` (`qemu-img commit`), lock `chmod 0444` + `chattr +i`, record the new golden `win11_base.sha256`, rebuild `--build-base-cache`, and recreate a fresh clean `win11_overlay.qcow2`:
      `./docs/v2/hardening/00_bake_v2_base_image.sh seal-and-cache`
 1. **Verify Sealed Base Hashes (`chmod 0444` & `chattr +i` Verified):**
    `./docs/v2/hardening/04_watchdog_and_base_hash.sh verify-base`
