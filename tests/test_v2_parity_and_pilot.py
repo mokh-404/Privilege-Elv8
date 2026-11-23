@@ -27,6 +27,7 @@ from src.v2.run_stage_a_pilot import (
     build_create_overlay_command,
     compute_od_v2_20_pilot_gate,
     evaluate_stage_a_pilot_runs,
+    execute_stage_a_pilot_batch,
     write_stage_a_pilot_report,
 )
 
@@ -382,3 +383,167 @@ def test_parity_workload_cli_matches_frozen_collect_artifacts_params(tmp_path):
         "/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz",
     ]
     assert env == {"BASE_CACHE_PATH": "/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz"}
+
+
+def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, monkeypatch):
+    import json
+    import os
+    import subprocess
+    from scripts.v2_curate_vault_manifest import curate_pilot_vault_and_batch
+
+    repo = Path(__file__).resolve().parent.parent
+    setup_script = repo / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    bsdtar_bin = shutil.which("bsdtar")
+    assert bsdtar_bin is not None
+
+    vault_dir = tmp_path / "vault"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
+
+    # Gate 0 must block curation until GATE0_SIGNED_OFF exists
+    with pytest.raises(PilotStagingError, match="Gate 0 sign-off marker missing"):
+        curate_pilot_vault_and_batch(vault_root=vault_dir, setup_script=setup_script, target_families=6)
+
+    (vault_dir / "GATE0_SIGNED_OFF").write_text("SIGNED_BY_TEST\n", encoding="utf-8")
+
+    # Missing ABUSECH_AUTH_KEY must fail cleanly when no client is injected
+    monkeypatch.delenv("ABUSECH_AUTH_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="ABUSECH_AUTH_KEY"):
+        curate_pilot_vault_and_batch(vault_root=vault_dir, setup_script=setup_script, target_families=6)
+
+    # Create 6 distinct synthetic AES-256 zip payloads (plus 1 near-duplicate imphash + 1 non-Windows APK)
+    families = [
+        ("lockbit", "ransomware", "exe", "lockbit"),
+        ("redline", "stealer", "exe", "RedLine"),
+        ("smokeloader", "loader", "exe", "smokeloader"),
+        ("asyncrat", "rat", "exe", "asyncrat"),
+        ("xmrig", "miner", "exe", "xmrig"),
+        ("amadey", "trojan", "exe", "persistence"),
+    ]
+    zips_by_sha: dict[str, bytes] = {}
+    records_by_tag: dict[str, list[dict[str, object]]] = {}
+    for idx, (fam, cat, ftype, query_tag) in enumerate(families):
+        raw = f"MZ_PILOT_SAMPLE_{fam}_{idx}".encode("utf-8")
+        sha = hashlib.sha256(raw).hexdigest()
+        src_p = tmp_path / f"{fam}.exe"
+        src_p.write_bytes(raw)
+        zpath = tmp_path / f"{fam}.zip"
+        subprocess.run(
+            [
+                bsdtar_bin,
+                "--format",
+                "zip",
+                "--options",
+                "zip:encryption=aes256",
+                "--passphrase",
+                "infected",
+                "-cf",
+                str(zpath),
+                "-C",
+                str(tmp_path),
+                src_p.name,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        src_p.unlink()
+        zips_by_sha[sha] = zpath.read_bytes()
+        entry = {
+            "sha256_hash": sha,
+            "signature": fam,
+            "file_name": f"{fam}.exe",
+            "file_type": ftype,
+            "file_size": 65536 + idx * 1024,
+            "imphash": f"{idx + 1:032x}",
+            "tags": [fam, "persist", cat],
+        }
+        records_by_tag[query_tag] = [entry]
+    # Add an Android APK that must be filtered out and a duplicate imphash that must be deduplicated
+    first_sha = next(iter(zips_by_sha))
+    dup_raw = b"MZ_DUPLICATE_FAMILY_BYTES"
+    dup_sha = hashlib.sha256(dup_raw).hexdigest()
+    records_by_tag["ransomware"] = [
+        {
+            "sha256_hash": hashlib.sha256(b"apk_skip").hexdigest(),
+            "signature": "AndroidBad",
+            "file_name": "app.apk",
+            "file_type": "apk",
+            "file_size": 50000,
+        },
+        {
+            "sha256_hash": dup_sha,
+            "signature": "OtherDup",
+            "file_name": "dup.exe",
+            "file_type": "exe",
+            "file_size": 70000,
+            "imphash": f"{1:032x}",
+        },
+        *records_by_tag["lockbit"],
+    ]
+
+    class _FakeFeedClient:
+        def query_tag(self, tag: str, limit: int = 50) -> list[dict[str, object]]:
+            return list(records_by_tag.get(tag, records_by_tag.get(tag.lower(), [])))
+
+        def download_sample_zip(self, sha256_hash: str) -> bytes:
+            return zips_by_sha[sha256_hash.lower()]
+
+    cur = curate_pilot_vault_and_batch(
+        vault_root=vault_dir,
+        setup_script=setup_script,
+        target_families=6,
+        n_control_boots=3,
+        dwell_seconds=45,
+        client=_FakeFeedClient(),
+    )
+    assert cur["n_families"] == 6
+    assert cur["n_total_runs"] == 15  # 3 controls + 6 * (dormant + executed)
+    batch_payload = json.loads(Path(cur["batch_path"]).read_text(encoding="utf-8"))
+    runs = batch_payload["runs"]
+
+    # Pick 1 control + 1 dormant + 1 executed run and exercise unattended execution + inetsim-vm lifecycle
+    subset = [
+        runs[0],
+        next(r for r in runs if r["spec"]["stratum"] == "dormant"),
+        next(r for r in runs if r["spec"]["stratum"] == "executed"),
+    ]
+    recorded: list[list[str]] = []
+
+    def _mock_cmd(cmd: list[str], env_over=None) -> int:
+        recorded.append(list(cmd))
+        return 0
+
+    res = execute_stage_a_pilot_batch(
+        batch_runs=subset,
+        runs_out_dir=tmp_path / "pilot_runs_out",
+        vault_root=vault_dir,
+        inetsim_wait_seconds=0,
+        run_cmd=_mock_cmd,
+        sleep_fn=lambda _s: None,
+    )
+    assert [r["inetsim_booted"] for r in res] == [False, False, True]
+    inetsim_starts = [i for i, c in enumerate(recorded) if c == ["sudo", "virsh", "-c", "qemu:///system", "start", "inetsim-vm"]]
+    inetsim_destroys = [i for i, c in enumerate(recorded) if c == ["sudo", "virsh", "-c", "qemu:///system", "destroy", "inetsim-vm"]]
+    win_starts = [i for i, c in enumerate(recorded) if c == ["sudo", "virsh", "-c", "qemu:///system", "start", "win11"]]
+    assert len(inetsim_starts) == 1 and len(inetsim_destroys) == 1
+    assert inetsim_starts[0] < win_starts[2] < inetsim_destroys[0]
+
+    # Verify abort cleanup destroys inetsim-vm even if watchdog aborts win11
+    recorded_abort: list[list[str]] = []
+
+    def _abort_cmd(cmd: list[str], env_over=None) -> int:
+        recorded_abort.append(list(cmd))
+        if "watchdog" in cmd:
+            return 2
+        return 0
+
+    with pytest.raises(RuntimeError, match="Watchdog aborted"):
+        execute_stage_a_pilot_batch(
+            batch_runs=[subset[2]],
+            runs_out_dir=tmp_path / "pilot_abort_out",
+            vault_root=vault_dir,
+            inetsim_wait_seconds=0,
+            run_cmd=_abort_cmd,
+            sleep_fn=lambda _s: None,
+        )
+    assert ["sudo", "virsh", "-c", "qemu:///system", "destroy", "inetsim-vm"] in recorded_abort
+    assert (vault_dir / "archives" / f"{first_sha}.zip").exists()

@@ -35,6 +35,7 @@ from src.v2.pilot_staging import (
     StageRunSpec,
     build_stage_bundle,
     build_stage_iso,
+    read_vault_payload_in_memory,
     validate_stage_run_spec,
 )
 
@@ -319,3 +320,83 @@ def test_open_qcow2_target_readonly_handles_absolute_backing_path(tmp_path):
         assert disk.read(len(marker)) == marker
     finally:
         close_target_safely(tgt)
+
+
+def test_isolated_net_preamble_and_aes256_vault_in_memory(tmp_path):
+    import hashlib
+    import os
+    import re
+
+    # 1. Verify param(...) remains first statement when isolated static IP preamble is injected
+    spec_ctrl = StageRunSpec(
+        run_id="net_preamble_test",
+        stratum="control",
+        benign_profile_id="dev_office_01",
+        dwell_seconds=45,
+    )
+    script_with_param = '# Header comment\nparam([string]$ProfileId = "x")\nWrite-Host $ProfileId\n'
+    out_ctrl = build_stage_bundle(spec_ctrl, tmp_path / "ctrl_net", benign_script_text=script_with_param)
+    rendered = out_ctrl["benign_workload"].read_text(encoding="utf-8")
+    assert "192.168.150.50" in rendered and "192.168.150.10" in rendered
+    assert re.match(r"^(?:\s|#[^\n]*\n)*param\(", rendered, flags=re.I) is not None
+    assert rendered.index("param(") < rendered.index("netsh interface ip set address")
+
+    # 2. Verify AES-256 encrypted zip decryption strictly in RAM via bsdtar & zero plaintext payload on host out_dir
+    bsdtar_bin = shutil.which("bsdtar")
+    xorriso_bin = shutil.which("xorriso")
+    assert bsdtar_bin is not None and xorriso_bin is not None
+
+    payload_bytes = b"MZ\x90\x00SYNTHETIC_AES256_VAULT_PAYLOAD"
+    payload_sha = hashlib.sha256(payload_bytes).hexdigest()
+    src_payload = tmp_path / "sample.exe"
+    src_payload.write_bytes(payload_bytes)
+    vault_zip = tmp_path / f"{payload_sha}.zip"
+    subprocess.run(
+        [
+            bsdtar_bin,
+            "--format",
+            "zip",
+            "--options",
+            "zip:encryption=aes256",
+            "--passphrase",
+            "infected",
+            "-cf",
+            str(vault_zip),
+            "-C",
+            str(tmp_path),
+            "sample.exe",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    os.chmod(vault_zip, 0o400)
+    src_payload.unlink()
+
+    assert read_vault_payload_in_memory(vault_zip, password="infected") == payload_bytes
+    with pytest.raises(PilotStagingError):
+        read_vault_payload_in_memory(vault_zip, password="wrong_password")
+
+    exec_spec = StageRunSpec(
+        run_id="pilot_aes_exec_01",
+        stratum="executed",
+        benign_profile_id="dev_office_01",
+        staging_target_path=r"C:\Users\Public\Downloads\agent.exe",
+        sample_sha256=payload_sha,
+        sample_family="synth_fam",
+        pair_group_id="pair_01",
+        execute_payload=True,
+        gate0_signed_off=True,
+        dedicated_host_user_verified=True,
+    )
+    bundle_dir = tmp_path / "exec_bundle"
+    out_exec = build_stage_bundle(exec_spec, bundle_dir, sample_vault_file=vault_zip, archive_password="infected")
+    assert not (bundle_dir / "payload.bin").exists()
+
+    verify_dir = tmp_path / "iso_read"
+    verify_dir.mkdir()
+    subprocess.run(
+        [xorriso_bin, "-osirrox", "on", "-indev", str(out_exec["iso"]), "-extract", "/payload.bin", str(verify_dir / "payload.bin")],
+        check=True,
+        capture_output=True,
+    )
+    assert (verify_dir / "payload.bin").read_bytes() == payload_bytes

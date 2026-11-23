@@ -122,10 +122,14 @@ def test_unprivileged_container_runner_mounts_overlay_backing_cache_and_build(tm
     log_json = tmp_path / "shim_argv.json"
 
     shim = tmp_path / "fake_docker.sh"
+    mode_log = tmp_path / "out_mode.txt"
     shim.write_text(
         f"""#!/usr/bin/env python3
-import json, sys
+import json, stat, sys
 from pathlib import Path
+out_p = Path({str(out_dir)!r})
+if len(sys.argv) > 1 and sys.argv[1] == "run":
+    Path({str(mode_log)!r}).write_text(oct(stat.S_IMODE(out_p.stat().st_mode)))
 Path({str(log_json)!r}).write_text(json.dumps(sys.argv[1:]))
 """,
         encoding="utf-8",
@@ -141,6 +145,11 @@ Path({str(log_json)!r}).write_text(json.dumps(sys.argv[1:]))
         check=True,
     )
     assert cp_run.returncode == 0
+    import stat
+
+    # Must be 0777 during --cap-drop=ALL container run and restored to 0755 on exit
+    assert mode_log.read_text(encoding="utf-8") == "0o777"
+    assert stat.S_IMODE(out_dir.stat().st_mode) == 0o755
     argv = json.loads(log_json.read_text(encoding="utf-8"))
     for req_flag in ("--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user"):
         assert req_flag in argv
@@ -164,3 +173,12 @@ Path({str(log_json)!r}).write_text(json.dumps(sys.argv[1:]))
     assert build_argv[0] == "build"
     assert "-f" in build_argv and str(dockerfile) in build_argv
     assert "-t" in build_argv and "dfir-v2-offline-extractor:latest" in build_argv
+
+
+def test_inetsim_doc_uses_valid_inetsim_conf_directives():
+    doc = (HARDENING_DIR / "03_inetsim_vm_setup.md").read_text(encoding="utf-8")
+    assert "service_bind_address    192.168.150.10" in doc
+    assert "start_service           dns" in doc
+    assert "start_service           http" in doc
+    assert "systemd-networkd-wait-online.service" in doc
+    assert "service_run_services" not in doc

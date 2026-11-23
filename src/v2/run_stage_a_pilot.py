@@ -19,7 +19,10 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+import shutil
+import subprocess
+import time
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -36,7 +39,12 @@ from src.v2.labeler_v2 import (
     label_executed_run,
 )
 from src.v2.offline_extractor import summarize_extraction_and_refgraph
-from src.v2.pilot_staging import StageRunSpec, validate_stage_run_spec
+from src.v2.pilot_staging import (
+    PilotStagingError,
+    StageRunSpec,
+    build_stage_bundle,
+    validate_stage_run_spec,
+)
 from src.v2.stats_v2 import compute_lofo_table, cross_stratum_execution_delta
 from src.v2.training import run_nested_family_cv
 
@@ -83,6 +91,174 @@ def build_container_extraction_command(
     ]
     env = {"BASE_CACHE_PATH": cache_arg}
     return cmd, env
+
+
+def build_inetsim_lifecycle_commands(
+    domain: str = "inetsim-vm",
+    libvirt_uri: str = "qemu:///system",
+) -> dict[str, list[str]]:
+    """Return allowed libvirt commands to start/stop/inspect `inetsim-vm` (`never virsh create`)."""
+    return {
+        "domstate": ["sudo", "virsh", "-c", libvirt_uri, "domstate", domain],
+        "start": ["sudo", "virsh", "-c", libvirt_uri, "start", domain],
+        "destroy": ["sudo", "virsh", "-c", libvirt_uri, "destroy", domain],
+    }
+
+
+def _invoke_cmd(
+    run_cmd: Callable[..., int] | None,
+    cmd: list[str],
+    env_overrides: Mapping[str, str] | None = None,
+    dry_run: bool = False,
+) -> int:
+    if dry_run:
+        return 0
+    if run_cmd is not None:
+        try:
+            return int(run_cmd(cmd, env_overrides))
+        except TypeError:
+            return int(run_cmd(cmd))
+    merged_env = dict(os.environ)
+    if env_overrides:
+        merged_env.update({str(k): str(v) for k, v in env_overrides.items()})
+    return int(subprocess.run(cmd, env=merged_env, check=False).returncode)
+
+
+def execute_stage_a_pilot_batch(
+    batch_runs: Sequence[Mapping[str, Any]],
+    runs_out_dir: str | Path,
+    base_qcow2: str | Path = "/var/lib/libvirt/images/win11_base.qcow2",
+    overlay_qcow2: str | Path = "/var/lib/libvirt/images/win11_overlay.qcow2",
+    base_cache_path: str | Path | None = "/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz",
+    vault_root: str | Path = "~/.quarantine_vault_dfir_v2",
+    win_domain: str = "win11",
+    inetsim_domain: str = "inetsim-vm",
+    libvirt_uri: str = "qemu:///system",
+    inetsim_wait_seconds: int = 8,
+    watchdog_grace_seconds: int = 180,
+    dry_run: bool = False,
+    run_cmd: Callable[..., int] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> list[dict[str, Any]]:
+    """Execute or dry-run an unattended Stage A Pilot batch with strict Gate 0 & `inetsim-vm` lifecycle cleanup."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    watchdog_script = repo_root / "docs" / "v2" / "hardening" / "04_watchdog_and_base_hash.sh"
+    bake_script = repo_root / "docs" / "v2" / "hardening" / "00_bake_v2_base_image.sh"
+    vault_script = repo_root / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    out_root = Path(runs_out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    stage_tmp_root = out_root / "_staging_iso"
+    stage_tmp_root.mkdir(parents=True, exist_ok=True)
+    vroot = Path(vault_root).expanduser()
+
+    parsed_entries: list[tuple[StageRunSpec, Mapping[str, Any]]] = []
+    has_malware_run = False
+    for entry in batch_runs:
+        raw_spec = entry["spec"]
+        spec = raw_spec if isinstance(raw_spec, StageRunSpec) else StageRunSpec(**dict(raw_spec))
+        validate_stage_run_spec(spec)
+        if spec.stratum in ("dormant", "executed"):
+            has_malware_run = True
+        parsed_entries.append((spec, entry))
+
+    if has_malware_run and not dry_run:
+        if not (vroot / "GATE0_SIGNED_OFF").is_file():
+            raise PilotStagingError(
+                f"BLOCKED (OD-V2-07): Gate 0 marker missing at {vroot / 'GATE0_SIGNED_OFF'}."
+            )
+        rc_pre = _invoke_cmd(run_cmd, ["bash", str(vault_script), "preflight"], {"VAULT_ROOT": str(vroot)})
+        if rc_pre != 0:
+            raise PilotStagingError(f"Vault preflight failed with exit code {rc_pre}")
+
+    inetsim_cmds = build_inetsim_lifecycle_commands(domain=inetsim_domain, libvirt_uri=libvirt_uri)
+    verify_cmd = ["bash", str(watchdog_script), "verify-base"]
+    prep_cmd = ["bash", str(bake_script), "prepare-overlay", str(base_qcow2), str(overlay_qcow2)]
+
+    results_log: list[dict[str, Any]] = []
+    for spec, entry in parsed_entries:
+        run_dir = out_root / spec.run_id
+        stage_dir = stage_tmp_root / spec.run_id
+        iso_path = stage_dir / f"run_stage_{spec.run_id}.iso"
+        inetsim_started = False
+
+        rc_v1 = _invoke_cmd(run_cmd, verify_cmd, dry_run=dry_run)
+        if rc_v1 != 0:
+            raise RuntimeError(f"Base verification failed before run {spec.run_id!r} (rc={rc_v1})")
+
+        rc_prep = _invoke_cmd(run_cmd, prep_cmd, dry_run=dry_run)
+        if rc_prep != 0:
+            raise RuntimeError(f"prepare-overlay failed for run {spec.run_id!r} (rc={rc_prep})")
+
+        vault_file = entry.get("vault_file")
+        if not dry_run or spec.stratum == "control" or (vault_file is not None and Path(vault_file).exists()):
+            build_stage_bundle(
+                spec=spec,
+                out_dir=stage_dir,
+                sample_vault_file=vault_file,
+                benign_script_text=str(entry.get("benign_script_text") or "# Benign workload placeholder\n"),
+                archive_password=entry.get("archive_password", "infected"),
+            )
+
+        attach_cmd = [
+            "sudo", "virsh", "-c", libvirt_uri, "attach-disk",
+            win_domain, str(iso_path), "sdc", "--type", "cdrom", "--mode", "readonly", "--config",
+        ]
+        if _invoke_cmd(run_cmd, attach_cmd, dry_run=dry_run) != 0:
+            raise RuntimeError(f"Failed to attach DFIR_STAGE ISO for run {spec.run_id!r}")
+
+        try:
+            if spec.stratum == "executed":
+                rc_inet = _invoke_cmd(run_cmd, inetsim_cmds["start"], dry_run=dry_run)
+                if rc_inet != 0:
+                    raise RuntimeError(f"Failed to start {inetsim_domain} for executed run {spec.run_id!r}")
+                inetsim_started = True
+                if not dry_run and inetsim_wait_seconds > 0:
+                    sleep_fn(float(inetsim_wait_seconds))
+
+            start_win = ["sudo", "virsh", "-c", libvirt_uri, "start", win_domain]
+            if _invoke_cmd(run_cmd, start_win, dry_run=dry_run) != 0:
+                raise RuntimeError(f"Failed to start {win_domain} for run {spec.run_id!r}")
+
+            wd_cmd = ["bash", str(watchdog_script), "watchdog", str(int(spec.dwell_seconds) + int(watchdog_grace_seconds))]
+            rc_wd = _invoke_cmd(run_cmd, wd_cmd, dry_run=dry_run)
+            if rc_wd not in (0, 124):
+                raise RuntimeError(f"Watchdog aborted run {spec.run_id!r} unexpectedly (rc={rc_wd})")
+        finally:
+            _invoke_cmd(run_cmd, ["sudo", "virsh", "-c", libvirt_uri, "destroy", win_domain], dry_run=dry_run)
+            if inetsim_started:
+                _invoke_cmd(run_cmd, inetsim_cmds["destroy"], dry_run=dry_run)
+            _invoke_cmd(
+                run_cmd,
+                ["sudo", "virsh", "-c", libvirt_uri, "detach-disk", win_domain, "sdc", "--config"],
+                dry_run=dry_run,
+            )
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+        ext_cmd, ext_env = build_container_extraction_command(
+            overlay_qcow2=overlay_qcow2,
+            run_out_dir=run_dir,
+            run_id=spec.run_id,
+            base_cache_path=base_cache_path,
+        )
+        rc_ext = _invoke_cmd(run_cmd, ext_cmd, env_overrides=ext_env, dry_run=dry_run)
+        if rc_ext != 0:
+            raise RuntimeError(f"Offline container extraction failed for run {spec.run_id!r} (rc={rc_ext})")
+
+        _invoke_cmd(run_cmd, ["sudo", "rm", "-f", str(overlay_qcow2)], dry_run=dry_run)
+        if _invoke_cmd(run_cmd, verify_cmd, dry_run=dry_run) != 0:
+            raise RuntimeError(f"Base hash verification failed after run {spec.run_id!r}")
+
+        results_log.append({
+            "run_id": spec.run_id,
+            "stratum": spec.stratum,
+            "sample_family": spec.sample_family,
+            "pair_group_id": spec.pair_group_id,
+            "inetsim_booted": bool(inetsim_started),
+            "out_dir": str(run_dir),
+            "dry_run": bool(dry_run),
+        })
+
+    return results_log
 
 
 def compute_od_v2_20_pilot_gate(df: pd.DataFrame, threshold_pct: float = 50.0) -> dict[str, Any]:
@@ -357,3 +533,39 @@ def write_stage_a_pilot_report(summary: Mapping[str, Any], out_md: str | Path) -
     out_p.parent.mkdir(parents=True, exist_ok=True)
     out_p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_p
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Unattended Stage A Pilot VM & offline extraction orchestrator.")
+    parser.add_argument("--batch-json", type=Path, required=True, help="Path to stage_a_pilot_batch.json")
+    parser.add_argument("--runs-out-dir", type=Path, required=True, help="Output directory for per-run extracted JSONL")
+    parser.add_argument("--base-qcow2", type=Path, default=Path("/var/lib/libvirt/images/win11_base.qcow2"))
+    parser.add_argument("--overlay-qcow2", type=Path, default=Path("/var/lib/libvirt/images/win11_overlay.qcow2"))
+    parser.add_argument(
+        "--base-cache-path",
+        type=Path,
+        default=Path("/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz"),
+    )
+    parser.add_argument("--vault-root", type=Path, default=Path("~/.quarantine_vault_dfir_v2"))
+    parser.add_argument("--inetsim-wait-seconds", type=int, default=8)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    payload = json.loads(args.batch_json.read_text(encoding="utf-8"))
+    runs = list(payload["runs"]) if isinstance(payload, dict) and "runs" in payload else list(payload)
+    executed = execute_stage_a_pilot_batch(
+        batch_runs=runs,
+        runs_out_dir=args.runs_out_dir,
+        base_qcow2=args.base_qcow2,
+        overlay_qcow2=args.overlay_qcow2,
+        base_cache_path=args.base_cache_path,
+        vault_root=args.vault_root,
+        inetsim_wait_seconds=args.inetsim_wait_seconds,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps({"completed_runs": len(executed), "runs": executed}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

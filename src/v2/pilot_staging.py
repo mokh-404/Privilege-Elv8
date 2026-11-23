@@ -21,7 +21,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -29,6 +31,7 @@ import struct
 import subprocess
 import tempfile
 from typing import Any, Mapping
+import zipfile
 
 from src.utils.repro import utc_now_iso
 
@@ -255,6 +258,132 @@ def _build_minimal_iso9660(volume_label: str, files: dict[str, bytes]) -> bytes:
     return bytes(image)
 
 
+ISOLATED_NET_PREAMBLE_PS1 = """# Isolated static network configuration (win11-isolated -> inetsim-vm 192.168.150.10)
+Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
+    netsh interface ip set address name="$($_.Name)" static 192.168.150.50 255.255.255.0 192.168.150.10 | Out-Null
+    netsh interface ip set dns name="$($_.Name)" static 192.168.150.10 | Out-Null
+}
+Start-Sleep -Seconds 5
+"""
+
+
+def _inject_isolated_net_preamble(script_text: str) -> str:
+    """Inject static `192.168.150.50` -> `192.168.150.10` networking while preserving leading `param(...)`."""
+    txt = str(script_text)
+    if "192.168.150.50" in txt and "192.168.150.10" in txt:
+        return txt
+
+    m = re.match(r"^(?:\s*(?:#[^\n]*(?:\n|$)|\n))*param\s*\(", txt, flags=re.IGNORECASE)
+    if m:
+        pos = m.end()
+        depth = 1
+        in_sq = False
+        in_dq = False
+        n = len(txt)
+        while pos < n and depth > 0:
+            ch = txt[pos]
+            if in_sq:
+                if ch == "'":
+                    in_sq = False
+            elif in_dq:
+                if ch == "`" and pos + 1 < n:
+                    pos += 1
+                elif ch == '"':
+                    in_dq = False
+            else:
+                if ch == "'":
+                    in_sq = True
+                elif ch == '"':
+                    in_dq = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            pos += 1
+        if depth == 0:
+            nl = txt.find("\n", pos)
+            insert_at = (nl + 1) if nl != -1 else pos
+            prefix = txt[:insert_at]
+            if prefix and not prefix.endswith("\n"):
+                prefix += "\n"
+            return prefix + ISOLATED_NET_PREAMBLE_PS1 + txt[insert_at:]
+
+    return ISOLATED_NET_PREAMBLE_PS1 + txt
+
+
+def read_vault_payload_in_memory(
+    vault_file: str | Path,
+    password: str | bytes | None = "infected",
+) -> bytes:
+    """Read a raw or encrypted `.zip` vault sample strictly into RAM (zero host-disk plaintext writes)."""
+    vpath = Path(vault_file)
+    if not vpath.exists():
+        raise FileNotFoundError(f"Vault sample file not found: {vpath}")
+
+    with vpath.open("rb") as fh:
+        magic = fh.read(4)
+
+    if magic != b"PK\x03\x04":
+        return vpath.read_bytes()
+
+    pwd_str: str | None
+    pwd_bytes: bytes | None
+    if password is None or password == "" or password == b"":
+        pwd_str = None
+        pwd_bytes = None
+    elif isinstance(password, bytes):
+        pwd_bytes = password
+        pwd_str = password.decode("utf-8", errors="replace")
+    else:
+        pwd_str = str(password)
+        pwd_bytes = pwd_str.encode("utf-8")
+
+    with zipfile.ZipFile(vpath, "r") as zf:
+        members = [zi for zi in zf.infolist() if not zi.is_dir()]
+        if len(members) != 1:
+            raise PilotStagingError(
+                f"Encrypted vault archive {vpath.name!r} must contain exactly 1 payload file, found {len(members)}"
+            )
+        member_name = members[0].filename
+        if not member_name or member_name.startswith(("/", "\\")) or "\\" in member_name or ".." in Path(member_name).parts:
+            raise PilotStagingError(f"Unsafe zip member path in vault archive: {member_name!r}")
+
+    if importlib.util.find_spec("pyzipper") is not None:
+        import pyzipper  # type: ignore
+
+        try:
+            with pyzipper.AESZipFile(vpath, "r") as pzf:
+                if pwd_bytes is not None:
+                    pzf.setpassword(pwd_bytes)
+                return pzf.read(member_name)
+        except Exception as exc:
+            raise PilotStagingError(f"Failed to decrypt vault archive {vpath.name!r} via pyzipper: {exc}") from exc
+
+    try:
+        with zipfile.ZipFile(vpath, "r") as zf:
+            return zf.read(member_name, pwd=pwd_bytes)
+    except NotImplementedError:
+        pass
+    except RuntimeError as exc:
+        if "compression method is not supported" not in str(exc).lower():
+            raise PilotStagingError(f"Failed to decrypt vault archive {vpath.name!r}: {exc}") from exc
+
+    bsdtar_bin = shutil.which("bsdtar")
+    if not bsdtar_bin:
+        raise PilotStagingError(
+            f"AES-encrypted vault archive {vpath.name!r} requires either `pyzipper` or `bsdtar` for RAM decryption."
+        )
+    cmd = [bsdtar_bin]
+    if pwd_str is not None:
+        cmd.extend(["--passphrase", pwd_str])
+    cmd.extend(["-xOf", str(vpath), member_name])
+    cp = subprocess.run(cmd, check=False, capture_output=True)
+    if cp.returncode != 0:
+        err = cp.stderr.decode("utf-8", errors="replace").strip()
+        raise PilotStagingError(f"bsdtar RAM decryption failed for {vpath.name!r}: {err}")
+    return cp.stdout
+
+
 def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str, bytes]) -> Path:
     """Build a read-only ISO image with Joliet + RockRidge long filenames via `xorriso` (or pure-Python fallback)."""
     iso_p = Path(iso_path)
@@ -272,35 +401,51 @@ def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str,
     xorriso_bin = shutil.which("xorriso")
     alt_mkisofs = shutil.which("genisoimage") or shutil.which("mkisofs")
     if xorriso_bin or alt_mkisofs:
-        with tempfile.TemporaryDirectory(prefix="dfir_stage_iso_") as tmp_dir:
+        shm_path = Path("/dev/shm")
+        tmp_base = str(shm_path) if (shm_path.is_dir() and os.access(shm_path, os.W_OK | os.X_OK)) else None
+        with tempfile.TemporaryDirectory(prefix="dfir_stage_iso_", dir=tmp_base) as tmp_dir:
             stage_root = Path(tmp_dir)
-            for fname, payload in clean_files.items():
-                (stage_root / fname).write_bytes(payload)
-            if xorriso_bin:
-                cmd = [
-                    xorriso_bin,
-                    "-as",
-                    "mkisofs",
-                    "-J",
-                    "-R",
-                    "-V",
-                    volume_label,
-                    "-o",
-                    str(iso_p),
-                    str(stage_root),
-                ]
-            else:
-                cmd = [
-                    str(alt_mkisofs),
-                    "-J",
-                    "-R",
-                    "-V",
-                    volume_label,
-                    "-o",
-                    str(iso_p),
-                    str(stage_root),
-                ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            os.chmod(stage_root, 0o700)
+            payload_tmp = stage_root / "payload.bin"
+            try:
+                for fname, payload in clean_files.items():
+                    fpath = stage_root / fname
+                    fpath.write_bytes(payload)
+                    if fname == "payload.bin":
+                        os.chmod(fpath, 0o400)
+                if xorriso_bin:
+                    cmd = [
+                        xorriso_bin,
+                        "-as",
+                        "mkisofs",
+                        "-J",
+                        "-R",
+                        "-V",
+                        volume_label,
+                        "-o",
+                        str(iso_p),
+                        str(stage_root),
+                    ]
+                else:
+                    cmd = [
+                        str(alt_mkisofs),
+                        "-J",
+                        "-R",
+                        "-V",
+                        volume_label,
+                        "-o",
+                        str(iso_p),
+                        str(stage_root),
+                    ]
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            finally:
+                if payload_tmp.exists():
+                    try:
+                        os.chmod(payload_tmp, 0o600)
+                        payload_tmp.write_bytes(b"\x00" * min(len(clean_files.get("payload.bin", b"")), 4096))
+                        payload_tmp.unlink()
+                    except Exception:
+                        pass
         return iso_p
 
     iso_p.write_bytes(_build_minimal_iso9660(volume_label, clean_files))
@@ -313,8 +458,9 @@ def build_stage_bundle(
     sample_vault_file: str | Path | None = None,
     benign_script_text: str = "# Benign workload placeholder\n",
     extra_iso_files: Mapping[str, bytes] | None = None,
+    archive_password: str | bytes | None = "infected",
 ) -> dict[str, Path]:
-    """Validate `spec`, verify vault sample SHA-256 (if malware run), and build read-only `DFIR_STAGE` ISO bundle."""
+    """Validate `spec`, decrypt vault sample into RAM (if malware run), verify SHA-256, and build `DFIR_STAGE` ISO."""
     validate_stage_run_spec(spec)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -332,9 +478,7 @@ def build_stage_bundle(
         if sample_vault_file is None:
             raise PilotStagingError(f"sample_vault_file is required for {spec.stratum!r} staging")
         vpath = Path(sample_vault_file)
-        if not vpath.exists():
-            raise FileNotFoundError(f"Vault sample file not found: {vpath}")
-        payload_bytes = vpath.read_bytes()
+        payload_bytes = read_vault_payload_in_memory(vpath, password=archive_password)
         actual_sha = hashlib.sha256(payload_bytes).hexdigest().lower()
         if actual_sha != str(spec.sample_sha256).lower():
             raise PilotStagingError(
@@ -344,7 +488,7 @@ def build_stage_bundle(
 
     manifest_bytes = json.dumps(manifest_dict, indent=2, sort_keys=True).encode("utf-8")
     bootstrapper_bytes = generate_guest_bootstrapper_ps1().encode("utf-8")
-    benign_bytes = str(benign_script_text).encode("utf-8")
+    benign_bytes = _inject_isolated_net_preamble(str(benign_script_text)).encode("utf-8")
 
     iso_files["run_manifest.json"] = manifest_bytes
     iso_files["Invoke-StagePayload.ps1"] = bootstrapper_bytes

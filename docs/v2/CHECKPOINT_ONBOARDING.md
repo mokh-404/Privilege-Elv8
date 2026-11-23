@@ -146,15 +146,13 @@ git diff --stat -- results/ data/ docs/FINAL_EVAL_PLAN.md collector/Collect-Arti
 
 ## 8. Exact Remaining Critical Path
 
-1. **Finish Infrastructure & Gate 0 Hardening (Host — Mokh, ZERO Malware):**
-   - Complete `inetsim-vm` (`192.168.150.10`, single NIC on `win11-isolated`) per [`03_inetsim_vm_setup.md`](hardening/03_inetsim_vm_setup.md) and validate both `win11` and `inetsim-vm` XML via `docs/v2/hardening/check_domain_xml.py`.
-   - Build & smoke-test the hardened container (`./docs/v2/hardening/06_unprivileged_container_runner.sh --build` -> `NEG-09`).
-   - Run and log all `NEG-01`..`NEG-10` checks in [`hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md`](hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md).
-   - Inspect the `5` residual rows in the `05:54` same-overlay zero-SSH parity run (`name_entropy` x1, `file_size_log`/`file_entropy` x4 in `docs/v2/CLEAN_IMAGE_PARITY_REPORT.md` — likely live shutdown-window transient files such as `Collect-Artifacts` log/manifest or locked files) and confirm Step 8 sign-off.
-   - Verify isolated ASUS user account (`OD-V2-07b`), initialize quarantine vault (`05_quarantine_vault_setup.sh init` + `preflight`), and formally sign **Gate 0** in [`08_NEGATIVE_EGRESS_AND_SIGN_OFF.md`](hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md) & [`OPERATOR_DECISIONS.md`](OPERATOR_DECISIONS.md).
+1. **Finalize Gate 0 Vault Marker (`NEG-01`..`NEG-10` & `inetsim-vm` Verified `PASS` `2026-11-23`):**
+   - `NEG-01..NEG-10`, base hash `d2facced...`, `inetsim-vm` (`192.168.150.10` serving `win11` `192.168.150.50`), `NEG-09` container (`4,414` rows, `OD-V2-20 = 99.62%`), `NEG-10` abort drill, and Step 8 live-overlay parity all executed `2026-11-23`.
+   - Rebuild container if needed (`./docs/v2/hardening/06_unprivileged_container_runner.sh --build`), verify ASUS dedicated isolated user (`OD-V2-07b`), initialize vault (`./docs/v2/hardening/05_quarantine_vault_setup.sh init`), write `/home/fsociety/.quarantine_vault_dfir_v2/GATE0_SIGNED_OFF`, and verify `preflight` passes.
 2. **Stage A Pilot (`OD-V2-05`, `OD-V2-20`):**
-   - Run `~3` clean control boots + `6–8` non-test families × paired `dormant` + `executed` runs via zero-SSH `DFIR_STAGE` ISOs and `06_unprivileged_container_runner.sh`.
-   - Execute `src/v2/run_stage_a_pilot.py`: check `OD-V2-20` `50%` pre-scoring link-coverage gate, `check_template_quantization`, pilot yield/variance, and empirical `sigma_delta_family` MDE calibration -> write `docs/v2/STAGE_A_PILOT_REPORT.md`.
+   - Curate `6–8` persistence-favoring non-test families into `0400` encrypted vault archives via `scripts/v2_curate_vault_manifest.py` (`ABUSECH_AUTH_KEY` env var).
+   - Run unattended Stage A Pilot via `src/v2/run_stage_a_pilot.py --batch-json ...` (auto-configures static `192.168.150.50` -> `192.168.150.10`, manages `inetsim-vm` start/destroy on `executed` runs, decrypts archives strictly in RAM into `DFIR_STAGE` ISO, extracts in `--cap-drop=ALL` container).
+   - Evaluate `OD-V2-20` `50%` pre-scoring gate, `check_template_quantization`, pilot yield/variance, and empirical `sigma_delta_family` MDE calibration -> write `docs/v2/STAGE_A_PILOT_REPORT.md`.
 3. **Freeze `FINAL_EVAL_PLAN_v2.md` & Run Stage B (`OD-V2-01`..`OD-V2-17`):**
    - Lock empirical `[TBD]` parameters into `docs/FINAL_EVAL_PLAN_v2.md` **before** collecting/freezing the blind test split (`dev` vs `blind_test` disjoint on `sample_family`, `ssdeep`/TLSH clusters, `pair_group_id`, benign profiles, and `emulated` v1 `dev`-only).
    - Collect Stage B runs, execute blinded human review via `src/v2/review_v2.py` (friend primary + Mokh 20% $\kappa$), run nested dev CV + `K=5` final evaluation (`full_20`, `no_content`, secondary `v2_refgraph`, Concept C execution delta, ablations, tail-risk/effort metrics).

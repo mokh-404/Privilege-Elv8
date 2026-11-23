@@ -61,6 +61,13 @@ fi
 mkdir -p "$RUN_OUT_DIR"
 ABS_QCOW2="$(realpath "$OVERLAY_QCOW2")"
 ABS_OUT="$(realpath "$RUN_OUT_DIR")"
+chmod 0777 "$ABS_OUT"
+
+restore_out_perms() {
+    chmod 0755 "$ABS_OUT" 2>/dev/null || true
+    chmod a+r "$ABS_OUT"/* 2>/dev/null || true
+}
+trap restore_out_perms EXIT
 QCOW2_NAME="$(basename "$ABS_QCOW2")"
 QCOW2_DIR="$(dirname "$ABS_QCOW2")"
 
@@ -129,7 +136,8 @@ fi
 DOCKER_VOLS+=(-v "${ABS_OUT}:/output:rw")
 
 echo "[*] Running unprivileged user-space extractor container on $ABS_QCOW2..."
-exec "$CONTAINER_RT" run --rm \
+rc=0
+"$CONTAINER_RT" run --rm \
     --network=none \
     --read-only \
     --cap-drop=ALL \
@@ -141,4 +149,6 @@ exec "$CONTAINER_RT" run --rm \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m \
     "${DOCKER_VOLS[@]}" \
     "$IMAGE_NAME" \
-    "${EXTRACTOR_ARGS[@]}"
+    "${EXTRACTOR_ARGS[@]}" || rc=$?
+restore_out_perms
+exit "$rc"

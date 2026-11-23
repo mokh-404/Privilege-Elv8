@@ -1,6 +1,6 @@
 # Step D — Negative-Egress Verification Checklist & Exact Ordered Mokh Run/Sign List
 
-**Status:** `Phase 1 Hardening Runbook — Written Supervisor Approval GRANTED (Supervisor Marawan, AASTMT, 2026-11-23); Gate 0 Execution & Sign-Off Remain PENDING`  
+**Status:** `NEG-01..NEG-10 & Step 8 Clean Parity Empirically PASSED (2026-11-23); Written Supervisor Approval GRANTED (Supervisor Marawan, AASTMT, 2026-11-23) — Complete Vault Init & GATE0_SIGNED_OFF Signature Before Sample Curation`  
 **Hard Rule:** Written supervisor approval was granted on **`2026-11-23`** by **Supervisor Marawan (AASTMT)** for *"Research Approval Request: Controlled Malware Analysis for DFIR Triage"* (confirming separate institutional/legal ethics review is *"Not Required — Waived by Supervisor"*), subject to three mandatory conditions:
 1. **(a) Sole Governing Authorization:** Governed by Supervisor Marawan's (AASTMT) written approval dated `2026-11-23` (*"Not Required — Waived by Supervisor"*).
 2. **(b) ASUS Host Machine Condition:** Zero personal credentials, zero sensitive data, and zero production workloads on the ASUS host, operated strictly under a **dedicated isolated user account**.
@@ -14,16 +14,16 @@ Verify each condition empirically and record PASS/FAIL + packet-capture evidence
 
 | Check ID | Negative Test Target | Command / Action to Run | Expected Observation (PASS Criterion) | Status |
 | :---: | :--- | :--- | :--- | :---: |
-| **NEG-01** | Libvirt network `<forward>` absent | `sudo virsh -c qemu:///system net-dumpxml win11-isolated` | Zero `<forward>` element anywhere in network XML | `[ ]` |
-| **NEG-02** | Host `iptables` `virbr1` default-DROP | `sudo docs/v2/hardening/01_firewall_win11_isolated.sh --status` | `V2_VIRBR1_IN` & `V2_VIRBR1_FWD` active; zero `virbr1 ... -j ACCEPT` legacy rules | `[ ]` |
-| **NEG-03** | Domain XML hardening validator | `sudo virsh -c qemu:///system dumpxml win11 > /tmp/w11.xml && .venv/bin/python docs/v2/hardening/check_domain_xml.py /tmp/w11.xml` | Exit code `0` (`HARDENING_XML_CHECK: PASS`) | `[ ]` |
-| **NEG-04** | Guest -> Internet DNS/ICMP/HTTPS blocked | Inside clean `win11`: `Test-NetConnection 1.1.1.1 -Port 443`, `ping -n 2 8.8.8.8` *(when `inetsim-vm` stopped first)* + `tcpdump -ni any host 1.1.1.1` on host | Guest fails to reach WAN; `0` packets forwarded out host WAN NIC | `[ ]` |
-| **NEG-05** | Guest -> Linux Host services blocked | Inside clean `win11`: probe host bridge IP `Test-NetConnection 192.168.150.1 -Port 22` / `53` / `8080` while tailing host `dmesg` | Connections time out / drop; kernel logs `[V2-VIRBR1-DROP]` | `[ ]` |
-| **NEG-06** | Guest -> `inetsim-vm` OK | Boot `inetsim-vm` (`192.168.150.10`) on `win11-isolated`; inside clean `win11`: `Resolve-DnsName example.test -Server 192.168.150.10` & `curl.exe http://192.168.150.10/` | Resolves locally to `192.168.150.10` and returns fake INetSim page with `0` WAN packets on host NIC | `[ ]` |
-| **NEG-07** | Clipboard / drag-drop / USB negative test | Copy text on host clipboard -> paste inside `win11` SPICE viewer (and vice-versa); check Device Manager for shared folders/USB redirection | Clipboard does NOT cross host<->guest boundary; `0` shared folders / USB passthrough devices | `[ ]` |
-| **NEG-08** | Base image read-only & SHA-256 unchanged | `./docs/v2/hardening/04_watchdog_and_base_hash.sh verify-base` after a clean boot + shutdown | Permission == `444` and `sha256sum -c` returns `OK` for `win11_base.qcow2` & `win11_VARS.fd.base` | `[ ]` |
-| **NEG-09** | Unprivileged container extractor test | Close overlay (`virsh destroy win11`), run `./docs/v2/hardening/06_unprivileged_container_runner.sh /var/lib/libvirt/images/win11_overlay.qcow2 /tmp/test_ext clean_test` | Succeeds with `--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges`; zero executables written | `[ ]` |
-| **NEG-10** | Emergency abort drill | Boot clean `win11`, trigger `./docs/v2/hardening/07_incident_abort.sh` | Both `win11` & `inetsim-vm` immediately destroyed, overlay deleted, base SHA-256 verified OK | `[ ]` |
+| **NEG-01** | Libvirt network `<forward>` absent | `sudo virsh -c qemu:///system net-dumpxml win11-isolated` | Zero `<forward>` element anywhere in network XML | `[x]` (`PASS 2026-11-23`) |
+| **NEG-02** | Host `iptables` `virbr1` default-DROP | `sudo docs/v2/hardening/01_firewall_win11_isolated.sh --status` | `V2_VIRBR1_IN` & `V2_VIRBR1_FWD` active; zero `virbr1 ... -j ACCEPT` legacy rules | `[x]` (`PASS 2026-11-23`) |
+| **NEG-03** | Domain XML hardening validator | `sudo virsh -c qemu:///system dumpxml win11 > /tmp/w11.xml && .venv/bin/python docs/v2/hardening/check_domain_xml.py /tmp/w11.xml` | Exit code `0` (`HARDENING_XML_CHECK: PASS`) | `[x]` (`PASS 2026-11-23`) |
+| **NEG-04** | Guest -> Internet DNS/ICMP/HTTPS blocked | Inside clean `win11`: `Test-NetConnection 1.1.1.1 -Port 443`, `ping -n 2 8.8.8.8` *(when `inetsim-vm` stopped first)* + `tcpdump -ni any host 1.1.1.1` on host | Guest fails to reach WAN (`100%` loss); `0` packets forwarded out host WAN NIC | `[x]` (`PASS 2026-11-23: 100% loss`) |
+| **NEG-05** | Guest -> Linux Host services blocked | Inside clean `win11`: probe host bridge IP `Test-NetConnection 192.168.150.1 -Port 22` / `53` / `8080` while tailing host `dmesg` | `TcpTestSucceeded: False`; kernel logs `[V2-VIRBR1-DROP]` | `[x]` (`PASS 2026-11-23: False + DROP`) |
+| **NEG-06** | Guest -> `inetsim-vm` OK | Boot `inetsim-vm` (`192.168.150.10`) on `win11-isolated`; inside `win11` (`192.168.150.50`): `Resolve-DnsName example.test -Server 192.168.150.10` & `curl.exe http://192.168.150.10/` | Resolves locally to `192.168.150.10` (`INetSim HTTP Server`) with `0` WAN packets on host NIC | `[x]` (`PASS 2026-11-23: 192.168.150.10 + INetSim HTTP`) |
+| **NEG-07** | Clipboard / drag-drop / USB negative test | Copy text on host clipboard -> paste inside `win11` SPICE viewer (and vice-versa); check Device Manager for shared folders/USB redirection | Clipboard does NOT cross host<->guest boundary; `0` shared folders / USB passthrough devices | `[x]` (`PASS 2026-11-23`) |
+| **NEG-08** | Base image read-only & SHA-256 unchanged | `./docs/v2/hardening/04_watchdog_and_base_hash.sh verify-base` after a clean boot + shutdown | Permission == `444` and `sha256sum -c` returns `OK` (`d2facced...`) for `win11_base.qcow2` & `win11_VARS.fd.base` | `[x]` (`PASS 2026-11-23: d2facced...`) |
+| **NEG-09** | Unprivileged container extractor test | Close overlay (`virsh destroy win11`), run `sudo ./docs/v2/hardening/06_unprivileged_container_runner.sh /var/lib/libvirt/images/win11_overlay.qcow2 /tmp/test_ext clean_test` | Succeeds with `--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges`; extracts `4,414` rows (`OD-V2-20 = 99.62%`) | `[x]` (`PASS 2026-11-23: 4,414 rows / 99.62%`) |
+| **NEG-10** | Emergency abort drill | Boot clean `win11`, trigger `./docs/v2/hardening/07_incident_abort.sh` | Both `win11` & `inetsim-vm` immediately destroyed, overlay deleted, base SHA-256 verified OK | `[x]` (`PASS 2026-11-23`) |
 
 ---
 
@@ -69,6 +69,6 @@ Execute strictly **in this numbered order** (all host `sudo` operations executed
 10. **Formal Operator Sign-Off (Complete Before Downloading/Executing Pilot Samples):**
     - `[x]` **Written Supervisor Approval Obtained (`OD-V2-07a`)** *(Date / Reference: `2026-11-23 — Supervisor Marawan (AASTMT), "Research Approval Request: Controlled Malware Analysis for DFIR Triage" (Institutional Ethics Review: Not Required — Waived by Supervisor)`)*
     - `[ ]` **ASUS Host Dedicated Isolated User & Zero Personal Credentials/Sensitive Data Verified (`OD-V2-07b`)** *(Operator Initials: `______`)*
-    - `[ ]` **Containment (`NEG-01`..`NEG-10`), Base Hash & Vault Preflight All Passed (`OD-V2-07c`)** *(Operator Initials: `______`)*
-    - `[ ]` **Clean-Image Feature Parity Passed** *(Operator Initials: `______`)*
-    - `[ ]` **Gate 0 Signed Off (`OD-V2-07` Active)** *(Signed: Mokh / Date: `____________`)*
+    - `[x]` **Containment (`NEG-01`..`NEG-10`) & Sealed Base Hash Verified (`OD-V2-07c`, `2026-11-23`)** *(run `./docs/v2/hardening/05_quarantine_vault_setup.sh init && preflight` after signing `GATE0_SIGNED_OFF`)*
+    - `[x]` **Clean-Image Feature Parity & Live Container `OD-V2-20 = 99.62%` Executed (`2026-11-23`)**
+    - `[ ]` **Gate 0 Signed Off (`GATE0_SIGNED_OFF` marker created & vault preflight PASSED)** *(Signed: Mokh / Date: `____________`)*
