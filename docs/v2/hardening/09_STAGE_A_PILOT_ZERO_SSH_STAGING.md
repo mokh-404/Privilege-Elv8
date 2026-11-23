@@ -2,7 +2,7 @@
 
 **Status:** `Implemented in src/v2/pilot_staging.py & Verified by Unit Tests`  
 **Related Decisions:** [`OD-V2-03`](../OPERATOR_DECISIONS.md), [`OD-V2-04`](../OPERATOR_DECISIONS.md), [`OD-V2-05`](../OPERATOR_DECISIONS.md), [`OD-V2-07`](../OPERATOR_DECISIONS.md), [`OD-V2-09`](../OPERATOR_DECISIONS.md)  
-**Implementation Module:** [`src/v2/pilot_staging.py`](../../../src/v2/pilot_staging.py)
+**Implementation Modules:** [`src/v2/pilot_staging.py`](../../../src/v2/pilot_staging.py) | [`src/v2/run_stage_a_pilot.py`](../../../src/v2/run_stage_a_pilot.py) | [`00_bake_v2_base_image.sh`](00_bake_v2_base_image.sh) | [`Install-V2BaseBootstrap.ps1`](Install-V2BaseBootstrap.ps1)
 
 ---
 
@@ -20,14 +20,13 @@ Consequently, **zero live SSH (`guest_runner.py`), zero `scp -r`, and zero `qemu
 
 Every VM run (`control`, `dormant`, or `executed`) receives its per-run configuration and staged inputs exclusively through a host-generated **read-only ISO-9660 virtual CD-ROM** (`run_stage_<run_id>.iso`, volume label **`DFIR_STAGE`**) built deterministically in user space by [`src/v2/pilot_staging.py`](../../../src/v2/pilot_staging.py):
 
-### A. Pre-Baked Clean Base Image Bootstrapper (Prepared Once Before Sealing `win11_base.qcow2` `0444`)
-During the clean base-image preparation boot (Step 5 of [`08_NEGATIVE_EGRESS_AND_SIGN_OFF.md`](08_NEGATIVE_EGRESS_AND_SIGN_OFF.md) — **before** `chmod 0444` and `record-base`):
-1. Install [`Invoke-StagePayload.ps1`](../../../src/v2/pilot_staging.py) at `C:\DFIR-Bootstrap\Invoke-StagePayload.ps1`.
-2. Register a boot/logon Scheduled Task `\DFIR-StageRunner` (`SYSTEM` / interactive session) invoking:
-   ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\DFIR-Bootstrap\Invoke-StagePayload.ps1
-   ```
-3. Seal `win11_base.qcow2` (`chmod 0444`, `chattr +i`) and record its golden SHA-256 (`feddb54d208174d3d1eda45e69ac831965a8572ead71f276ddf229a0ac3d0674`).
+### A. Pre-Baked Clean Base Image Bootstrapper (Prepared Once via `00_bake_v2_base_image.sh` Before Sealing `win11_base.qcow2` `0444`)
+Read-only inspection of the unbaked v1 `win11_base.qcow2` (`4,364` records) confirmed that `Sysmon`, `C:\DFIR-Bootstrap\Invoke-StagePayload.ps1`, and `\DFIR-StageRunner` are **absent** while `sshd` is `Start=2`. Therefore, during Step 0 of [`08_NEGATIVE_EGRESS_AND_SIGN_OFF.md`](08_NEGATIVE_EGRESS_AND_SIGN_OFF.md) — **before** `chmod 0444`, `chattr +i`, and `01_firewall_win11_isolated.sh`:
+1. Run [`00_bake_v2_base_image.sh`](00_bake_v2_base_image.sh) + [`Install-V2BaseBootstrap.ps1`](Install-V2BaseBootstrap.ps1) inside one clean maintenance boot to:
+   - Install `Sysmon64` with the v2 process/file/registry/task/WMI config (`64 MB` EVTX buffer);
+   - Install `C:\DFIR-Bootstrap\Invoke-StagePayload.ps1` and register `\DFIR-StageRunner` (`SYSTEM`, `ONSTART`);
+   - Disable `sshd` (`Start=4`), clear setup logs, flush `C:`, and power off cleanly.
+2. Run `./docs/v2/hardening/00_bake_v2_base_image.sh seal-and-cache` on the host to verify all three conditions via `dissect.target`, set `chmod 0444` + `chattr +i`, record the new golden `win11_base.sha256`, and rebuild `--build-base-cache`.
 
 ### B. Per-Run Host Staging Workflow (`build_stage_bundle`)
 Before each run `run_id`:

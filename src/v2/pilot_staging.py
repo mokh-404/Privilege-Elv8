@@ -139,6 +139,14 @@ if ($manifest.stratum -in @("dormant", "executed")) {
         Start-Process -FilePath $targetPath -WorkingDirectory $targetDir
     }
 }
+
+# 3. Wait dwell_seconds, flush NTFS volume cache, and power off cleanly before watchdog hard kill
+$dwell = if ($manifest.dwell_seconds) { [int]$manifest.dwell_seconds } else { 120 }
+Start-Sleep -Seconds $dwell
+Write-VolumeCache -DriveLetter C -ErrorAction SilentlyContinue
+if ($manifest.auto_poweroff -ne $false) {
+    Stop-Computer -Force
+}
 """
 
 

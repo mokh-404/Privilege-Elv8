@@ -29,10 +29,21 @@ Verify each condition empirically and record PASS/FAIL + packet-capture evidence
 
 ## Part 2: Exact Ordered **"What Mokh Runs and Signs"** List (Critical Path Before Pilot)
 
+> [!IMPORTANT]
+> **Blocker Verified on Current `win11_base.qcow2` (`4,364` records):** Read-only inspection confirmed that **`Sysmon` / `Sysmon64` and `Microsoft-Windows-Sysmon%4Operational.evtx` are ABSENT**, **`C:\DFIR-Bootstrap\Invoke-StagePayload.ps1` and `\DFIR-StageRunner` are ABSENT**, and **`sshd` is still Auto-start (`Start = 2`)**. You **MUST** run **Step 0 (`00_bake_v2_base_image.sh` + `Install-V2BaseBootstrap.ps1`)** on a clean maintenance boot **BEFORE** running `chattr +i /var/lib/libvirt/images/win11_base.qcow2` or applying `01_firewall_win11_isolated.sh`.
+
 Execute strictly **in this numbered order** (all host `sudo` operations executed manually by Mokh):
 
-1. **Record Base Hashes (`chmod 0444` Verified):**
-   `./docs/v2/hardening/04_watchdog_and_base_hash.sh record-base`
+0. **One-Time Clean Base Image Bake (`Sysmon` + `\DFIR-StageRunner` + Disable `sshd`, BEFORE `chattr +i`):**
+   - Build the read-only `DFIR_BAKE` maintenance ISO containing [`Install-V2BaseBootstrap.ps1`](Install-V2BaseBootstrap.ps1) and `Sysmon64.exe`:
+     `./docs/v2/hardening/00_bake_v2_base_image.sh build-bake-iso /path/to/Sysmon64.exe /tmp/v2_base_bake.iso`
+   - Boot a clean maintenance session of `win11` with `/tmp/v2_base_bake.iso` attached (or copy `Install-V2BaseBootstrap.ps1` + `Sysmon64.exe` over the existing v1 SSH channel before `sshd` is disabled) and run as Administrator inside the guest:
+     `powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\INSTALL.PS1`
+     *(Installs `Sysmon64` with the v2 config & 64 MB EVTX buffer, installs `C:\DFIR-Bootstrap\Invoke-StagePayload.ps1`, registers `\DFIR-StageRunner` as `SYSTEM` `ONSTART`, disables `sshd`, clears transient setup logs, flushes `C:`, and powers off cleanly).*
+   - Once the guest powers off, verify the baked image in user space, seal `chmod 0444` + `chattr +i`, record the new golden `win11_base.sha256`, and rebuild `--build-base-cache`:
+     `./docs/v2/hardening/00_bake_v2_base_image.sh seal-and-cache`
+1. **Verify Sealed Base Hashes (`chmod 0444` & `chattr +i` Verified):**
+   `./docs/v2/hardening/04_watchdog_and_base_hash.sh verify-base`
 2. **Harden Host Firewall (`virbr1` Default-DROP):**
    `sudo ./docs/v2/hardening/01_firewall_win11_isolated.sh --apply`
 3. **Provision & Verify Isolated `inetsim-vm` (`OD-V2-03`):**
@@ -40,14 +51,15 @@ Execute strictly **in this numbered order** (all host `sudo` operations executed
 4. **Harden `win11` Domain XML & Re-Check Network XML:**
    Edit via `sudo virsh -c qemu:///system edit win11` per [`02_domain_xml_hardening.md`](02_domain_xml_hardening.md), then pass:
    `.venv/bin/python docs/v2/hardening/check_domain_xml.py /tmp/win11_after.xml --net-xml /tmp/win11_net.xml`
-5. **Install Sysmon + ETW Profile Inside `win11` Base Image (Clean Prep Boot, BEFORE Sealing Base):**
-   Configure Sysmon logging (`EventID 1, 8, 11, 12, 13, 14, 19, 20, 21, 25`), re-seal `win11_base.qcow2` as `chmod 0444`, and re-run `04_watchdog_and_base_hash.sh record-base`.
+5. **Re-Verify Baked `win11_base.qcow2` Offline (`Sysmon` + `\DFIR-StageRunner` + `sshd=Disabled`):**
+   `./docs/v2/hardening/00_bake_v2_base_image.sh verify-image`
 6. **Build & Verify Offline Extractor Container Image (`Step F`):**
    Build `docs/v2/hardening/offline_extractor.Dockerfile` (`docker build`) and validate `06_unprivileged_container_runner.sh`.
 7. **Run Negative-Egress Verification (`NEG-01`..`NEG-10`) on Clean Boot:**
    Complete the entire table above using a clean control overlay only (zero malware).
-8. **Run Clean-Image Feature Parity Test (`docs/v2/FEATURE_PARITY_AUDIT.md` §4):**
-   Compare live `Collect-Artifacts.ps1` vs offline extractor on the same clean overlay (`signature_state >= 98%`, exact features `100%`).
+8. **Run Clean-Image Feature Parity Comparator (`docs/v2/FEATURE_PARITY_AUDIT.md` §4 & `scripts/compare_v1_v2_parity.py`):**
+   Compare live `Collect-Artifacts.ps1` vs offline extractor on the same clean overlay:
+   `.venv/bin/python scripts/compare_v1_v2_parity.py --v1-live-json /tmp/parity_v1_live.json --v2-offline-jsonl /tmp/parity_v2_offline/artifacts.jsonl --out-md docs/v2/CLEAN_IMAGE_PARITY_REPORT.md`
 9. **Initialize Quarantine Vault & Verify Supervisor Approval Conditions (`OD-V2-07`):**
    Verify dedicated isolated host user account on the ASUS host (zero personal credentials/sensitive data/production workloads), run `./docs/v2/hardening/05_quarantine_vault_setup.sh init`, sign Gate 0 (`GATE0_SIGNED_OFF`), and verify `./docs/v2/hardening/05_quarantine_vault_setup.sh preflight` passes.
 10. **Formal Operator Sign-Off (Complete Before Downloading/Executing Pilot Samples):**

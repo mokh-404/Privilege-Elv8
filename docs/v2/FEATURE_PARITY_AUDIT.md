@@ -72,8 +72,16 @@ Execute this verification on **one clean control boot** before Pilot Stage A beg
 2. **Offline Extraction of the Exact Same Closed Overlay:**
    - Run the unprivileged container offline extractor (`Step D` / `Step F`) read-only on `/var/lib/libvirt/images/win11_overlay.qcow2` -> `/tmp/parity_v2_offline/artifacts.jsonl`.
    - Delete `win11_overlay.qcow2` and verify `sha256sum /var/lib/libvirt/images/win11_base.qcow2` is unchanged.
-3. **Per-Feature Automated Comparison & Acceptance Thresholds:**
-   Join matched records on normalized `artifact_key` across `/tmp/parity_v1_live.json` (excluding `artifact_type == "process"` and `C:\collector_out_parity`) and `/tmp/parity_v2_offline/artifacts.jsonl`, compute `features.row_features` on both, and check:
+3. **Per-Feature Automated Comparison & Acceptance Thresholds (`scripts/compare_v1_v2_parity.py`):**
+   Run the automated comparator script:
+   ```bash
+   .venv/bin/python scripts/compare_v1_v2_parity.py \
+       --v1-live-json /tmp/parity_v1_live.json \
+       --v2-offline-jsonl /tmp/parity_v2_offline/artifacts.jsonl \
+       --out-md docs/v2/CLEAN_IMAGE_PARITY_REPORT.md \
+       --out-json /tmp/parity_report.json
+   ```
+   which joins matched records on normalized `artifact_key` across `/tmp/parity_v1_live.json` (excluding `artifact_type == "process"` and `C:\collector_out_parity`) and `/tmp/parity_v2_offline/artifacts.jsonl`, computes `features.row_features` on both, and checks:
    - **Exact-match features** (`ext_class`, `registry_location_class`, `name_length`, `name_entropy`, `file_size_log`, `has_double_extension`, `has_encoded_flag`, `has_url_or_ip`, `has_lolbin`, `has_hidden_attr`, `autostart_flag`): **`100%` exact equality** (`|diff| <= 1e-6` on floats for shared non-missing rows).
    - **`file_entropy`** (for rows non-null in both): **`|v2 - v1| <= 1e-6` bits** on `100%` of shared files.
    - **`signature_state`**: **`>= 98%` exact agreement** across shared SIP/non-SIP files; log every discrepancy for catalog `.cat` vs PE root trust debugging.
