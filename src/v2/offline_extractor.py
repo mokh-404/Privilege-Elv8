@@ -837,6 +837,21 @@ def _read_qcow2_backing_file_header(qcow2_path: Path) -> str | None:
         return fh.read(hdr.backing_file_size).decode("utf-8", errors="replace")
 
 
+def _resolve_qcow2_backing_path(image_path: Path, raw_backing: str) -> Path:
+    """Resolve a QCOW2 backing-file reference, falling back to sibling filename (e.g. `/input/` containers)."""
+    bpath = Path(raw_backing)
+    img_parent = image_path.resolve().parent
+    candidate = bpath.resolve() if bpath.is_absolute() else (img_parent / bpath).resolve()
+    if candidate.exists():
+        return candidate
+    sibling = (img_parent / bpath.name).resolve()
+    if sibling.exists():
+        return sibling
+    raise FileNotFoundError(
+        f"QCOW2 backing file not found: {candidate} (referenced by {image_path})"
+    )
+
+
 def _open_qcow2_stream_readonly(image_path: Path, _seen: set[Path] | None = None) -> Any:
     """Recursively open a QCOW2 (or raw) image stream read-only without `Path.with_name()` crashes on `/` paths."""
     from dissect.hypervisor.disk import qcow2 as dq  # type: ignore
@@ -850,12 +865,7 @@ def _open_qcow2_stream_readonly(image_path: Path, _seen: set[Path] | None = None
     raw_backing = _read_qcow2_backing_file_header(resolved)
     backing_stream = None
     if raw_backing:
-        bpath = Path(raw_backing)
-        resolved_backing = bpath.resolve() if bpath.is_absolute() else (resolved.parent / bpath).resolve()
-        if not resolved_backing.exists():
-            raise FileNotFoundError(
-                f"QCOW2 backing file not found: {resolved_backing} (referenced by {resolved})"
-            )
+        resolved_backing = _resolve_qcow2_backing_path(resolved, raw_backing)
         backing_stream = _open_qcow2_stream_readonly(resolved_backing, _seen=seen)
 
     with resolved.open("rb") as fh:
@@ -891,12 +901,7 @@ def open_qcow2_target_readonly(qcow2_path: str | Path, *, apply: bool = True) ->
             raise
         if not raw_backing:
             raise
-        bpath = Path(raw_backing)
-        resolved_backing = bpath.resolve() if bpath.is_absolute() else (qpath.resolve().parent / bpath).resolve()
-        if not resolved_backing.exists():
-            raise FileNotFoundError(
-                f"QCOW2 backing file not found: {resolved_backing} (referenced by {qpath})"
-            ) from exc
+        resolved_backing = _resolve_qcow2_backing_path(qpath, raw_backing)
         backing_stream = _open_qcow2_stream_readonly(resolved_backing)
         container = QCow2Container(qpath, backing_file=backing_stream)
         target = Target(qpath)

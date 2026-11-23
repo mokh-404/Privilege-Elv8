@@ -23,6 +23,7 @@ from src.v2.offline_extractor import (
 )
 from src.v2.pilot_staging import PilotStagingError, StageRunSpec, build_clean_parity_stage_iso
 from src.v2.run_stage_a_pilot import (
+    build_container_extraction_command,
     build_create_overlay_command,
     compute_od_v2_20_pilot_gate,
     evaluate_stage_a_pilot_runs,
@@ -339,3 +340,45 @@ def test_stage_a_pilot_orchestrator_gate0_od_v2_20_and_power_calibration(tmp_pat
     )
     with pytest.raises(PilotStagingError, match="Gate 0 .* is NOT signed off"):
         evaluate_stage_a_pilot_runs([ctrl_df], [unsigned_run])
+
+
+def test_parity_workload_cli_matches_frozen_collect_artifacts_params(tmp_path):
+    import re
+
+    repo = Path(__file__).resolve().parent.parent
+    collector_ps1 = (repo / "collector" / "Collect-Artifacts.ps1").read_text(encoding="utf-8")
+    m_param = re.search(r"(?is)param\s*\((.*?)\n\)", collector_ps1)
+    assert m_param is not None
+    param_body = m_param.group(1)
+
+    declared_params = {name.lower() for name in re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", param_body)}
+    declared_aliases = {alias.lower() for alias in re.findall(r'\[Alias\("([^"]+)"\)\]', param_body)}
+    valid_flags = declared_params | declared_aliases
+    assert "outdir" in valid_flags
+    assert "runid" not in valid_flags
+
+    bundle = build_clean_parity_stage_iso(tmp_path / "parity_cli_check")
+    workload_txt = bundle["benign_workload"].read_text(encoding="utf-8")
+    assert "parity_stdout.log" in workload_txt
+
+    invoked_lines = [ln for ln in workload_txt.splitlines() if "$collectorScript" in ln and "powershell.exe" in ln]
+    assert len(invoked_lines) == 1
+    passed_flags = re.findall(r"(?<=\s)-([A-Za-z_][A-Za-z0-9_]*)\b", invoked_lines[0].split("$collectorScript", 1)[1])
+    assert "OutDir" in passed_flags
+    assert "RunId" not in passed_flags
+    for flag in passed_flags:
+        assert flag.lower() in valid_flags, f"Undeclared Collect-Artifacts.ps1 parameter -{flag}"
+
+    cmd, env = build_container_extraction_command(
+        "/var/lib/libvirt/images/win11_overlay.qcow2",
+        "/tmp/pilot_out/run_01",
+        "run_01",
+    )
+    assert cmd[0].endswith("06_unprivileged_container_runner.sh")
+    assert cmd[1:] == [
+        "/var/lib/libvirt/images/win11_overlay.qcow2",
+        "/tmp/pilot_out/run_01",
+        "run_01",
+        "/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz",
+    ]
+    assert env == {"BASE_CACHE_PATH": "/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz"}

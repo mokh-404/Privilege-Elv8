@@ -59,6 +59,32 @@ def build_create_overlay_command(base_qcow2: str | Path, overlay_qcow2: str | Pa
     ]
 
 
+def build_container_extraction_command(
+    overlay_qcow2: str | Path,
+    run_out_dir: str | Path,
+    run_id: str,
+    base_cache_path: str | Path | None = Path("/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz"),
+    runner_script: str | Path | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Build the unprivileged `06_unprivileged_container_runner.sh` argv and env with `BASE_CACHE_PATH`."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    script_p = (
+        Path(runner_script)
+        if runner_script is not None
+        else (repo_root / "docs" / "v2" / "hardening" / "06_unprivileged_container_runner.sh")
+    )
+    cache_arg = str(base_cache_path) if base_cache_path is not None else "none"
+    cmd = [
+        str(script_p),
+        str(overlay_qcow2),
+        str(run_out_dir),
+        str(run_id),
+        cache_arg,
+    ]
+    env = {"BASE_CACHE_PATH": cache_arg}
+    return cmd, env
+
+
 def compute_od_v2_20_pilot_gate(df: pd.DataFrame, threshold_pct: float = 50.0) -> dict[str, Any]:
     """Compute the pre-scoring `OD-V2-20` go/no-go gate on pilot persistence/execution artifacts."""
     summary = summarize_extraction_and_refgraph(df, disk_id="stage_a_pilot")

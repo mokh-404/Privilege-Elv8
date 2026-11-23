@@ -87,3 +87,80 @@ def test_firewall_script_cleans_ufw_user_chains_and_inserts_at_position_1():
     assert 'iptables -I INPUT 1 -i "$BRIDGE" -j V2_VIRBR1_IN' in fw_txt
     assert 'iptables -I FORWARD 1 -i "$BRIDGE" -j V2_VIRBR1_FWD' in fw_txt
     assert 'iptables -I FORWARD 2 -o "$BRIDGE" -j V2_VIRBR1_FWD' in fw_txt
+
+
+def test_unprivileged_container_runner_mounts_overlay_backing_cache_and_build(tmp_path):
+    import json
+    import os
+    import shutil
+
+    runner = HARDENING_DIR / "06_unprivileged_container_runner.sh"
+    dockerfile = HARDENING_DIR / "offline_extractor.Dockerfile"
+    req_txt = (HARDENING_DIR / "requirements_extractor.txt").read_text(encoding="utf-8")
+    df_txt = dockerfile.read_text(encoding="utf-8")
+    assert "COPY src/utils/repro.py /app/src/utils/repro.py" in df_txt
+    assert "/cache" in df_txt
+    assert "scikit-learn" in req_txt
+
+    qemu_img = shutil.which("qemu-img")
+    assert qemu_img is not None
+
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+    base_img = img_dir / "win11_base.qcow2"
+    overlay_img = img_dir / "win11_overlay.qcow2"
+    subprocess.run([qemu_img, "create", "-f", "qcow2", str(base_img), "64K"], check=True, capture_output=True)
+    subprocess.run(
+        [qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", "win11_base.qcow2", str(overlay_img)],
+        check=True,
+        capture_output=True,
+    )
+
+    cache_file = tmp_path / "win11_base_cache.json.gz"
+    cache_file.write_bytes(b"stub_cache")
+    out_dir = tmp_path / "out_dir"
+    log_json = tmp_path / "shim_argv.json"
+
+    shim = tmp_path / "fake_docker.sh"
+    shim.write_text(
+        f"""#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+Path({str(log_json)!r}).write_text(json.dumps(sys.argv[1:]))
+""",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    env = dict(os.environ, CONTAINER_RT=str(shim))
+    cp_run = subprocess.run(
+        ["bash", str(runner), str(overlay_img), str(out_dir), "test_run", str(cache_file)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert cp_run.returncode == 0
+    argv = json.loads(log_json.read_text(encoding="utf-8"))
+    for req_flag in ("--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user"):
+        assert req_flag in argv
+    assert f"{overlay_img.resolve()}:/input/win11_overlay.qcow2:ro" in argv
+    assert f"{base_img.resolve()}:/input/win11_base.qcow2:ro" in argv
+    assert f"{cache_file.resolve()}:/cache/base_cache.json.gz:ro" in argv
+    assert "--qcow2" in argv and "/input/win11_overlay.qcow2" in argv
+    assert "--out-dir" in argv and "/output" in argv
+    assert "--run-id" in argv and "test_run" in argv
+    assert "--base-cache-path" in argv and "/cache/base_cache.json.gz" in argv
+
+    cp_build = subprocess.run(
+        ["bash", str(runner), "--build"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert cp_build.returncode == 0
+    build_argv = json.loads(log_json.read_text(encoding="utf-8"))
+    assert build_argv[0] == "build"
+    assert "-f" in build_argv and str(dockerfile) in build_argv
+    assert "-t" in build_argv and "dfir-v2-offline-extractor:latest" in build_argv

@@ -393,7 +393,8 @@ def build_clean_parity_stage_iso(
     """Build a zero-SSH read-only `DFIR_STAGE` ISO that runs `Collect-Artifacts.ps1` inside the clean guest.
 
     When attached to a clean disposable overlay, `\\DFIR-StageRunner` (`Invoke-StagePayload.ps1`) executes
-    `benign_workload.ps1`, which runs `Collect-Artifacts.ps1 -OutDir C:\\collector_out_parity -RunId ...`,
+    `benign_workload.ps1`, which runs `Collect-Artifacts.ps1 -OutDir C:\\collector_out_parity`
+    (writing stdout/stderr to `C:\\collector_out_parity\\parity_stdout.log`),
     flushes `Write-VolumeCache -DriveLetter C`, and powers off the guest cleanly (`Stop-Computer -Force`).
     The resulting `C:\\collector_out_parity\\artifacts.json` is then read directly out of the closed
     `win11_overlay.qcow2` in user space via `scripts/compare_v1_v2_parity.py --extract-v1-json-from-qcow2`.
@@ -414,11 +415,31 @@ $vol = Get-Volume | Where-Object {{ $_.FileSystemLabel -eq "DFIR_STAGE" -and $_.
 $stageRoot = if ($vol) {{ "$($vol.DriveLetter):\\" }} else {{ $PSScriptRoot }}
 $collectorScript = Join-Path $stageRoot "COLLECT.PS1"
 $outDir = "{guest_out_dir}"
+$logPath = Join-Path $outDir "parity_stdout.log"
 if (-not (Test-Path -LiteralPath $outDir)) {{
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 }}
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $collectorScript -OutDir $outDir -RunId "{run_id}"
-Write-VolumeCache -DriveLetter C -ErrorAction SilentlyContinue
+$prevPref = $ErrorActionPreference
+try {{
+    $ErrorActionPreference = "Continue"
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $collectorScript -OutDir $outDir 2>&1
+    $collExit = $LASTEXITCODE
+    $output | Out-File -LiteralPath $logPath -Encoding utf8
+    "COLLECT_EXIT_CODE=$collExit" | Out-File -LiteralPath $logPath -Append -Encoding utf8
+    if ($collExit -ne 0) {{
+        throw "Collect-Artifacts.ps1 exited with code $collExit"
+    }}
+    $artifactsJson = Join-Path $outDir "artifacts.json"
+    if (-not (Test-Path -LiteralPath $artifactsJson)) {{
+        throw "Expected collector output missing: $artifactsJson"
+    }}
+}} catch {{
+    $_ | Out-String | Out-File -LiteralPath $logPath -Append -Encoding utf8
+    throw
+}} finally {{
+    $ErrorActionPreference = $prevPref
+    Write-VolumeCache -DriveLetter C -ErrorAction SilentlyContinue
+}}
 """
     spec = StageRunSpec(
         run_id=run_id,
