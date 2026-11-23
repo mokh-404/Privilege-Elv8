@@ -24,8 +24,11 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import struct
-from typing import Any
+import subprocess
+import tempfile
+from typing import Any, Mapping
 
 from src.utils.repro import utc_now_iso
 
@@ -252,11 +255,64 @@ def _build_minimal_iso9660(volume_label: str, files: dict[str, bytes]) -> bytes:
     return bytes(image)
 
 
+def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str, bytes]) -> Path:
+    """Build a read-only ISO image with Joliet + RockRidge long filenames via `xorriso` (or pure-Python fallback)."""
+    iso_p = Path(iso_path)
+    iso_p.parent.mkdir(parents=True, exist_ok=True)
+    if iso_p.exists():
+        iso_p.unlink()
+
+    clean_files: dict[str, bytes] = {}
+    for raw_name, payload in files.items():
+        name = str(raw_name)
+        if not name or "/" in name or "\\" in name or name in (".", ".."):
+            raise ValueError(f"ISO staging filename must be a clean root basename, got {raw_name!r}")
+        clean_files[name] = bytes(payload)
+
+    xorriso_bin = shutil.which("xorriso")
+    alt_mkisofs = shutil.which("genisoimage") or shutil.which("mkisofs")
+    if xorriso_bin or alt_mkisofs:
+        with tempfile.TemporaryDirectory(prefix="dfir_stage_iso_") as tmp_dir:
+            stage_root = Path(tmp_dir)
+            for fname, payload in clean_files.items():
+                (stage_root / fname).write_bytes(payload)
+            if xorriso_bin:
+                cmd = [
+                    xorriso_bin,
+                    "-as",
+                    "mkisofs",
+                    "-J",
+                    "-R",
+                    "-V",
+                    volume_label,
+                    "-o",
+                    str(iso_p),
+                    str(stage_root),
+                ]
+            else:
+                cmd = [
+                    str(alt_mkisofs),
+                    "-J",
+                    "-R",
+                    "-V",
+                    volume_label,
+                    "-o",
+                    str(iso_p),
+                    str(stage_root),
+                ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return iso_p
+
+    iso_p.write_bytes(_build_minimal_iso9660(volume_label, clean_files))
+    return iso_p
+
+
 def build_stage_bundle(
     spec: StageRunSpec,
     out_dir: str | Path,
     sample_vault_file: str | Path | None = None,
     benign_script_text: str = "# Benign workload placeholder\n",
+    extra_iso_files: Mapping[str, bytes] | None = None,
 ) -> dict[str, Path]:
     """Validate `spec`, verify vault sample SHA-256 (if malware run), and build read-only `DFIR_STAGE` ISO bundle."""
     validate_stage_run_spec(spec)
@@ -293,6 +349,9 @@ def build_stage_bundle(
     iso_files["run_manifest.json"] = manifest_bytes
     iso_files["Invoke-StagePayload.ps1"] = bootstrapper_bytes
     iso_files["benign_workload.ps1"] = benign_bytes
+    if extra_iso_files:
+        for ename, epayload in extra_iso_files.items():
+            iso_files[str(ename)] = bytes(epayload)
 
     manifest_path = out_path / "run_manifest.json"
     manifest_path.write_bytes(manifest_bytes)
@@ -302,7 +361,7 @@ def build_stage_bundle(
     benign_path.write_bytes(benign_bytes)
 
     iso_path = out_path / f"run_stage_{spec.run_id}.iso"
-    iso_path.write_bytes(_build_minimal_iso9660("DFIR_STAGE", iso_files))
+    build_stage_iso(iso_path, "DFIR_STAGE", iso_files)
 
     xml_path = out_path / "cdrom_device.xml"
     xml_path.write_text(
@@ -372,15 +431,8 @@ Write-VolumeCache -DriveLetter C -ErrorAction SilentlyContinue
         spec=spec,
         out_dir=out_path,
         benign_script_text=parity_workload_ps1,
+        extra_iso_files={"COLLECT.PS1": collector_bytes},
     )
-    # Re-build ISO including COLLECT.PS1 alongside run_manifest.json, Invoke-StagePayload.ps1, and benign_workload.ps1
-    iso_files = {
-        "run_manifest.json": bundle["manifest"].read_bytes(),
-        "Invoke-StagePayload.ps1": bundle["bootstrapper"].read_bytes(),
-        "benign_workload.ps1": bundle["benign_workload"].read_bytes(),
-        "COLLECT.PS1": collector_bytes,
-    }
-    bundle["iso"].write_bytes(_build_minimal_iso9660("DFIR_STAGE", iso_files))
     coll_copy = out_path / "COLLECT.PS1"
     coll_copy.write_bytes(collector_bytes)
     bundle["collector_ps1"] = coll_copy

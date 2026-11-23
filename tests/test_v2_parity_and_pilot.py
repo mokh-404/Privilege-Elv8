@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import shutil
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -13,9 +15,15 @@ import pytest
 from scripts.compare_v1_v2_parity import compare_v1_v2_feature_parity, format_parity_markdown
 from src import config
 from src.v2.labeler_v2 import drop_v2_harness_footprint
-from src.v2.offline_extractor import extract_from_fixture, is_v2_harness_footprint_record, write_outputs
+from src.v2.offline_extractor import (
+    expand_target_like_v1,
+    extract_from_fixture,
+    is_v2_harness_footprint_record,
+    write_outputs,
+)
 from src.v2.pilot_staging import PilotStagingError, StageRunSpec, build_clean_parity_stage_iso
 from src.v2.run_stage_a_pilot import (
+    build_create_overlay_command,
     compute_od_v2_20_pilot_gate,
     evaluate_stage_a_pilot_runs,
     write_stage_a_pilot_report,
@@ -79,21 +87,38 @@ def test_bake_scripts_exist_and_have_valid_syntax():
     assert "prepare-overlay)" in sh_txt
     assert "qemu-img commit" in sh_txt
     assert "chown 956:956" in sh_txt
+    assert "rel_base" in sh_txt
+    assert "open_qcow2_target_readonly" in sh_txt
+    assert "build_stage_iso" in sh_txt
     ps_txt = ps_path.read_text(encoding="utf-8")
     assert "Microsoft-Windows-Sysmon/Operational" in ps_txt
     assert "67108864" in ps_txt
     assert "\\DFIR-StageRunner" in ps_txt
     assert 'Set-Service -Name "sshd" -StartupType Disabled' in ps_txt
 
+    cmd = build_create_overlay_command(
+        "/var/lib/libvirt/images/win11_base.qcow2",
+        "/var/lib/libvirt/images/win11_overlay.qcow2",
+    )
+    assert cmd[:7] == ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b"]
+    assert cmd[7] == "win11_base.qcow2"
+    assert cmd[8] == "/var/lib/libvirt/images/win11_overlay.qcow2"
+
 
 def test_zero_ssh_parity_iso_builder_and_v2_harness_footprint_filtering(tmp_path):
-    # 1. Verify zero-SSH parity ISO packages Collect-Artifacts.ps1 into DFIR_STAGE ISO
+    # 1. Verify zero-SSH parity ISO packages Collect-Artifacts.ps1 into DFIR_STAGE ISO with full long filenames
     bundle = build_clean_parity_stage_iso(tmp_path / "parity_iso_dir")
     assert bundle["iso"].exists() and bundle["collector_ps1"].exists()
     iso_bytes = bundle["iso"].read_bytes()
     assert b"CD001" in iso_bytes
     assert b"COLLECT.PS1" in iso_bytes
     assert "C:\\collector_out_parity" in bundle["benign_workload"].read_text(encoding="utf-8")
+
+    xorriso_bin = shutil.which("xorriso")
+    assert xorriso_bin is not None
+    cp = subprocess.run([xorriso_bin, "-indev", str(bundle["iso"]), "-ls", "/"], capture_output=True, text=True, check=True)
+    for expected in ("run_manifest.json", "benign_workload.ps1", "Invoke-StagePayload.ps1", "COLLECT.PS1"):
+        assert expected in cp.stdout
 
     # 2. Verify v2 harness footprint filtering in both offline_extractor and labeler_v2
     harness_and_real = [
@@ -169,6 +194,11 @@ def test_zero_ssh_parity_iso_builder_and_v2_harness_footprint_filtering(tmp_path
     # Refuses to overwrite frozen v1 RUNNER_FOOTPRINT_LOG_CSV
     with pytest.raises(ValueError, match="Refusing to overwrite frozen v1"):
         drop_v2_harness_footprint(pd.DataFrame(harness_and_real), log_path=config.RUNNER_FOOTPRINT_LOG_CSV)
+
+    # 3. Verify v1 Extract-TargetPath semantics on quoted args and comma-terminated Winlogon Userinit
+    assert expand_target_like_v1(r'"C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe" /svc') == r"C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe"
+    assert expand_target_like_v1(r'"C:\Users\mokh\AppData\Local\Microsoft\OneDrive\OneDrive.exe" /background') == r"C:\Users\mokh\AppData\Local\Microsoft\OneDrive\OneDrive.exe"
+    assert expand_target_like_v1(r"C:\WINDOWS\system32\userinit.exe,") == r"C:\WINDOWS\system32\userinit.exe"
 
 
 def test_stage_a_pilot_orchestrator_gate0_od_v2_20_and_power_calibration(tmp_path):

@@ -38,10 +38,15 @@ from src.utils.repro import utc_now_iso, write_json
 from src.v2 import refgraph as RG
 
 
-EXTRACTOR_VERSION = "2.1.0"
-GOLDEN_BASE_IMAGE_SHA256 = "feddb54d208174d3d1eda45e69ac831965a8572ead71f276ddf229a0ac3d0674"
+EXTRACTOR_VERSION = "2.2.0"
+PRE_BAKE_BASE_IMAGE_SHA256 = "feddb54d208174d3d1eda45e69ac831965a8572ead71f276ddf229a0ac3d0674"
+GOLDEN_BASE_IMAGE_SHA256 = "d2facced4255e3ae1cb821249d5e6330e380f639cee8a5aae19ef99be690835c"
+ALLOWED_BASE_IMAGE_SHA256S: frozenset[str] = frozenset({
+    PRE_BAKE_BASE_IMAGE_SHA256,
+    GOLDEN_BASE_IMAGE_SHA256,
+})
 MIB = 1 << 20
-MAX_PE_SIGNIFY_BYTES = 64 * MIB  # safety bound when decompressing / reading PEs for Authenticode hash
+MAX_PE_SIGNIFY_BYTES = 128 * MIB  # safety bound when decompressing / reading PEs for Authenticode hash
 
 _SIP_EXTS: frozenset[str] = frozenset({
     ".exe", ".dll", ".sys", ".ocx", ".cpl", ".scr", ".msi", ".cab", ".cat",
@@ -214,7 +219,12 @@ def load_base_image_cache(
 
     actual_sha = str(data.get("base_image_sha256") or "").lower().strip()
     exp_sha = str(expected_base_sha256 or "").lower().strip()
-    if exp_sha and actual_sha != exp_sha:
+    if exp_sha == "auto":
+        if actual_sha not in ALLOWED_BASE_IMAGE_SHA256S:
+            raise ValueError(
+                f"Base-image cache SHA-256 mismatch: cache bound to {actual_sha!r}, not in {sorted(ALLOWED_BASE_IMAGE_SHA256S)}"
+            )
+    elif exp_sha and actual_sha != exp_sha:
         raise ValueError(
             f"Base-image cache SHA-256 mismatch: cache bound to {actual_sha!r}, expected {exp_sha!r}"
         )
@@ -262,35 +272,66 @@ def expand_win_env(raw: str | None, env_map: Mapping[str, str] | None = None) ->
     return s
 
 
+_TARGET_EXT_EXTRACT_RE = re.compile(
+    r"^(.+?\.(?:exe|dll|ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|hta|sys|scr|msi|lnk|com|msc|cpl))(?=\s|,|$)",
+    re.I,
+)
+_LOCKED_LIVE_HIVE_NAMES: frozenset[str] = frozenset({
+    "ntuser.dat",
+    "ntuser.dat.log",
+    "ntuser.dat.log1",
+    "ntuser.dat.log2",
+    "usrclass.dat",
+    "usrclass.dat.log",
+    "usrclass.dat.log1",
+    "usrclass.dat.log2",
+})
+
+
+def _is_locked_live_hive_file(path_str: str | None) -> bool:
+    if not path_str:
+        return False
+    bname = F.path_basename(str(path_str).replace("/", "\\").lower())
+    return bname in _LOCKED_LIVE_HIVE_NAMES
+
+
 def expand_target_like_v1(raw: str | None, c_exists_fn: Any = None, env_map: Mapping[str, str] | None = None) -> str | None:
-    """Replicate v1 Collect-Artifacts.ps1 Expand-NormPath / Extract-TargetPath semantics."""
+    """Replicate v1 Collect-Artifacts.ps1 Extract-TargetPath + Expand-NormPath semantics."""
     if not raw or not str(raw).strip():
         return None
-    s = expand_win_env(str(raw).strip().strip('"').strip(), env_map=env_map).replace("/", "\\")
-    if s.startswith(("\\??\\", "\\\\?\\")):
-        s = s[4:]
-    if s.lower().startswith("\\systemroot\\"):
-        s = r"C:\WINDOWS\\" + s[len("\\systemroot\\") :]
-    elif s.lower().startswith("systemroot\\"):
-        s = r"C:\WINDOWS\\" + s[len("systemroot\\") :]
-    elif s.lower().startswith("system32\\"):
-        s = r"C:\WINDOWS\\" + s
-    elif s.lower().startswith("syswow64\\"):
-        s = r"C:\WINDOWS\\" + s
-    while "\\\\" in s:
-        s = s.replace("\\\\", "\\")
-    if not s:
+    s = str(raw).strip()
+    if s.startswith('"'):
+        end_q = s.find('"', 1)
+        candidate = s[1:end_q] if end_q > 1 else s[1:]
+    else:
+        m = _TARGET_EXT_EXTRACT_RE.match(s)
+        if m:
+            candidate = m.group(1)
+        else:
+            candidate = s.split()[0]
+
+    norm = expand_win_env(candidate.strip().strip('"').strip(), env_map=env_map).replace("/", "\\")
+    if norm.startswith(("\\??\\", "\\\\?\\")):
+        norm = norm[4:]
+    if norm.lower().startswith("\\systemroot\\"):
+        norm = r"C:\WINDOWS\\" + norm[len("\\systemroot\\") :]
+    elif norm.lower().startswith("systemroot\\"):
+        norm = r"C:\WINDOWS\\" + norm[len("systemroot\\") :]
+    elif norm.lower().startswith("system32\\"):
+        norm = r"C:\WINDOWS\\" + norm
+    elif norm.lower().startswith("syswow64\\"):
+        norm = r"C:\WINDOWS\\" + norm
+    while "\\\\" in norm:
+        norm = norm.replace("\\\\", "\\")
+    norm = norm.strip().rstrip(",")
+    if not norm:
         return None
-    # Strip trailing arguments if an unquoted executable/DLL path is followed by switches
-    m_ext = re.match(r"^([A-Za-z]:\\[^\"<>|?*]+?\.(?:exe|dll|sys|ocx|cpl|scr|msi|ps1|bat|cmd|vbs|js|msc))(?:\s+.*)?$", s, re.I)
-    if m_ext:
-        s = m_ext.group(1)
-    if "\\" not in s and re.search(r"\.(exe|dll|com|msc|cpl)$", s, re.I) and c_exists_fn is not None:
+    if "\\" not in norm and re.search(r"\.(exe|dll|com|msc|cpl)$", norm, re.I) and c_exists_fn is not None:
         for base_dir in (r"C:\Windows\System32", r"C:\Windows\System32\WindowsPowerShell\v1.0"):
-            cand = f"{base_dir}\\{s}"
+            cand = f"{base_dir}\\{norm}"
             if c_exists_fn(cand):
                 return cand
-    return s
+    return norm
 
 
 def decompress_wof_stream(raw_wof: bytes, uncomp_size: int, algo: int) -> bytes:
@@ -508,16 +549,20 @@ def _parse_task_xml(xml_text: str | bytes) -> dict[str, Any]:
         "EventTrigger": "MSFT_TaskEventTrigger",
         "IdleTrigger": "MSFT_TaskIdleTrigger",
         "SessionStateChangeTrigger": "MSFT_TaskSessionStateChangeTrigger",
+        "WnfStateChangeTrigger": "MSFT_TaskTrigger",
     }
     trigs: list[str] = []
     cmd_parts: list[str] = []
 
     for el in root.iter():
         tname = strip_ns(el.tag)
-        if tname in trig_map:
-            mapped = trig_map[tname]
-            if mapped not in trigs:
-                trigs.append(mapped)
+        if tname == "Triggers":
+            for t_child in el:
+                ctag = strip_ns(t_child.tag)
+                if ctag in trig_map:
+                    trigs.append(trig_map[ctag])
+                elif ctag.endswith("Trigger"):
+                    trigs.append("MSFT_TaskTrigger")
         elif tname == "Exec":
             cmd = ""
             args = ""
@@ -545,10 +590,12 @@ def _parse_task_xml(xml_text: str | bytes) -> dict[str, Any]:
             for ch in el:
                 if strip_ns(ch.tag) == "ClassId" and ch.text:
                     m = _COM_GUID_RE.search(ch.text)
-                    guid = m.group(1).lower() if m else ch.text.strip().lower()
-                    if guid not in out["com_handlers"]:
-                        out["com_handlers"].append(guid)
-                    cmd_parts.append(f"COM:{guid}")
+                    raw_guid = m.group(1) if m else ch.text.strip()
+                    low_guid = raw_guid.lower()
+                    if low_guid not in out["com_handlers"]:
+                        out["com_handlers"].append(low_guid)
+                    # Preserve original/uppercase brace GUID matching Get-ScheduledTask CimClass/ClassId
+                    cmd_parts.append(f"COM:{raw_guid}")
 
     out["triggers"] = trigs
     out["command_line"] = " ; ".join(cmd_parts).strip() or None
@@ -647,7 +694,8 @@ def decode_taskcache_actions_blob(blob: bytes | bytearray | None) -> dict[str, A
         elif is_com:
             if pos + 16 > len(b):
                 break
-            guid = "{" + str(uuid.UUID(bytes_le=b[pos : pos + 16])).lower() + "}"
+            guid = "{" + str(uuid.UUID(bytes_le=b[pos : pos + 16])).upper() + "}"
+            low_guid = guid.lower()
             pos += 16
             data_str = ""
             if pos + 4 <= len(b):
@@ -656,8 +704,8 @@ def decode_taskcache_actions_blob(blob: bytes | bytearray | None) -> dict[str, A
                     pos += 4
                     data_str = b[pos : pos + d_len].decode("utf-16-le", errors="ignore").rstrip("\x00").strip()
                     pos += d_len
-            if guid not in out["com_handlers"]:
-                out["com_handlers"].append(guid)
+            if low_guid not in out["com_handlers"]:
+                out["com_handlers"].append(low_guid)
             cmd_parts.append(f"COM:{guid} {data_str}".strip() if data_str else f"COM:{guid}")
         else:
             break
@@ -774,6 +822,134 @@ def _mft_record_metadata(rec: Any, canonical_path: str) -> dict[str, Any]:
     }
 
 
+def _read_qcow2_backing_file_header(qcow2_path: Path) -> str | None:
+    """Return the raw backing-file string embedded in a QCOW2 header, or None if absent/not QCOW2."""
+    from dissect.hypervisor.disk import qcow2 as dq  # type: ignore
+
+    with qcow2_path.open("rb") as fh:
+        if fh.read(4) != dq.QCOW2_MAGIC_BYTES:
+            return None
+        fh.seek(0)
+        hdr = dq.c_qcow2.QCowHeader(fh)
+        if not hdr.backing_file_offset or not hdr.backing_file_size:
+            return None
+        fh.seek(hdr.backing_file_offset)
+        return fh.read(hdr.backing_file_size).decode("utf-8", errors="replace")
+
+
+def _open_qcow2_stream_readonly(image_path: Path, _seen: set[Path] | None = None) -> Any:
+    """Recursively open a QCOW2 (or raw) image stream read-only without `Path.with_name()` crashes on `/` paths."""
+    from dissect.hypervisor.disk import qcow2 as dq  # type: ignore
+
+    resolved = image_path.resolve()
+    seen = set() if _seen is None else set(_seen)
+    if resolved in seen:
+        raise ValueError(f"Cycle detected in QCOW2 backing chain at {resolved}")
+    seen.add(resolved)
+
+    raw_backing = _read_qcow2_backing_file_header(resolved)
+    backing_stream = None
+    if raw_backing:
+        bpath = Path(raw_backing)
+        resolved_backing = bpath.resolve() if bpath.is_absolute() else (resolved.parent / bpath).resolve()
+        if not resolved_backing.exists():
+            raise FileNotFoundError(
+                f"QCOW2 backing file not found: {resolved_backing} (referenced by {resolved})"
+            )
+        backing_stream = _open_qcow2_stream_readonly(resolved_backing, _seen=seen)
+
+    with resolved.open("rb") as fh:
+        is_qcow2 = fh.read(4) == dq.QCOW2_MAGIC_BYTES
+    if is_qcow2:
+        return dq.QCow2(resolved, backing_file=backing_stream).open()
+    return resolved.open("rb")
+
+
+def _exception_chain_has_invalid_name(exc: BaseException) -> bool:
+    cur: BaseException | None = exc
+    visited: set[int] = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        if isinstance(cur, ValueError) and "invalid name" in str(cur).lower():
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def open_qcow2_target_readonly(qcow2_path: str | Path, *, apply: bool = True) -> Any:
+    """Open a closed QCOW2 (or raw) Target read-only, resolving absolute or slash-containing backing paths."""
+    from dissect.target import Target  # type: ignore
+    from dissect.target.containers.qcow2 import QCow2Container  # type: ignore
+
+    qpath = Path(qcow2_path)
+    try:
+        return Target.open(str(qpath), apply=apply)
+    except Exception as exc:
+        raw_backing = _read_qcow2_backing_file_header(qpath) if qpath.exists() and qpath.is_file() else None
+        has_slash_backing = bool(raw_backing and ("/" in raw_backing or "\\" in raw_backing))
+        if not (_exception_chain_has_invalid_name(exc) or has_slash_backing):
+            raise
+        if not raw_backing:
+            raise
+        bpath = Path(raw_backing)
+        resolved_backing = bpath.resolve() if bpath.is_absolute() else (qpath.resolve().parent / bpath).resolve()
+        if not resolved_backing.exists():
+            raise FileNotFoundError(
+                f"QCOW2 backing file not found: {resolved_backing} (referenced by {qpath})"
+            ) from exc
+        backing_stream = _open_qcow2_stream_readonly(resolved_backing)
+        container = QCow2Container(qpath, backing_file=backing_stream)
+        target = Target(qpath)
+        target.disks.add(container)
+        if apply:
+            target.apply()
+        return target
+
+
+def close_target_safely(target: Any) -> None:
+    """Safely close `Target` disks, backing streams, and underlying handles."""
+    if target is None:
+        return
+    try:
+        if hasattr(target, "target") and target.target is not None:  # type: ignore[attr-defined]
+            target.target.close()
+    except Exception:
+        pass
+    disks = getattr(target, "disks", None)
+    if disks is None:
+        return
+    for disk in list(disks):
+        for attr in ("close",):
+            try:
+                fn = getattr(disk, attr, None)
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
+        qc_obj = getattr(disk, "qcow2", None)
+        cur = qc_obj
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            for h_attr in ("fh", "data_file"):
+                h = getattr(cur, h_attr, None)
+                try:
+                    if h is not None and hasattr(h, "close"):
+                        h.close()
+                except Exception:
+                    pass
+            nxt = getattr(cur, "backing_file", None)
+            if nxt is None:
+                break
+            nxt_qcow2 = getattr(nxt, "qcow2", None)
+            try:
+                if hasattr(nxt, "close"):
+                    nxt.close()
+            except Exception:
+                pass
+            cur = nxt_qcow2
+
+
 def extract_from_qcow2(
     qcow2_path: str | Path,
     run_id: str = "offline_qcow2",
@@ -784,7 +960,6 @@ def extract_from_qcow2(
     expected_base_sha256: str = GOLDEN_BASE_IMAGE_SHA256,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Parse a closed QCOW2 disk image strictly in user space (zero mounts)."""
-    from dissect.target import Target  # type: ignore
     from dissect.target.plugins.os.windows import prefetch as dpf  # type: ignore
 
     qcow2_path = Path(qcow2_path)
@@ -800,7 +975,7 @@ def extract_from_qcow2(
         loaded_cache = load_base_image_cache(base_cache_path, expected_base_sha256=expected_base_sha256)
         cached_file_entries = dict(loaded_cache.get("file_entries") or {})
 
-    t = Target.open(str(qcow2_path))
+    t = open_qcow2_target_readonly(qcow2_path)
     try:
         c_fs = t.fs.mounts.get("c:")
         ntfs = getattr(c_fs, "ntfs", None) if c_fs is not None else None
@@ -906,8 +1081,14 @@ def extract_from_qcow2(
                 fast_sz,
                 mft_meta.get("mtime_ns"),
             )
-            if ckey is not None and ckey in cached_file_entries:
-                c_hit = cached_file_entries[ckey]
+            c_hit_raw = cached_file_entries.get(ckey) if ckey is not None else None
+            stale_large_pe_hit = bool(
+                c_hit_raw is not None
+                and fast_sz > 64 * MIB
+                and str(c_hit_raw.get("signature_status") or "") == "NotSigned"
+            )
+            if c_hit_raw is not None and not stale_large_pe_hit:
+                c_hit = c_hit_raw
                 base_cache_hits += 1
                 info = {
                     **mft_meta,
@@ -934,13 +1115,19 @@ def extract_from_qcow2(
                 "signature_status": sig,
                 "wof_compressed": wof_flag,
             }
+            if _is_locked_live_hive_file(norm):
+                # OD-V2-02 Step F0 ruling (b): align locked active hive files with v1 Win32 lock missingness
+                info["file_head_histogram"] = None
+                info["file_sha256"] = None
+                info["signature_status"] = "UnknownError"
+                info["attributes"] = None
             if ckey is not None:
                 new_cache_file_entries[ckey] = {
                     "path": norm,
                     "file_size": int(full_sz),
-                    "file_head_histogram": hist,
-                    "file_sha256": sha,
-                    "signature_status": sig,
+                    "file_head_histogram": info["file_head_histogram"],
+                    "file_sha256": info["file_sha256"],
+                    "signature_status": info["signature_status"],
                     "wof_compressed": wof_flag,
                 }
             file_meta_cache[low] = info
@@ -960,16 +1147,18 @@ def extract_from_qcow2(
             task_triggers: str | None = None,
             fmeta: Mapping[str, Any] | None = None,
             extra: Mapping[str, Any] | None = None,
+            allow_fmeta_path_fallback: bool = True,
         ) -> dict[str, Any]:
-            eff_path = path or (fmeta.get("path") if fmeta else None)
+            clean_name = name.replace("/", "\\").rsplit("\\", 1)[-1] if artifact_type.lower() == "task" else name
+            eff_path = path if (path is not None or not allow_fmeta_path_fallback) else (fmeta.get("path") if fmeta else None)
             if eff_path and str(eff_path).lower().startswith("c:\\"):
                 referenced_target_paths.add(str(eff_path))
-            akey = f"{artifact_type.lower()}|{RG._str(path_or_key).replace('/', '\\').lower()}|{RG._str(name).replace('/', '\\').lower()}"
+            akey = f"{artifact_type.lower()}|{RG._str(path_or_key).replace('/', '\\').lower()}|{RG._str(clean_name).replace('/', '\\').lower()}"
             rec: dict[str, Any] = {
                 "run_id": run_id,
                 "artifact_type": artifact_type,
                 "artifact_key": akey,
-                "name": name,
+                "name": clean_name,
                 "path": eff_path,
                 "command_line": command_line,
                 "registry_key": registry_key,
@@ -1277,8 +1466,12 @@ def extract_from_qcow2(
             target = expand_target_like_v1(parsed["first_exec"], c_exists_fn=c_path_exists, env_map=user_env_map)
             com_clsid = parsed["com_handlers"][0] if parsed["com_handlers"] else None
             com_target = clsid_resolved_target.get(com_clsid.lower()) if com_clsid else None
-            eff_target = target or com_target
-            fmeta = inspect_target_file(eff_target) if eff_target else None
+            # Keep v2_refgraph COM target strictly in extra + referenced_target_paths;
+            # keep full_20 path/fmeta identical to v1 Collect-Artifacts.ps1 (None for COM-only tasks).
+            if com_target:
+                referenced_target_paths.add(com_target)
+                inspect_target_file(com_target)
+            fmeta = inspect_target_file(target) if target else None
 
             tc_meta = []
             if tc_entry is not None:
@@ -1294,11 +1487,12 @@ def extract_from_qcow2(
                 artifact_type="task",
                 path_or_key=tdir,
                 name=tname,
-                path=eff_target,
+                path=target,
                 command_line=parsed["command_line"],
                 task_name=rel_uri,
                 task_triggers=",".join(parsed["triggers"]) if parsed["triggers"] else None,
                 fmeta=fmeta,
+                allow_fmeta_path_fallback=False,
                 extra={
                     "task_xml_exists": xml_exists,
                     "task_xml_path": rel_uri if xml_exists else None,
@@ -1380,7 +1574,7 @@ def extract_from_qcow2(
                     },
                 ))
 
-        # UAC bypass, IFEO, Winlogon
+        # UAC bypass, IFEO, Winlogon, Defender Policies & Exclusions
         for sid in user_sids:
             for uac_sub in (r"Software\Classes\ms-settings\shell\open\command", r"Software\Classes\mscfile\shell\open\command"):
                 kobj = reg_key_safe(rf"HKU\{sid}\{uac_sub}")
@@ -1429,6 +1623,25 @@ def extract_from_qcow2(
                         path=target, command_line=val_exp, registry_key=dk, registry_value=val_exp, fmeta=fmeta,
                         extra={"reg_hive": "HKLM", "reg_wow64_view": "64bit", "reg_value_raw": val_raw, "reg_value_expanded": val_exp},
                     ))
+
+        for def_sub in (
+            r"SOFTWARE\Policies\Microsoft\Windows Defender",
+            r"SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection",
+            r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths",
+        ):
+            def_k = reg_key_safe(rf"HKLM\{def_sub}")
+            if def_k is None:
+                continue
+            dk = rf"HKLM\{def_sub}"
+            for v in def_k.values():
+                vname = "(Default)" if not v.name else str(v.name)
+                vstr = str(v.value if v.value is not None else "")
+                records.append(build_record(
+                    artifact_type="registry", path_or_key=dk, name=vname,
+                    path=None, command_line=None, registry_key=dk, registry_value=vstr,
+                    allow_fmeta_path_fallback=False,
+                    extra={"reg_hive": "HKLM", "reg_wow64_view": "64bit", "reg_value_raw": vstr, "reg_value_expanded": vstr},
+                ))
 
         for c_rec in pending_clsid_records:
             fmeta = inspect_target_file(c_rec["s_exp"])
@@ -1817,10 +2030,7 @@ def extract_from_qcow2(
         })
         return records, summary
     finally:
-        try:
-            t.target.close() if hasattr(t, "target") else None  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        close_target_safely(t)
 
 
 def extract_from_fixture(

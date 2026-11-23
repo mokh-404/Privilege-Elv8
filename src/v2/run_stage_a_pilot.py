@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -38,6 +39,24 @@ from src.v2.offline_extractor import summarize_extraction_and_refgraph
 from src.v2.pilot_staging import StageRunSpec, validate_stage_run_spec
 from src.v2.stats_v2 import compute_lofo_table, cross_stratum_execution_delta
 from src.v2.training import run_nested_family_cv
+
+
+def build_create_overlay_command(base_qcow2: str | Path, overlay_qcow2: str | Path) -> list[str]:
+    """Return a `qemu-img create` command using a relative `-b` backing filename so dissect resolves it cleanly."""
+    base_resolved = Path(base_qcow2).resolve()
+    overlay_dir = Path(overlay_qcow2).resolve().parent
+    rel_backing = os.path.relpath(base_resolved, overlay_dir)
+    return [
+        "qemu-img",
+        "create",
+        "-f",
+        "qcow2",
+        "-F",
+        "qcow2",
+        "-b",
+        rel_backing,
+        str(overlay_qcow2),
+    ]
 
 
 def compute_od_v2_20_pilot_gate(df: pd.DataFrame, threshold_pct: float = 50.0) -> dict[str, Any]:

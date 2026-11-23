@@ -486,6 +486,8 @@ def build_disk_graph(disk_df: pd.DataFrame, disk_id: str = "disk_0") -> DiskGrap
                     com_guid = cm.group(1).lower()
             if com_guid:
                 com_dll = resolve_clsid_path(com_guid, prefer_wow64=bool(row.get("prefer_wow64", False)))
+                if not com_dll and row.get("task_com_target_path"):
+                    com_dll, _ = normalize_windows_path(row.get("task_com_target_path"), short_to_long=short_to_long)
                 clsid_nid = f"clsid|{com_guid}"
                 ensure_node(clsid_nid, "COM_CLSID", is_context=False)
                 link_unsplit(akey, clsid_nid, "INVOKES_COM", com_guid)

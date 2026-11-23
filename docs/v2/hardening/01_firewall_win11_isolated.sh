@@ -24,8 +24,13 @@ EOF
 MODE="${1:---apply}"
 case "$MODE" in
     --status)
-        echo "=== iptables -S | grep -E 'virbr1|V2-VIRBR1' ==="
-        iptables -S | grep -E "virbr1|V2-VIRBR1" || true
+        echo "=== iptables -S INPUT (head) / FORWARD (head) & virbr1|V2_VIRBR1 ==="
+        iptables -S INPUT 2>/dev/null | head -n 10 || true
+        iptables -S FORWARD 2>/dev/null | head -n 10 || true
+        iptables -S | grep -E "virbr1|V2_VIRBR1" || true
+        for uch in ufw-user-input ufw-user-output ufw-user-forward; do
+            iptables -S "$uch" 2>/dev/null | grep -E "virbr1" || true
+        done
         exit 0
         ;;
     --nft-print)
@@ -78,12 +83,40 @@ for pair in \
     done
 done
 
+echo "[*] Removing UFW ufw-user-* ACCEPT rules referencing $BRIDGE if present..."
+for uch in ufw-user-input ufw-user-output ufw-user-forward; do
+    if iptables -L "$uch" -n >/dev/null 2>&1; then
+        for dir_flag in "-i" "-o"; do
+            while iptables -C "$uch" "$dir_flag" "$BRIDGE" -j ACCEPT 2>/dev/null; do
+                iptables -D "$uch" "$dir_flag" "$BRIDGE" -j ACCEPT
+            done
+        done
+        while read -r rule_spec; do
+            [[ -z "$rule_spec" ]] && continue
+            # shellcheck disable=SC2086
+            iptables -D $rule_spec 2>/dev/null || true
+        done < <(
+            iptables -S "$uch" 2>/dev/null \
+                | grep -E "(^|[[:space:]])(-i|-o)[[:space:]]+${BRIDGE}([[:space:]]|$)" \
+                | grep -E -- "-j[[:space:]]+ACCEPT([[:space:]]|$)" \
+                | sed 's/^-A //' \
+                || true
+        )
+    fi
+done
+
 echo "[*] Flushing any previous V2_VIRBR1_IN / V2_VIRBR1_FWD chains..."
 for ch in V2_VIRBR1_IN V2_VIRBR1_FWD; do
+    while iptables -C INPUT -i "$BRIDGE" -j "$ch" 2>/dev/null; do
+        iptables -D INPUT -i "$BRIDGE" -j "$ch"
+    done
+    while iptables -C FORWARD -i "$BRIDGE" -j "$ch" 2>/dev/null; do
+        iptables -D FORWARD -i "$BRIDGE" -j "$ch"
+    done
+    while iptables -C FORWARD -o "$BRIDGE" -j "$ch" 2>/dev/null; do
+        iptables -D FORWARD -o "$BRIDGE" -j "$ch"
+    done
     if iptables -L "$ch" -n >/dev/null 2>&1; then
-        iptables -D INPUT -i "$BRIDGE" -j "$ch" 2>/dev/null || true
-        iptables -D FORWARD -i "$BRIDGE" -j "$ch" 2>/dev/null || true
-        iptables -D FORWARD -o "$BRIDGE" -j "$ch" 2>/dev/null || true
         iptables -F "$ch"
         iptables -X "$ch"
     fi

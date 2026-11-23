@@ -78,3 +78,12 @@ def test_all_hardening_shell_scripts_pass_bash_n():
     for sc in scripts:
         cp = subprocess.run(["bash", "-n", str(sc)], capture_output=True, text=True)
         assert cp.returncode == 0, f"bash -n failed for {sc.name}: {cp.stderr}"
+
+
+def test_firewall_script_cleans_ufw_user_chains_and_inserts_at_position_1():
+    fw_txt = (HARDENING_DIR / "01_firewall_win11_isolated.sh").read_text(encoding="utf-8")
+    for uch in ("ufw-user-input", "ufw-user-output", "ufw-user-forward"):
+        assert uch in fw_txt
+    assert 'iptables -I INPUT 1 -i "$BRIDGE" -j V2_VIRBR1_IN' in fw_txt
+    assert 'iptables -I FORWARD 1 -i "$BRIDGE" -j V2_VIRBR1_FWD' in fw_txt
+    assert 'iptables -I FORWARD 2 -o "$BRIDGE" -j V2_VIRBR1_FWD' in fw_txt

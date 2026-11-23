@@ -53,7 +53,15 @@ prepare_overlay() {
         echo "Removing stale overlay before fresh CoW creation: $overlay"
         sudo rm -f "$overlay"
     fi
-    sudo qemu-img create -f qcow2 -F qcow2 -b "$base" "$overlay"
+    local base_dir overlay_dir rel_base
+    base_dir="$(cd "$(dirname "$base")" && pwd)"
+    overlay_dir="$(cd "$(dirname "$overlay")" && pwd)"
+    if [[ "$base_dir" == "$overlay_dir" ]]; then
+        rel_base="$(basename "$base")"
+    else
+        rel_base="$(realpath --relative-to="$overlay_dir" "$base")"
+    fi
+    sudo qemu-img create -f qcow2 -F qcow2 -b "$rel_base" "$overlay"
     sudo chown 956:956 "$overlay"
     sudo chmod 0660 "$overlay"
 
@@ -63,44 +71,47 @@ prepare_overlay() {
         sudo chmod 0600 "$VARS_LIVE"
     fi
     ls -la "$overlay" "$VARS_LIVE"
-    echo "OVERLAY_READY: $overlay (backed by $base)"
+    echo "OVERLAY_READY: $overlay (relative backing: $rel_base -> $base)"
 }
 
 verify_image_readonly() {
     local img="${1:-$BASE_IMG}"
-    "${PYTHON_BIN}" - "$img" <<'PY'
+    PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" - "$img" <<'PY'
 import sys
-from dissect.target import Target
+from src.v2.offline_extractor import close_target_safely, open_qcow2_target_readonly
 
 img_path = sys.argv[1]
-t = Target.open(img_path)
-svc_root = t.registry.key(r"HKLM\SYSTEM\ControlSet001\Services")
-svcs = {sk.name.lower(): {v.name: v.value for v in sk.values()} for sk in svc_root.subkeys()}
+t = open_qcow2_target_readonly(img_path)
+try:
+    svc_root = t.registry.key(r"HKLM\SYSTEM\ControlSet001\Services")
+    svcs = {sk.name.lower(): {v.name: v.value for v in sk.values()} for sk in svc_root.subkeys()}
 
-has_sysmon_svc = ("sysmon64" in svcs) or ("sysmon" in svcs)
-has_sysmon_drv = "sysmondrv" in svcs
-sshd_start = svcs.get("sshd", {}).get("Start")
+    has_sysmon_svc = ("sysmon64" in svcs) or ("sysmon" in svcs)
+    has_sysmon_drv = "sysmondrv" in svcs
+    sshd_start = svcs.get("sshd", {}).get("Start")
 
-has_evtx = t.fs.path(r"c:\Windows\System32\winevt\Logs\Microsoft-Windows-Sysmon%4Operational.evtx").exists()
-has_bootstrap_ps1 = t.fs.path(r"c:\DFIR-Bootstrap\Invoke-StagePayload.ps1").exists()
-has_task_xml = t.fs.path(r"c:\Windows\System32\Tasks\DFIR-StageRunner").exists()
+    has_evtx = t.fs.path(r"c:\Windows\System32\winevt\Logs\Microsoft-Windows-Sysmon%4Operational.evtx").exists()
+    has_bootstrap_ps1 = t.fs.path(r"c:\DFIR-Bootstrap\Invoke-StagePayload.ps1").exists()
+    has_task_xml = t.fs.path(r"c:\Windows\System32\Tasks\DFIR-StageRunner").exists()
 
-tc_tree = t.registry.key(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree")
-has_task_tree = "dfir-stagerunner" in [sk.name.lower() for sk in tc_tree.subkeys()]
+    tc_tree = t.registry.key(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree")
+    has_task_tree = "dfir-stagerunner" in [sk.name.lower() for sk in tc_tree.subkeys()]
 
-print(f"IMAGE: {img_path}")
-print(f"  Sysmon service present     : {has_sysmon_svc}")
-print(f"  SysmonDrv driver present   : {has_sysmon_drv}")
-print(f"  Sysmon EVTX log present    : {has_evtx}")
-print(f"  Invoke-StagePayload.ps1    : {has_bootstrap_ps1}")
-print(f"  \\DFIR-StageRunner task     : {has_task_xml and has_task_tree} (xml={has_task_xml}, tree={has_task_tree})")
-print(f"  sshd Start mode (4=Disabled): {sshd_start}")
+    print(f"IMAGE: {img_path}")
+    print(f"  Sysmon service present     : {has_sysmon_svc}")
+    print(f"  SysmonDrv driver present   : {has_sysmon_drv}")
+    print(f"  Sysmon EVTX log present    : {has_evtx}")
+    print(f"  Invoke-StagePayload.ps1    : {has_bootstrap_ps1}")
+    print(f"  \\DFIR-StageRunner task     : {has_task_xml and has_task_tree} (xml={has_task_xml}, tree={has_task_tree})")
+    print(f"  sshd Start mode (4=Disabled): {sshd_start}")
 
-ok = has_sysmon_svc and has_sysmon_drv and has_evtx and has_bootstrap_ps1 and has_task_xml and has_task_tree and (sshd_start in (4, None))
-if not ok:
-    print("V2_BASE_BAKE_VERIFY: FAIL (base image/overlay has not been baked with Sysmon + \\DFIR-StageRunner + sshd=Disabled yet)")
-    sys.exit(1)
-print("V2_BASE_BAKE_VERIFY: PASS")
+    ok = has_sysmon_svc and has_sysmon_drv and has_evtx and has_bootstrap_ps1 and has_task_xml and has_task_tree and (sshd_start in (4, None))
+    if not ok:
+        print("V2_BASE_BAKE_VERIFY: FAIL (base image/overlay has not been baked with Sysmon + \\DFIR-StageRunner + sshd=Disabled yet)")
+        sys.exit(1)
+    print("V2_BASE_BAKE_VERIFY: PASS")
+finally:
+    close_target_safely(t)
 PY
 }
 
@@ -111,20 +122,22 @@ build_bake_iso() {
         echo "ERROR: Sysmon64.exe not found at: $sysmon_bin" >&2
         exit 1
     fi
-    "${PYTHON_BIN}" - "$sysmon_bin" "$out_iso" "${REPO_ROOT}/docs/v2/hardening/Install-V2BaseBootstrap.ps1" <<'PY'
+    PYTHONPATH="${REPO_ROOT}" "${PYTHON_BIN}" - "$sysmon_bin" "$out_iso" "${REPO_ROOT}/docs/v2/hardening/Install-V2BaseBootstrap.ps1" <<'PY'
 import sys
 from pathlib import Path
-from src.v2.pilot_staging import _build_minimal_iso9660
+from src.v2.pilot_staging import build_stage_iso
 
 sysmon_p = Path(sys.argv[1])
 out_p = Path(sys.argv[2])
 ps1_p = Path(sys.argv[3])
 
 files = {
+    "Sysmon64.exe": sysmon_p.read_bytes(),
+    "Install-V2BaseBootstrap.ps1": ps1_p.read_bytes(),
     "SYSMON64.EXE": sysmon_p.read_bytes(),
     "INSTALL.PS1": ps1_p.read_bytes(),
 }
-out_p.write_bytes(_build_minimal_iso9660("DFIR_BAKE", files))
+build_stage_iso(out_p, "DFIR_BAKE", files)
 print(f"Built read-only DFIR_BAKE maintenance ISO: {out_p} ({out_p.stat().st_size} bytes)")
 PY
 }

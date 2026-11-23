@@ -10,14 +10,25 @@ import argparse
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from src import config
 from src.data import features as F
-from src.v2.offline_extractor import extract_from_qcow2, is_v2_harness_footprint_record, write_outputs
+from src.v2.offline_extractor import (
+    close_target_safely,
+    extract_from_qcow2,
+    is_v2_harness_footprint_record,
+    open_qcow2_target_readonly,
+    write_outputs,
+)
 from src.v2.pilot_staging import build_clean_parity_stage_iso
 
 EXACT_MATCH_FEATURES: tuple[str, ...] = (
@@ -66,10 +77,8 @@ def extract_v1_live_json_from_qcow2(
     out_json_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Read `C:\\collector_out_parity\\artifacts.json` directly from a closed QCOW2 overlay in user space (zero SSH)."""
-    from dissect.target import Target  # type: ignore
-
     qpath = Path(qcow2_path)
-    t = Target.open(str(qpath))
+    t = open_qcow2_target_readonly(qpath)
     try:
         gp = t.fs.path(guest_json_path)
         if not gp.exists():
@@ -79,10 +88,7 @@ def extract_v1_live_json_from_qcow2(
             )
         raw_bytes = gp.open("rb").read()
     finally:
-        try:
-            t.target.close() if hasattr(t, "target") else None  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        close_target_safely(t)
 
     if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
         txt = raw_bytes.decode("utf-16")
@@ -102,26 +108,49 @@ def extract_v1_live_json_from_qcow2(
     raise ValueError(f"Unexpected JSON structure in guest file {guest_json_path!r}")
 
 
+def _norm_compare_key(raw_key: object) -> str:
+    return str(raw_key or "").replace("/", "\\").replace("::", "|").lower().strip()
+
+
 def compare_v1_v2_feature_parity(
     v1_records: Sequence[Mapping[str, Any]],
     v2_records: Sequence[Mapping[str, Any]],
     scratch_prefix: str = r"c:\collector_out_parity",
+    exclude_post_bake_drift: bool = False,
 ) -> dict[str, Any]:
     """Compare matched cold-disk records across all 20 `full_20` features and evaluate §4 acceptance gates."""
+    def _skip_post_bake(rec: Mapping[str, Any]) -> bool:
+        if not exclude_post_bake_drift:
+            return False
+        at = str(rec.get("artifact_type") or "").lower()
+        nm = str(rec.get("name") or "").lower()
+        # Exclude artifacts mutated deliberately by Step 0 base-image bake or across reboots (.pf, sshd=Disabled)
+        if at == "service" and nm == "sshd":
+            return True
+        if at == "prefetch":
+            return True
+        return False
+
     v1_cold = [
         dict(r)
         for r in v1_records
         if str(r.get("artifact_type") or "").lower() != "process"
         and not _is_parity_collector_scratch(r, scratch_prefix=scratch_prefix)
+        and not _skip_post_bake(r)
     ]
-    v2_list = [dict(r) for r in v2_records if not _is_parity_collector_scratch(r, scratch_prefix=scratch_prefix)]
+    v2_list = [
+        dict(r)
+        for r in v2_records
+        if not _is_parity_collector_scratch(r, scratch_prefix=scratch_prefix)
+        and not _skip_post_bake(r)
+    ]
 
     v2_process_rows = sum(1 for r in v2_list if str(r.get("artifact_type") or "").lower() == "process")
     v2_feats_all = [F.row_features(r) for r in v2_list]
     v2_parent_all_na = all(str(f.get("parent_process_class")) == "na" for f in v2_feats_all)
 
-    v1_by_key = {str(r.get("artifact_key") or "").replace("/", "\\").lower(): r for r in v1_cold if r.get("artifact_key")}
-    v2_by_key = {str(r.get("artifact_key") or "").replace("/", "\\").lower(): r for r in v2_list if r.get("artifact_key")}
+    v1_by_key = {_norm_compare_key(r.get("artifact_key")): r for r in v1_cold if r.get("artifact_key")}
+    v2_by_key = {_norm_compare_key(r.get("artifact_key")): r for r in v2_list if r.get("artifact_key")}
     shared_keys = sorted(set(v1_by_key.keys()) & set(v2_by_key.keys()))
     if not shared_keys:
         raise ValueError("No shared artifact_key records found between v1_records and v2_records")
@@ -259,6 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base-cache-path", type=Path, default=None, help="Optional base-image cache path when running v2 offline extractor on --extract-v1-json-from-qcow2")
     parser.add_argument("--v1-live-json", type=Path, default=Path("/tmp/parity_v1_live.json"))
     parser.add_argument("--v2-offline-jsonl", type=Path, default=Path("/tmp/parity_v2_offline/artifacts.jsonl"))
+    parser.add_argument("--exclude-post-bake-drift", action="store_true", help="Exclude sshd/prefetch when comparing pre-bake v1 snapshot against post-bake v2 base image")
     parser.add_argument("--out-md", type=Path, default=None)
     parser.add_argument("--out-json", type=Path, default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -287,7 +317,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         v1_recs = _load_records(args.v1_live_json)
         v2_recs = _load_records(args.v2_offline_jsonl)
 
-    rep = compare_v1_v2_feature_parity(v1_recs, v2_recs)
+    rep = compare_v1_v2_feature_parity(
+        v1_recs,
+        v2_recs,
+        exclude_post_bake_drift=bool(args.exclude_post_bake_drift),
+    )
     md = format_parity_markdown(rep)
     print(md)
     if args.out_md is not None:

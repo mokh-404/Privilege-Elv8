@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import shutil
 import struct
+import subprocess
 import uuid
 
 import pandas as pd
@@ -13,6 +16,7 @@ from src.v2.offline_extractor import (
     GOLDEN_BASE_IMAGE_SHA256,
     MIB,
     _parse_task_xml,
+    close_target_safely,
     compute_head_histogram,
     decode_taskcache_actions_blob,
     decompress_wof_stream,
@@ -20,6 +24,7 @@ from src.v2.offline_extractor import (
     load_base_image_cache,
     make_base_file_cache_key,
     normalize_volume_prefix,
+    open_qcow2_target_readonly,
     save_base_image_cache,
     validate_extracted_record,
     verify_offline_signature,
@@ -29,6 +34,7 @@ from src.v2.pilot_staging import (
     PilotStagingError,
     StageRunSpec,
     build_stage_bundle,
+    build_stage_iso,
     validate_stage_run_spec,
 )
 
@@ -76,6 +82,7 @@ def test_task_xml_parser_utf8_and_utf16le_exec_and_comhandler():
         assert "MSFT_TaskLogonTrigger" in parsed["triggers"]
         assert parsed["exec_actions"][0]["command_expanded"] == r"C:\ProgramData\App\run.exe"
         assert parsed["com_handlers"] == ["{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}"]
+        assert "COM:{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}" in parsed["command_line"]
 
 
 def test_decode_taskcache_actions_blob_exec_and_comhandler():
@@ -110,7 +117,7 @@ def test_decode_taskcache_actions_blob_exec_and_comhandler():
         )
         dec_com = decode_taskcache_actions_blob(blob_com)
         assert dec_com["com_handlers"] == ["{429bc048-379e-45e0-80e4-eb1977941b5c}"]
-        assert "COM:{429bc048-379e-45e0-80e4-eb1977941b5c}" in dec_com["command_line"]
+        assert "COM:{429BC048-379E-45E0-80E4-EB1977941B5C}" in dec_com["command_line"]
 
 
 def test_base_image_cache_save_load_and_sha256_binding(tmp_path):
@@ -235,3 +242,80 @@ def test_extract_from_fixture_outputs_and_refgraph_coverage(tmp_path):
     assert len(df_pq) == 3
     loaded_manifest = json.loads(paths["manifest"].read_text())
     assert loaded_manifest["total_records"] == 3
+
+
+def test_stage_iso_xorriso_preserves_long_filenames_and_fallback(tmp_path, monkeypatch):
+    ctrl_spec = StageRunSpec(
+        run_id="xorriso_long_names",
+        stratum="control",
+        benign_profile_id="dev_office_01",
+        dwell_seconds=60,
+    )
+    out = build_stage_bundle(ctrl_spec, tmp_path / "bundle")
+    iso_path = out["iso"]
+    iso_bytes = iso_path.read_bytes()
+
+    # Check Joliet Supplementary Volume Descriptor + UTF-16BE filenames + Volume Label
+    assert b"\x02CD001\x01" in iso_bytes
+    assert b"DFIR_STAGE" in iso_bytes
+    assert "run_manifest.json".encode("utf-16-be") in iso_bytes
+    assert "benign_workload.ps1".encode("utf-16-be") in iso_bytes
+
+    xorriso_bin = shutil.which("xorriso")
+    assert xorriso_bin is not None
+    cp = subprocess.run([xorriso_bin, "-indev", str(iso_path), "-ls", "/"], capture_output=True, text=True, check=True)
+    ls_out = cp.stdout
+    for expected in ("run_manifest.json", "benign_workload.ps1", "Invoke-StagePayload.ps1"):
+        assert expected in ls_out
+    assert "RUN_MANI.JSO" not in ls_out
+    assert "BENIGN_W.PS1" not in ls_out
+
+    # Pure-Python fallback still works if host ISO tools are unavailable
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    fb_iso = build_stage_iso(tmp_path / "fallback.iso", "DFIR_STAGE", {"run_manifest.json": b"{}"})
+    assert b"CD001" in fb_iso.read_bytes()
+
+
+def test_open_qcow2_target_readonly_handles_absolute_backing_path(tmp_path):
+    from dissect.target import Target  # type: ignore
+    from dissect.target.exceptions import TargetError  # type: ignore
+
+    qemu_img = shutil.which("qemu-img")
+    assert qemu_img is not None
+
+    base_dir = tmp_path / "base_store"
+    overlay_dir = tmp_path / "overlay_store"
+    base_dir.mkdir()
+    overlay_dir.mkdir()
+
+    raw_base = tmp_path / "raw_base.bin"
+    marker = b"V2_ABS_BACKING_MARKER_123456"
+    payload = bytearray(65536)
+    payload[4096 : 4096 + len(marker)] = marker
+    raw_base.write_bytes(payload)
+
+    base_qcow2 = base_dir / "win11_base.qcow2"
+    overlay_qcow2 = overlay_dir / "win11_overlay.qcow2"
+    subprocess.run(
+        [qemu_img, "convert", "-f", "raw", "-O", "qcow2", str(raw_base), str(base_qcow2)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base_qcow2.resolve()), str(overlay_qcow2)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises((TargetError, ValueError)):
+        Target.open(str(overlay_qcow2), apply=False)
+
+    tgt = open_qcow2_target_readonly(overlay_qcow2, apply=False)
+    try:
+        disk = tgt.disks[0]
+        disk.seek(4096)
+        assert disk.read(len(marker)) == marker
+    finally:
+        close_target_safely(tgt)
