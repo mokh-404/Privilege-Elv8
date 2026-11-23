@@ -22,6 +22,7 @@
 | [v2/NOVELTY_VERIFICATION.md](v2/NOVELTY_VERIFICATION.md) | Step E6 prior-art verification ledger from `v2/concept_a_gap_audit.md` (`[1]`–`[137]` cataloged with every row marked `UNVERIFIED` + 2026 anomaly flags) |
 | [v2/FEATURE_PARITY_AUDIT.md](v2/FEATURE_PARITY_AUDIT.md) | Step F0 live-v1 vs offline-v2 parity audit of all 20 locked `full_20` features, `OD-V2-02` `process`-row exclusion impact, and clean-image parity test procedure |
 | [v2/CLEAN_IMAGE_EXTRACTION_DRYRUN.md](v2/CLEAN_IMAGE_EXTRACTION_DRYRUN.md) | Step F safe read-only extraction dry run on `/var/lib/libvirt/images/win11_base.qcow2` (`4,145` records, `69.56%` persistence/exec link coverage, unchanged SHA-256) |
+| [v2/BENIGN_GENERATOR_DESIGN.md](v2/BENIGN_GENERATOR_DESIGN.md) | Step C.6 varied benign workload design (disjoint dev/blind_test profiles, unsigned PEs, services/tasks/registry) & pass/fail quantization gate (`IMP-06`) |
 | [v2/hardening/POINTER_CAPTURE_SPEC.md](v2/hardening/POINTER_CAPTURE_SPEC.md) | Offline unprivileged-container pointer-capture schema & v1 collector gap audit (`OD-V2-04`, `OD-V2-16`) |
 | [v2/hardening/02_domain_xml_hardening.md](v2/hardening/02_domain_xml_hardening.md) | Step D libvirt domain/network XML hardening runbook (`win11` & `win11-isolated`) + `check_domain_xml.py` validator |
 | [v2/hardening/03_inetsim_vm_setup.md](v2/hardening/03_inetsim_vm_setup.md) | Step D separate isolated Linux `inetsim-vm` (`192.168.150.10`) fake-internet VM setup (`OD-V2-03`) |
