@@ -14,6 +14,7 @@
 | [WORK_SUMMARY.md](WORK_SUMMARY.md) | Archived Step 1–7 pre-Step-8 execution checkpoint (Win11 51-run batch details, 8 label corrections, 6 kept `.pf` drift audits, per-technique coverage) |
 | [WINDOWS_11_LAB_SETUP.md](WINDOWS_11_LAB_SETUP.md) | Windows 11 libvirt/QEMU/KVM + UEFI Secure Boot + swtpm 2.0 guest image build & snapshot isolation guide |
 | [IMPROVEMENT_ANALYSIS.md](IMPROVEMENT_ANALYSIS.md) | Post-v1 read-only codebase, statistics, safety, and labeling audit (prioritized P0/P1/P2 findings + top 10 before v2) |
+| [v2/CHECKPOINT_ONBOARDING.md](v2/CHECKPOINT_ONBOARDING.md) | **Single-file onboarding checkpoint** spanning v1 freeze baseline, `OD-V2-01..20`, Phase 1 commit ledger (`ca73589..bbdf564`), codebase inventory, host lab state, solved pitfalls, and Gate 0 -> Stage A -> `--final` checklist |
 | [v2/OPERATOR_DECISIONS.md](v2/OPERATOR_DECISIONS.md) | Recorded v2 operator decisions (`OD-V2-01`..`OD-V2-20`: all confirmed `2026-11-23`; `OD-V2-07` written approval granted by Supervisor Marawan, AASTMT `2026-11-23`, Gate 0 execution pending) |
 | [v2/V2_PLAN.md](v2/V2_PLAN.md) | Single-source-of-truth pilot-first v2 plan (strata, safety gate, zero-SSH ISO staging, cached offline extraction, labeling, blind freeze, secondary refgraph/tail/execution-delta specs) |
 | [v2/FINAL_EVAL_PLAN_v2_SKELETON.md](v2/FINAL_EVAL_PLAN_v2_SKELETON.md) | Draft pre-registration skeleton for v2 (confirmed `OD-V2-20` pilot gate, Statistical-Power Note, all `[TBD]` fields pending pilot & blind-test freeze) |
