@@ -1,7 +1,7 @@
 # DFIR-Triage ML v2 — Prior-Art & Literature Novelty Verification Ledger
 
 **Status:** `ALL EXTERNAL CITATIONS AND CLAIMS REMAIN UNVERIFIED`  
-**Source Audited:** [`v2/concept_a_gap_audit.md`](../../v2/concept_a_gap_audit.md) (external research report covering citations `[1]`–`[137]`)  
+**Source Audited:** [`docs/v2/research/concept_a_gap_audit.md`](research/concept_a_gap_audit.md) (archived external research report covering citations `[1]`–`[137]`, tagged **`UNVERIFIED external report`**)  
 **Policy:** Treat every venue, bibliographic reference, URL, metric, and technical claim below as **`UNVERIFIED`** until inspected directly in its primary source (PDF/DOI/repository). Never cite unverified numbers or priority claims in pre-registration docs or downstream writing. To our knowledge, pending verification, the proposed static dead-disk referential graph design (`v2_refgraph`) combines pointer-resolved static cold-disk links with hub-attenuated propagation under frozen training-pool statistics.
 
 > [!CAUTION]

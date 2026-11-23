@@ -1,6 +1,6 @@
 # DFIR-Triage ML v2 — Operator Decisions & Onboarding Record
 
-**Status:** `OD-V2-01..06, 08, 09, 11..19 CONFIRMED BY MOKH (2026-11-23); OD-V2-10 CHANGED & CONFIRMED (2026-11-23); OD-V2-07 DESIGN CONFIRMED — WRITTEN PROFESSOR/UNIVERSITY APPROVAL & GATE 0 SIGN-OFF REMAIN PENDING`  
+**Status:** `OD-V2-01..06, 08, 09, 11..19 CONFIRMED BY MOKH (2026-11-23); OD-V2-10 CHANGED & CONFIRMED (2026-11-23); OD-V2-07 DESIGN CONFIRMED — WRITTEN PROFESSOR/UNIVERSITY APPROVAL & GATE 0 SIGN-OFF REMAIN PENDING; OD-V2-20 PROPOSED — PENDING MOKH'S CONFIRMATION`  
 **Single Source of Truth:** This document (decision records) together with [`docs/v2/V2_PLAN.md`](V2_PLAN.md) (v2 architecture, safety, methodology, and evaluation design) is the single source of truth for Phase v2.  
 **Related Docs:** [`V2_PLAN.md`](V2_PLAN.md) | [`FINAL_EVAL_PLAN_v2_SKELETON.md`](FINAL_EVAL_PLAN_v2_SKELETON.md) | [`v2/plan.md`](../../v2/plan.md) | [`IMPROVEMENT_ANALYSIS.md`](../IMPROVEMENT_ANALYSIS.md)
 
@@ -29,6 +29,7 @@
 | **`OD-V2-17`** | **Propagation baselines for `v2_refgraph`** | Pre-register 3 interpretable propagation baselines for secondary `v2_refgraph`: `(a)` base ranker alone, `(b)` naive undirected propagation, and `(c)` hub-attenuated typed propagation (context-split + training-pool IHF weights) — all transparent & traceable | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-18`** | **Heterogeneous GNNs deferred** | Heterogeneous Graph Neural Networks (`R-GCN`, `GAT`) are **deferred** and explicitly excluded from v2 core | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-19`** | **Deferred post-v2-final stretch items** | Strictly post-`--final` stretch experiments (never delaying or gating v2 core): timestomp / temporal-baseline comparison, Prefetch-disabled server ablation, and external corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`) as qualitative case studies with **zero tuning** | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-20`** | **`v2_refgraph` pilot pre-scoring go/no-go gate** | Computed on Stage A **pilot** data **before** any model scoring: if `< 50%` of persistence/execution-type artifacts (`task`, `service`, `run_key`, `wmi_subscription`, `prefetch`) have `>= 1` uniquely resolved static link, `v2_refgraph` is reported as **exploratory only** | **proposed, pending Mokh's confirmation** |
 
 ---
 
@@ -126,6 +127,13 @@
   3. Public external forensic corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`) as **qualitative case studies with zero model tuning**.
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
+### `OD-V2-20` — `v2_refgraph` Pilot Pre-Scoring 50% Link-Coverage Go/No-Go Gate
+- **Decision (Proposed):** Compute static pointer resolution coverage on the **Stage A pilot dataset BEFORE any model training or scoring**:
+  - Evaluate the subset of **persistence and execution-type artifacts**: `artifact_type in {"task", "service", "run_key", "wmi_subscription", "prefetch"}`.
+  - If **fewer than `50%`** of these persistence/execution-type artifacts have at least one **uniquely resolved** static link (`resolved_single` target in `linked_artifact_keys`), downgrade `v2_refgraph` to **exploratory only** in the final v2 evaluation plan (`FINAL_EVAL_PLAN_v2.md`).
+  - *(Baseline context from Step F clean-image dry run on `win11_base.qcow2`: `69.56%` (`553 / 795`) of persistence/execution artifacts had `>= 1` resolved outgoing static link; real malware pilot coverage remains `[TBD]` until Stage A runs).*
+- **Status:** **`proposed, pending Mokh's confirmation`**
+
 ---
 
 ## Operator Sign-Off Checklist (Mokh)
@@ -149,3 +157,4 @@
 - [x] `OD-V2-17` — Three interpretable propagation baselines for `v2_refgraph` (base alone, naive undirected, hub-attenuated typed) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-18` — Heterogeneous GNNs (`R-GCN`, `GAT`) deferred, outside v2 core *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-19` — Post-v2-final deferred stretch (timestomp experiment, Prefetch-disabled server ablation, `ADFIR`/`NIST CFReDS`/`Magnet CTF` qualitative case studies with zero tuning) *(confirmed by Mokh 2026-11-23)*
+- [ ] `OD-V2-20` — `v2_refgraph` pre-scoring pilot go/no-go gate (`< 50%` persistence/execution-type artifacts with `>= 1` uniquely resolved link -> `v2_refgraph` reported as exploratory only) *(proposed, pending Mokh's confirmation)*
