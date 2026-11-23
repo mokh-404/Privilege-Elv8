@@ -1,6 +1,6 @@
 # DFIR-Triage ML v2 — Operator Decisions & Onboarding Record
 
-**Status:** `OD-V2-01..06, 08, 09, 11..19 CONFIRMED BY MOKH (2026-11-23); OD-V2-10 CHANGED & CONFIRMED (2026-11-23); OD-V2-07 DESIGN CONFIRMED — WRITTEN PROFESSOR/UNIVERSITY APPROVAL & GATE 0 SIGN-OFF REMAIN PENDING; OD-V2-20 PROPOSED — PENDING MOKH'S CONFIRMATION`  
+**Status:** `OD-V2-01..06, 08..20 CONFIRMED BY MOKH (2026-11-23); OD-V2-07 WRITTEN APPROVAL GRANTED BY SUPERVISOR MARAWAN (AASTMT, 2026-11-23, "NOT REQUIRED — WAIVED BY SUPERVISOR") & DESIGN CONFIRMED BY MOKH (2026-11-23) — HARD GATE 0 CHECKLIST EXECUTION & SIGN-OFF REMAIN REQUIRED BEFORE ANY MALWARE ACQUISITION`  
 **Single Source of Truth:** This document (decision records) together with [`docs/v2/V2_PLAN.md`](V2_PLAN.md) (v2 architecture, safety, methodology, and evaluation design) is the single source of truth for Phase v2.  
 **Related Docs:** [`V2_PLAN.md`](V2_PLAN.md) | [`FINAL_EVAL_PLAN_v2_SKELETON.md`](FINAL_EVAL_PLAN_v2_SKELETON.md) | [`v2/plan.md`](../../v2/plan.md) | [`IMPROVEMENT_ANALYSIS.md`](../IMPROVEMENT_ANALYSIS.md)
 
@@ -11,12 +11,12 @@
 | ID | Topic | Confirmed v2 Decision | Status |
 | :--- | :--- | :--- | :--- |
 | **`OD-V2-01`** | **Data targets (Families + Positives/Runs)** | `>= 25–30` total distinct malware families, `>= 10–15` distinct families in blind test (pilot decides what is feasible); rough anchor `~300–500` positives across `100+` VM runs | **confirmed by Mokh 2026-11-23** |
-| **`OD-V2-02`** | **v1 data reuse (`emulated` stratum)** | Reuse frozen `dataset_v1.parquet` strictly as a 3rd `"emulated"` training-pool stratum (`dev` only); v2 blind test is **100% new**; reuse disclosed in all tables/reports | **confirmed by Mokh 2026-11-23** |
+| **`OD-V2-02`** | **v1 data reuse (`emulated` stratum) & Step F0 parity rulings** | Reuse frozen `dataset_v1.parquet` strictly as a 3rd `"emulated"` training-pool stratum (`dev` only); v2 blind test is **100% new**; reuse disclosed in all tables/reports. **Step F0 parity rulings confirmed:** (a) exclude 75 live `process` rows (`1,179 -> 1,104` cold-disk rows) in mixed-stratum models while leaving `dataset_v1.parquet` untouched; (b) document/align 27 locked v1 OS files (`file_entropy` Win32 lock missingness); (c) keep `run_key` raw (`--no-expand-env` default) in `full_20` while storing raw + expanded paths for `v2_refgraph` | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-03`** | **Fake-internet responder** | `INetSim` on a **separate isolated Linux VM** (`inetsim-vm`) attached to `win11-isolated` (never on host OS, never in-guest FakeNet-NG) | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-04`** | **Offline artifact extraction** | **User-space offline parsing inside an unprivileged container** (`--network=none`, `--read-only`, `--cap-drop=ALL`, pure user-space QCOW2/NTFS/registry/EVTX/Amcache/Prefetch parsing); **never host-kernel mounts** of infected images | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-05`** | **Stage A pilot scope** | `~3` clean control boots + `6–8` non-test malware families × paired `dormant` + `executed` runs per `sample_sha256` (`pair_group_id`, matching initial staging path); pilot families stay strictly out of blind test | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-06`** | **Multi-seed & tuning budget** | `K = 5` seeds (`[42, 43, 44, 45, 46]`) for `--final` and learning curves; `30` equal trials per tuned model arm in nested dev CV, **with a fallback to `20` trials if the pilot shows compute is too heavy** | **confirmed by Mokh 2026-11-23** |
-| **`OD-V2-07`** | **Malware sample sourcing & quarantine vault** | Authorized research feed (e.g., MalwareBazaar / institutional repo), encrypted non-executable host vault (`chmod 0700` dir, `0400` AES-256 archive), SHA-256 manifest preflight; zero acquisition until written professor/university approval & Gate 0 sign-off | **design confirmed by Mokh 2026-11-23; written professor/university approval & Gate 0 sign-off PENDING** |
+| **`OD-V2-07`** | **Malware sample sourcing, quarantine vault & written supervisor approval** | Authorized research feed, encrypted non-executable host vault (`chmod 0700` dir, `0400` AES-256 archive), SHA-256 manifest preflight. **Written approval granted `2026-11-23` by Supervisor Marawan (AASTMT)** (*"Research Approval Request: Controlled Malware Analysis for DFIR Triage"*; separate institutional/legal ethics review *"Not Required — Waived by Supervisor"*) under 3 mandatory conditions: (a) sole governing authorization by Supervisor Marawan, (b) ASUS host with zero personal credentials/sensitive data/production workloads under a dedicated isolated user account, (c) zero malware acquisition/extraction/execution until Gate 0 checklist (`NEG-01..10` + base hash + vault verify + dedicated user check) is executed & signed by Mokh | **written supervisor approval GRANTED by Supervisor Marawan (AASTMT) 2026-11-23; design confirmed by Mokh 2026-11-23; Gate 0 checklist sign-off PENDING** |
 | **`OD-V2-08`** | **Malware categories, family normalization & clustering** | Multi-category mix (Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, Trojanized Installer), **preferring families that run without live C2 and leave persistence artifacts**; AVClass2/ClarAVy canonical family names + `ssdeep`/TLSH/imphash near-duplicate clustering | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-09`** | **Stratum mix (`executed` vs `dormant` vs `emulated`) & pairing** | Report `(a) executed` (~60–70% of real-malware runs), `(b) dormant` (~30–40% of real-malware runs), and `(c) emulated` (v1 `dev` only, 0% blind test) separately and pooled with weights disclosed; `dormant` and `executed` cross-stratum runs are **paired by `sample_sha256` (`pair_group_id`)** and never straddle `dev` and `blind_test` | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-10`** | **Independent blinded human review** | **CHANGED:** **Mokh's friend is the primary blinded reviewer; Mokh scores the 20% overlap slice for Cohen's $\kappa$** (because Mokh built the labeler and is not independent). Blinded exports hide `label`, `label_reason`, `launcher`, `technique_id`, `sample_family` and require `reviewer_id`, `reviewed_at_utc`, per-row notes | **CHANGED & confirmed by Mokh 2026-11-23** |
@@ -29,7 +29,7 @@
 | **`OD-V2-17`** | **Propagation baselines for `v2_refgraph`** | Pre-register 3 interpretable propagation baselines for secondary `v2_refgraph`: `(a)` base ranker alone, `(b)` naive undirected propagation, and `(c)` hub-attenuated typed propagation (context-split + training-pool IHF weights) — all transparent & traceable | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-18`** | **Heterogeneous GNNs deferred** | Heterogeneous Graph Neural Networks (`R-GCN`, `GAT`) are **deferred** and explicitly excluded from v2 core | **confirmed by Mokh 2026-11-23** |
 | **`OD-V2-19`** | **Deferred post-v2-final stretch items** | Strictly post-`--final` stretch experiments (never delaying or gating v2 core): timestomp / temporal-baseline comparison, Prefetch-disabled server ablation, and external corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`) as qualitative case studies with **zero tuning** | **confirmed by Mokh 2026-11-23** |
-| **`OD-V2-20`** | **`v2_refgraph` pilot pre-scoring go/no-go gate** | Computed on Stage A **pilot** data **before** any model scoring: if `< 50%` of persistence/execution-type artifacts (`task`, `service`, `run_key`, `wmi_subscription`, `prefetch`) have `>= 1` uniquely resolved static link, `v2_refgraph` is reported as **exploratory only** | **proposed, pending Mokh's confirmation** |
+| **`OD-V2-20`** | **`v2_refgraph` pilot pre-scoring go/no-go gate** | Computed on Stage A **pilot** data **before** any model scoring: if `< 50%` of persistence/execution-type artifacts (`task`, `service`, `run_key`, `wmi_subscription`, `prefetch`) have `>= 1` uniquely resolved static link, `v2_refgraph` is reported as **exploratory only** | **confirmed by Mokh 2026-11-23** |
 
 ---
 
@@ -39,8 +39,12 @@
 - **Decision:** Express primary scale targets in **distinct malware families** (`>= 25–30` total families, with `>= 10–15` distinct families held out in the blind test) alongside rough run/positive anchors (`~300–500` total positives across `100+` VM runs). **The Stage A pilot decides what is feasible** before freezing Stage B targets.
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-02` — v1 Data Reuse (`emulated` Training-Pool Stratum)
+### `OD-V2-02` — v1 Data Reuse (`emulated` Training-Pool Stratum) & Step F0 Parity Rulings
 - **Decision:** Reuse frozen v1 (`data/processed/dataset_v1.parquet`: `1,549` rows, `103` `attacker_induced` across 16 simulated ATT&CK techniques) strictly as a third **`"emulated"` training-pool (`dev`) stratum only**. Zero v1 rows, benign `artifact_key`s, or v1 emulated techniques enter the v2 blind test — the v2 blind test is **100% new**, and v1 reuse is explicitly disclosed in every v2 manifest, table, and report.
+- **Confirmed Step F0 Feature-Parity Rulings (`FEATURE_PARITY_AUDIT.md` §3, confirmed `2026-11-23`):**
+  1. **(a) Live `process`-row exclusion in mixed-stratum models:** Filter out the `75` live `artifact_type == "process"` rows from v1 `emulated` `dev` (`1,179 -> 1,104` cold-disk rows) when training mixed-stratum models (`emulated` + `executed` + `dormant`) so `parent_process_class != "na"` cannot act as an `emulated`-stratum shortcut, while leaving frozen `dataset_v1.parquet` completely untouched on disk.
+  2. **(b) Locked OS file `file_entropy` alignment/disclosure:** Explicitly document and align the `27` v1 locked OS files (`PAGEFILE.SYS`, active registry hives, EVTX) where live Win32 sharing violations produced `file_entropy = 0.0` / `NaN`, and rely on dual-config `full_20` + `no_content` evaluation.
+  3. **(c) `run_key` raw environment-variable parity:** Keep `run_key` `command_line` / `registry_value` unexpanded (`--no-expand-env` default) in `full_20` to match `Collect-Artifacts.ps1` (`DoNotExpandEnvironmentNames`), while storing both `reg_value_raw` and `reg_value_expanded` for `v2_refgraph`.
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ### `OD-V2-03` — Fake-Internet Responder Architecture
@@ -59,9 +63,14 @@
 - **Decision:** Use **`K = 5` independent seeds** (`[42, 43, 44, 45, 46]`) for multi-seed `--final` evaluation (reporting per-seed mean ± std and the K-seed ensemble score) and learning curves, and **`30` equal trials per tuned model arm** (`rf`, `xgb`, `iforest`, `mlp`, `ae`, `lr`) in nested family-grouped dev CV, **with a pre-authorized fallback to `20` equal trials if the Stage A pilot shows compute is too heavy**.
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
-### `OD-V2-07` — Malware Sample Sourcing & Quarantine Vault
-- **Decision:** Source samples exclusively from an authorized research/academic feed under recorded institutional approvals; store outside the repository in an encrypted, non-executable quarantine vault (`chmod 0700` dir, `0400` AES-256 archive) with SHA-256 manifest preflight before injection. **Written professor/university approval is still required, and Gate 0 remains unsigned.** Zero malware acquisition or execution may occur until both are completed.
-- **Status:** **`design confirmed by Mokh 2026-11-23; written professor/university approval & Gate 0 sign-off PENDING`**
+### `OD-V2-07` — Malware Sample Sourcing, Quarantine Vault & Written Supervisor Authorization
+- **Decision:** Source samples exclusively from an authorized research/academic feed; store outside the repository in an encrypted, non-executable quarantine vault (`chmod 0700` dir, `0400` AES-256 archive) with SHA-256 manifest preflight before injection.
+- **Written Supervisor Approval Recorded (`2026-11-23`):** Written approval was granted on **`2026-11-23`** by **Supervisor Marawan (AASTMT)** for *"Research Approval Request: Controlled Malware Analysis for DFIR Triage"*, explicitly confirming that no separate institutional or legal ethics board review is required beyond supervisor authorization (*"Not Required — Waived by Supervisor"*).
+- **Three Mandatory Governance & Containment Conditions:**
+  1. **(a) Sole Governing Authorization:** Governed by Supervisor Marawan's (AASTMT) written approval dated `2026-11-23` (*"Not Required — Waived by Supervisor"* for separate institutional/legal ethics review).
+  2. **(b) ASUS Host Machine Isolation Condition:** The ASUS lab host must contain **zero personal credentials, zero sensitive data, and zero production workloads**, and all collection/detonation workflows must operate strictly under a **dedicated isolated user account**.
+  3. **(c) Hard Gate 0 Enforcement:** Zero malware sample acquisition, download, extraction, or execution may occur until the full Gate 0 checklist (`NEG-01`..`NEG-10` negative-egress tests + immutable base SHA-256 verification + quarantine vault verification + dedicated isolated user verification in [`hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md`](hardening/08_NEGATIVE_EGRESS_AND_SIGN_OFF.md)) is executed and signed off by Mokh.
+- **Status:** **`written supervisor approval GRANTED by Supervisor Marawan (AASTMT) 2026-11-23 ("Not Required — Waived by Supervisor"); design confirmed by Mokh 2026-11-23; Gate 0 checklist execution & operator sign-off PENDING`**
 
 ### `OD-V2-08` — Malware Categories, Family Normalization & Deduplication
 - **Decision:** Target balanced multi-category coverage across Ransomware, InfoStealer, Loader/Dropper, RAT/Backdoor, Coinminer, and Trojanized Installer, **preferring families that execute meaningfully without live C2 infrastructure and leave host persistence artifacts**; normalize canonical family labels via AVClass2/ClarAVy consensus and group near-duplicate binaries/packers via `ssdeep`/TLSH/imphash clustering before assigning `dev` vs `blind_test` (`IMP-05`).
@@ -128,23 +137,22 @@
 - **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ### `OD-V2-20` — `v2_refgraph` Pilot Pre-Scoring 50% Link-Coverage Go/No-Go Gate
-- **Decision (Proposed):** Compute static pointer resolution coverage on the **Stage A pilot dataset BEFORE any model training or scoring**:
+- **Decision:** Compute static pointer resolution coverage on the **Stage A pilot dataset BEFORE any model training or scoring**:
   - Evaluate the subset of **persistence and execution-type artifacts**: `artifact_type in {"task", "service", "run_key", "wmi_subscription", "prefetch"}`.
   - If **fewer than `50%`** of these persistence/execution-type artifacts have at least one **uniquely resolved** static link (`resolved_single` target in `linked_artifact_keys`), downgrade `v2_refgraph` to **exploratory only** in the final v2 evaluation plan (`FINAL_EVAL_PLAN_v2.md`).
-  - *(Baseline context from Step F clean-image dry run on `win11_base.qcow2`: `69.56%` (`553 / 795`) of persistence/execution artifacts had `>= 1` resolved outgoing static link; real malware pilot coverage remains `[TBD]` until Stage A runs).*
-- **Status:** **`proposed, pending Mokh's confirmation`**
+- **Status:** **`confirmed by Mokh 2026-11-23`**
 
 ---
 
 ## Operator Sign-Off Checklist (Mokh)
 
 - [x] `OD-V2-01` — Family targets (`>= 25–30` total, `>= 10–15` blind test; pilot decides feasibility) *(confirmed by Mokh 2026-11-23)*
-- [x] `OD-V2-02` — v1 reuse strictly as `dev`-only `"emulated"` stratum; 100% new blind test *(confirmed by Mokh 2026-11-23)*
+- [x] `OD-V2-02` — v1 reuse strictly as `dev`-only `"emulated"` stratum; 100% new blind test + 3 Step F0 parity rulings (`75` live `process` rows excluded in mixed-stratum models; `27` locked OS files documented/aligned; `run_key` raw in `full_20` + raw/expanded in `v2_refgraph`) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-03` — INetSim on separate isolated Linux VM *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-04` — User-space offline parsing in unprivileged container (zero host-kernel mounts) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-05` — Pilot scope (`~3` controls + `6–8` families × paired `dormant` + `executed` runs per `sample_sha256` / `pair_group_id`) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-06` — `K = 5` seeds and `30` equal trials per tuned model (`20`-trial fallback if pilot compute too heavy) *(confirmed by Mokh 2026-11-23)*
-- [ ] `OD-V2-07` — Quarantine vault & SHA-256 manifest design confirmed (`2026-11-23`); **written professor/university approval & Gate 0 sign-off PENDING**
+- [ ] `OD-V2-07` — Quarantine vault & SHA-256 manifest design confirmed (`2026-11-23`); **written supervisor approval GRANTED by Supervisor Marawan (AASTMT, `2026-11-23`, "Not Required — Waived by Supervisor")**; **Gate 0 checklist (`NEG-01..10`, base hash, vault verify, ASUS dedicated isolated user check) execution & Mokh sign-off PENDING**
 - [x] `OD-V2-08` — Categories, AVClass2/ClarAVy normalization, fuzzy-hash clustering, prefer no-live-C2 persistence families *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-09` — Stratum mix (`executed` ~60–70% / `dormant` ~30–40%, paired by `sample_sha256` / `pair_group_id` within same split / `emulated` `dev`-only) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-10` — Friend primary blinded reviewer + Mokh scores 20% overlap for Cohen's $\kappa$ *(CHANGED & confirmed by Mokh 2026-11-23)*
@@ -157,4 +165,4 @@
 - [x] `OD-V2-17` — Three interpretable propagation baselines for `v2_refgraph` (base alone, naive undirected, hub-attenuated typed) *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-18` — Heterogeneous GNNs (`R-GCN`, `GAT`) deferred, outside v2 core *(confirmed by Mokh 2026-11-23)*
 - [x] `OD-V2-19` — Post-v2-final deferred stretch (timestomp experiment, Prefetch-disabled server ablation, `ADFIR`/`NIST CFReDS`/`Magnet CTF` qualitative case studies with zero tuning) *(confirmed by Mokh 2026-11-23)*
-- [ ] `OD-V2-20` — `v2_refgraph` pre-scoring pilot go/no-go gate (`< 50%` persistence/execution-type artifacts with `>= 1` uniquely resolved link -> `v2_refgraph` reported as exploratory only) *(proposed, pending Mokh's confirmation)*
+- [x] `OD-V2-20` — `v2_refgraph` pre-scoring pilot go/no-go gate (`< 50%` persistence/execution-type artifacts with `>= 1` uniquely resolved link -> `v2_refgraph` reported as exploratory only) *(confirmed by Mokh 2026-11-23)*

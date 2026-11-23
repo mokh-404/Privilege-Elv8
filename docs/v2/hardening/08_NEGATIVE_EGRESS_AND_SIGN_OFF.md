@@ -1,7 +1,10 @@
 # Step D — Negative-Egress Verification Checklist & Exact Ordered Mokh Run/Sign List
 
-**Status:** `Phase 1 Hardening Runbook — NO Changes Have Been Applied to Host Firewall, Libvirt XML, or VMs`  
-**Hard Rule:** Gate 0 (`OD-V2-07`) and written professor/university approval remain **PENDING**. Complete **every** check below (using clean control images only) before acquiring or running any malware.
+**Status:** `Phase 1 Hardening Runbook — Written Supervisor Approval GRANTED (Supervisor Marawan, AASTMT, 2026-11-23); Gate 0 Execution & Sign-Off Remain PENDING`  
+**Hard Rule:** Written supervisor approval was granted on **`2026-11-23`** by **Supervisor Marawan (AASTMT)** for *"Research Approval Request: Controlled Malware Analysis for DFIR Triage"* (confirming separate institutional/legal ethics review is *"Not Required — Waived by Supervisor"*), subject to three mandatory conditions:
+1. **(a) Sole Governing Authorization:** Governed by Supervisor Marawan's (AASTMT) written approval dated `2026-11-23` (*"Not Required — Waived by Supervisor"*).
+2. **(b) ASUS Host Machine Condition:** Zero personal credentials, zero sensitive data, and zero production workloads on the ASUS host, operated strictly under a **dedicated isolated user account**.
+3. **(c) Hard Gate 0 Enforcement:** Zero malware sample acquisition, extraction, or execution until the Gate 0 checklist below (`NEG-01`..`NEG-10` + base hash + vault verify + dedicated isolated user check) is fully executed and signed by Mokh.
 
 ---
 
@@ -45,10 +48,11 @@ Execute strictly **in this numbered order** (all host `sudo` operations executed
    Complete the entire table above using a clean control overlay only (zero malware).
 8. **Run Clean-Image Feature Parity Test (`docs/v2/FEATURE_PARITY_AUDIT.md` §4):**
    Compare live `Collect-Artifacts.ps1` vs offline extractor on the same clean overlay (`signature_state >= 98%`, exact features `100%`).
-9. **Initialize Quarantine Vault & Obtain Institutional Approvals (`OD-V2-07`):**
-   Run `./docs/v2/hardening/05_quarantine_vault_setup.sh init`, file written professor/university approval, sign Gate 0 (`GATE0_SIGNED_OFF`), and verify `./docs/v2/hardening/05_quarantine_vault_setup.sh preflight` passes.
+9. **Initialize Quarantine Vault & Verify Supervisor Approval Conditions (`OD-V2-07`):**
+   Verify dedicated isolated host user account on the ASUS host (zero personal credentials/sensitive data/production workloads), run `./docs/v2/hardening/05_quarantine_vault_setup.sh init`, sign Gate 0 (`GATE0_SIGNED_OFF`), and verify `./docs/v2/hardening/05_quarantine_vault_setup.sh preflight` passes.
 10. **Formal Operator Sign-Off (Complete Before Downloading/Executing Pilot Samples):**
-    - `[ ]` **Institutional / Professor Written Approval Obtained** *(Date / Reference: `____________`)*
-    - `[ ]` **Containment (`NEG-01`..`NEG-10`) All Passed** *(Operator Initials: `______`)*
+    - `[x]` **Written Supervisor Approval Obtained (`OD-V2-07a`)** *(Date / Reference: `2026-11-23 — Supervisor Marawan (AASTMT), "Research Approval Request: Controlled Malware Analysis for DFIR Triage" (Institutional Ethics Review: Not Required — Waived by Supervisor)`)*
+    - `[ ]` **ASUS Host Dedicated Isolated User & Zero Personal Credentials/Sensitive Data Verified (`OD-V2-07b`)** *(Operator Initials: `______`)*
+    - `[ ]` **Containment (`NEG-01`..`NEG-10`), Base Hash & Vault Preflight All Passed (`OD-V2-07c`)** *(Operator Initials: `______`)*
     - `[ ]` **Clean-Image Feature Parity Passed** *(Operator Initials: `______`)*
     - `[ ]` **Gate 0 Signed Off (`OD-V2-07` Active)** *(Signed: Mokh / Date: `____________`)*

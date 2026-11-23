@@ -1,6 +1,6 @@
 # DFIR-Triage ML v2 — `full_20` Feature-Parity Audit (Live v1 vs. Offline v2)
 
-**Status:** `Step F0 Complete (Audit & Parity Procedure Ready; Clean-Image Parity Check Pending Operator Boot)`  
+**Status:** `Step F0 Complete — All 3 Feature-Parity Recommendations Confirmed by Mokh (2026-11-23); Clean-Image Parity Check Pending Operator Boot`  
 **Scope:** Line-by-line audit comparing v1 live collection ([`collector/Collect-Artifacts.ps1`](../../collector/Collect-Artifacts.ps1)) and feature extraction ([`src/data/features.py`](../../src/data/features.py)) against pure user-space offline QCOW2 extraction (`OD-V2-04`) across all 20 locked [`config.FEATURES`](../../src/config.py#L53-L80), plus impact on v1 `emulated` reuse (`OD-V2-02`) and the clean-image parity test procedure for Mokh.
 
 ---
@@ -48,12 +48,15 @@ Empirically cross-checked against frozen `data/processed/dataset_v1.parquet` (`d
 
 ---
 
-## 3. Effect on `OD-V2-02` (Reuse of Frozen v1 as `"emulated"` Training-Pool Stratum)
+## 3. Effect on `OD-V2-02` (Reuse of Frozen v1 as `"emulated"` Training-Pool Stratum — Confirmed by Mokh `2026-11-23`)
 
-| Stratum Compatibility Issue | Impact on `OD-V2-02` | Required Action in v2 Pipeline |
+All three Step F0 feature-parity recommendations below are **`confirmed by Mokh 2026-11-23`**:
+
+| Stratum Compatibility Issue | Impact on `OD-V2-02` | Confirmed Action in v2 Pipeline (`confirmed by Mokh 2026-11-23`) |
 | :--- | :--- | :--- |
-| **`parent_process_class` (`process` rows)** | v1 `dev` contains **`75` live `process` rows** (`services=48`, `svchost=12`, `other=12`, `cmd=1`, `na=2`), while cold-disk offline extraction (`executed`, `dormant`) produces **`0` `process` rows** (`100%` `"na"`). Training supervised trees/MLP on v1 `process` rows would let models memorize `artifact_type == "process"` / non-`"na"` `parent_process_class` as `emulated`-only strata cues. | Filter `emulated` training rows to **cold-disk-comparable types (`artifact_type != "process"`, leaving `1,104` v1 `dev` rows)** by default when combining `emulated` + `executed` + `dormant`. Retain all `1,179` v1 `dev` rows untouched in frozen `dataset_v1.parquet`, and disclose this `process`-row exclusion explicitly in v2 training/stratum logs. |
-| **`amcache` & locked-file `file_entropy` missingness** | v1 had `0` `amcache` rows (`51/51` `locked_hive_no_vss`) and `27/444` `dev` `file` rows with `NaN` `file_entropy` (`file_size_log` non-null). Offline extraction recovers `amcache` and avoids lock failures. | Do **NOT** mix `amcache`-only presence or `file_entropy`-missingness indicators across strata; report `"emulated"` contribution explicitly in dev ablations (`with_emulated` vs `real_malware_only`), while `full_20` vs `no_content` directly tests `file_entropy` sensitivity. |
+| **`parent_process_class` (`process` rows)** | v1 `dev` contains **`75` live `process` rows** (`services=48`, `svchost=12`, `other=12`, `cmd=1`, `na=2`), while cold-disk offline extraction (`executed`, `dormant`) produces **`0` `process` rows** (`100%` `"na"`). Training supervised trees/MLP on v1 `process` rows would let models memorize `artifact_type == "process"` / non-`"na"` `parent_process_class` as `emulated`-only strata cues. | **(a) Confirmed (`2026-11-23`):** Filter `emulated` training rows to **cold-disk-comparable types (`artifact_type != "process"`, leaving `1,104` v1 `dev` rows)** by default when combining `emulated` + `executed` + `dormant`. Retain all `1,179` v1 `dev` rows untouched in frozen `dataset_v1.parquet`, and disclose this `process`-row exclusion explicitly in v2 training/stratum logs. |
+| **`amcache` & locked-file `file_entropy` missingness** | v1 had `0` `amcache` rows (`51/51` `locked_hive_no_vss`) and `27/444` `dev` `file` rows with `0.0`/`NaN` `file_entropy` (`file_size_log` non-null) due to Win32 sharing violations on locked OS files. Offline extraction recovers `amcache` and avoids lock failures. | **(b) Confirmed (`2026-11-23`):** Document and align the `27` v1 locked OS files where Win32 sharing violations produced `file_entropy = 0.0` / `NaN`; do **NOT** mix `amcache`-only presence or `file_entropy`-missingness indicators across strata; report `"emulated"` contribution explicitly in dev ablations (`with_emulated` vs `real_malware_only`), while `full_20` vs `no_content` directly tests `file_entropy` sensitivity. |
+| **`run_key` raw environment-variable parity (`cmdline_*`)** | [`Collect-Artifacts.ps1:359`](../../collector/Collect-Artifacts.ps1#L359) used `DoNotExpandEnvironmentNames` on `run_key` values while expanding `service` `ImagePath`. | **(c) Confirmed (`2026-11-23`):** Keep `run_key` raw (`--no-expand-env` default) in `full_20` to match `Collect-Artifacts.ps1`, while storing both `reg_value_raw` and `reg_value_expanded` for `v2_refgraph`. |
 | **Zero Blind-Test Leakage (`OD-V2-02`)** | Locked unchanged | `100%` of v1 `emulated` rows stay in `split_pool == "dev"` only; `0%` enter the v2 blind test. |
 
 ---
