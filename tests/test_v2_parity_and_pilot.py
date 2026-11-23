@@ -12,7 +12,9 @@ import pytest
 
 from scripts.compare_v1_v2_parity import compare_v1_v2_feature_parity, format_parity_markdown
 from src import config
-from src.v2.pilot_staging import PilotStagingError, StageRunSpec
+from src.v2.labeler_v2 import drop_v2_harness_footprint
+from src.v2.offline_extractor import extract_from_fixture, is_v2_harness_footprint_record, write_outputs
+from src.v2.pilot_staging import PilotStagingError, StageRunSpec, build_clean_parity_stage_iso
 from src.v2.run_stage_a_pilot import (
     compute_od_v2_20_pilot_gate,
     evaluate_stage_a_pilot_runs,
@@ -78,6 +80,91 @@ def test_bake_scripts_exist_and_have_valid_syntax():
     assert "67108864" in ps_txt
     assert "\\DFIR-StageRunner" in ps_txt
     assert 'Set-Service -Name "sshd" -StartupType Disabled' in ps_txt
+
+
+def test_zero_ssh_parity_iso_builder_and_v2_harness_footprint_filtering(tmp_path):
+    # 1. Verify zero-SSH parity ISO packages Collect-Artifacts.ps1 into DFIR_STAGE ISO
+    bundle = build_clean_parity_stage_iso(tmp_path / "parity_iso_dir")
+    assert bundle["iso"].exists() and bundle["collector_ps1"].exists()
+    iso_bytes = bundle["iso"].read_bytes()
+    assert b"CD001" in iso_bytes
+    assert b"COLLECT.PS1" in iso_bytes
+    assert "C:\\collector_out_parity" in bundle["benign_workload"].read_text(encoding="utf-8")
+
+    # 2. Verify v2 harness footprint filtering in both offline_extractor and labeler_v2
+    harness_and_real = [
+        {
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\windows\system32\svchost.exe|svchost.exe",
+            "name": "svchost.exe",
+            "path": r"C:\Windows\System32\svchost.exe",
+        },
+        {
+            "artifact_type": "task",
+            "artifact_key": r"task|\|dfir-stagerunner",
+            "name": "DFIR-StageRunner",
+            "task_name": r"\DFIR-StageRunner",
+            "command_line": r"powershell.exe -File C:\DFIR-Bootstrap\Invoke-StagePayload.ps1",
+        },
+        {
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\dfir-bootstrap\invoke-stagepayload.ps1|invoke-stagepayload.ps1",
+            "name": "Invoke-StagePayload.ps1",
+            "path": r"C:\DFIR-Bootstrap\Invoke-StagePayload.ps1",
+        },
+        {
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\collector_out_parity\artifacts.json|artifacts.json",
+            "name": "artifacts.json",
+            "path": r"C:\collector_out_parity\artifacts.json",
+        },
+        {
+            "artifact_type": "service",
+            "artifact_key": r"service|hklm\system\currentcontrolset\services\sysmon64|sysmon64",
+            "name": "Sysmon64",
+            "service_name": "Sysmon64",
+            "path": r"C:\Windows\Sysmon64.exe",
+            "registry_key": r"HKLM\SYSTEM\CurrentControlSet\Services\Sysmon64",
+        },
+        {
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\windows\sysmon64.exe|sysmon64.exe",
+            "name": "Sysmon64.exe",
+            "path": r"C:\Windows\Sysmon64.exe",
+        },
+        {
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\windows\system32\drivers\sysmondrv.sys|sysmondrv.sys",
+            "name": "SysmonDrv.sys",
+            "path": r"C:\Windows\System32\drivers\SysmonDrv.sys",
+        },
+        {
+            "artifact_type": "prefetch",
+            "artifact_key": r"prefetch|c:\windows\prefetch\sysmon64.exe-12345678.pf|sysmon64.exe-12345678.pf",
+            "name": "SYSMON64.EXE-12345678.pf",
+            "path": r"C:\Windows\Prefetch\SYSMON64.EXE-12345678.pf",
+            "pf_executable_name": "SYSMON64.EXE",
+        },
+    ]
+    kept, summary = extract_from_fixture(harness_and_real, run_id="harness_filter_test")
+    assert len(kept) == 1
+    assert kept[0]["name"] == "svchost.exe"
+    assert summary["v2_harness_footprint_dropped_count"] == 7
+    out_paths = write_outputs(kept, summary, tmp_path / "ext_out")
+    assert out_paths["dropped_csv"].exists()
+    dropped_df = pd.read_csv(out_paths["dropped_csv"])
+    assert len(dropped_df) == 7
+
+    # Also verify labeler_v2 drop_v2_harness_footprint filters all 7 and writes to a v2 audit CSV
+    v2_log = tmp_path / "v2_runner_footprint_dropped.csv"
+    kept_l, dropped_l = drop_v2_harness_footprint(pd.DataFrame(harness_and_real), log_path=v2_log)
+    assert len(kept_l) == 1
+    assert len(dropped_l) == 7
+    assert v2_log.exists()
+
+    # Refuses to overwrite frozen v1 RUNNER_FOOTPRINT_LOG_CSV
+    with pytest.raises(ValueError, match="Refusing to overwrite frozen v1"):
+        drop_v2_harness_footprint(pd.DataFrame(harness_and_real), log_path=config.RUNNER_FOOTPRINT_LOG_CSV)
 
 
 def test_stage_a_pilot_orchestrator_gate0_od_v2_20_and_power_calibration(tmp_path):

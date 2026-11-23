@@ -11,6 +11,7 @@ import pandas as pd
 from src import config
 from src.data import sanitize, splits
 from src.data.labeler import stable_content_hash
+from src.v2.offline_extractor import is_v2_harness_footprint_record
 
 
 AMBIGUOUS_LABEL = "ambiguous_unattributed"
@@ -20,6 +21,50 @@ V2_LABEL_VALUES: tuple[str, ...] = (
     "baseline",
     AMBIGUOUS_LABEL,
 )
+
+
+def drop_v2_harness_footprint(
+    df: pd.DataFrame,
+    log_path: Any = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Deterministically filter both v1 runner footprint and v2 harness artifacts (`\\DFIR-StageRunner`,
+    `C:\\DFIR-Bootstrap\\*`, `C:\\collector_out_parity\\*`, `Sysmon64`/`SysmonDrv`).
+
+    Never touches frozen v1 `results/logs/runner_footprint_dropped.csv` unless explicitly passed in `log_path`.
+    """
+    if len(df) == 0:
+        return df.copy(), pd.DataFrame(columns=["run_id", "artifact_type", "artifact_key", "name", "path", "drop_reason"])
+
+    kept_v1, dropped_v1 = sanitize.drop_runner_footprint(df.copy(), log_path=None)
+    v2_reasons = [is_v2_harness_footprint_record(rec) for rec in kept_v1.to_dict(orient="records")]
+    v2_mask = pd.Series([r is not None for r in v2_reasons], index=kept_v1.index)
+
+    dropped_v2 = kept_v1[v2_mask].copy()
+    if len(dropped_v2):
+        dropped_v2["drop_reason"] = [r for r in v2_reasons if r is not None]
+    kept = kept_v1[~v2_mask].reset_index(drop=True)
+
+    cols = [c for c in ("run_id", "artifact_type", "artifact_key", "name", "path", "drop_reason") if c in df.columns or c == "drop_reason"]
+    all_dropped_parts = []
+    if len(dropped_v1):
+        all_dropped_parts.append(dropped_v1[[c for c in cols if c in dropped_v1.columns]])
+    if len(dropped_v2):
+        all_dropped_parts.append(dropped_v2[[c for c in cols if c in dropped_v2.columns]])
+    all_dropped = (
+        pd.concat(all_dropped_parts, ignore_index=True)
+        if all_dropped_parts
+        else pd.DataFrame(columns=["run_id", "artifact_type", "artifact_key", "name", "path", "drop_reason"])
+    )
+
+    if log_path is not None:
+        from pathlib import Path
+        lp = Path(log_path)
+        if lp.resolve() == config.RUNNER_FOOTPRINT_LOG_CSV.resolve():
+            raise ValueError("Refusing to overwrite frozen v1 RUNNER_FOOTPRINT_LOG_CSV from v2 labeler")
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        all_dropped.to_csv(lp, index=False)
+
+    return kept, all_dropped
 
 
 def build_multi_control_baseline(control_dfs: Sequence[pd.DataFrame]) -> dict[str, Any]:
@@ -206,7 +251,7 @@ def label_executed_run(
     if len(run_df) == 0:
         return run_df.copy()
 
-    df, _ = sanitize.drop_runner_footprint(run_df.copy(), log_path=runner_log_path)
+    df, _ = drop_v2_harness_footprint(run_df.copy(), log_path=runner_log_path)
     sanitize.assert_clean(df, report_path=sanitization_report)
 
     hash_idx = baseline_index["hash_index"] if "hash_index" in baseline_index else baseline_index
@@ -308,7 +353,7 @@ def label_dormant_run(
     if len(run_df) == 0:
         return run_df.copy()
 
-    df, _ = sanitize.drop_runner_footprint(run_df.copy(), log_path=runner_log_path)
+    df, _ = drop_v2_harness_footprint(run_df.copy(), log_path=runner_log_path)
     sanitize.assert_clean(df, report_path=sanitization_report)
 
     hash_idx = baseline_index["hash_index"] if "hash_index" in baseline_index else baseline_index

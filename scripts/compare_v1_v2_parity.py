@@ -17,6 +17,8 @@ import pandas as pd
 
 from src import config
 from src.data import features as F
+from src.v2.offline_extractor import extract_from_qcow2, is_v2_harness_footprint_record, write_outputs
+from src.v2.pilot_staging import build_clean_parity_stage_iso
 
 EXACT_MATCH_FEATURES: tuple[str, ...] = (
     "artifact_type",
@@ -50,10 +52,54 @@ def _load_records(path: str | Path) -> list[dict[str, Any]]:
 
 
 def _is_parity_collector_scratch(rec: Mapping[str, Any], scratch_prefix: str = r"c:\collector_out_parity") -> bool:
+    if is_v2_harness_footprint_record(rec) is not None:
+        return True
     p = str(rec.get("path") or "").replace("/", "\\").lower()
     ak = str(rec.get("artifact_key") or "").replace("/", "\\").lower()
     pref = scratch_prefix.lower().rstrip("\\")
     return bool(pref and (p.startswith(pref) or pref in ak))
+
+
+def extract_v1_live_json_from_qcow2(
+    qcow2_path: str | Path,
+    guest_json_path: str = r"c:\collector_out_parity\artifacts.json",
+    out_json_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Read `C:\\collector_out_parity\\artifacts.json` directly from a closed QCOW2 overlay in user space (zero SSH)."""
+    from dissect.target import Target  # type: ignore
+
+    qpath = Path(qcow2_path)
+    t = Target.open(str(qpath))
+    try:
+        gp = t.fs.path(guest_json_path)
+        if not gp.exists():
+            raise FileNotFoundError(
+                f"Guest v1 collector output {guest_json_path!r} not found inside {qpath}. "
+                "Ensure the clean parity boot ran with the DFIR_STAGE parity ISO (--build-parity-iso) and shut down cleanly."
+            )
+        raw_bytes = gp.open("rb").read()
+    finally:
+        try:
+            t.target.close() if hasattr(t, "target") else None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        txt = raw_bytes.decode("utf-16")
+    else:
+        txt = raw_bytes.decode("utf-8-sig")
+
+    if out_json_path is not None:
+        op = Path(out_json_path)
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_text(txt, encoding="utf-8")
+
+    data = json.loads(txt)
+    if isinstance(data, dict) and "artifacts" in data:
+        return list(data["artifacts"])
+    if isinstance(data, list):
+        return list(data)
+    raise ValueError(f"Unexpected JSON structure in guest file {guest_json_path!r}")
 
 
 def compare_v1_v2_feature_parity(
@@ -206,15 +252,41 @@ def format_parity_markdown(report: Mapping[str, Any]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compare live v1 vs offline v2 clean-image feature parity.")
-    parser.add_argument("--v1-live-json", type=Path, required=True)
-    parser.add_argument("--v2-offline-jsonl", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Zero-SSH Clean-Image Live-v1 vs Offline-v2 Feature Parity Comparator.")
+    parser.add_argument("--build-parity-iso", type=Path, default=None, help="Build zero-SSH DFIR_STAGE parity ISO in this directory and exit")
+    parser.add_argument("--extract-v1-json-from-qcow2", type=Path, default=None, help="Closed QCOW2 overlay from which to extract C:\\collector_out_parity\\artifacts.json in user space")
+    parser.add_argument("--guest-json-path", default=r"c:\collector_out_parity\artifacts.json")
+    parser.add_argument("--base-cache-path", type=Path, default=None, help="Optional base-image cache path when running v2 offline extractor on --extract-v1-json-from-qcow2")
+    parser.add_argument("--v1-live-json", type=Path, default=Path("/tmp/parity_v1_live.json"))
+    parser.add_argument("--v2-offline-jsonl", type=Path, default=Path("/tmp/parity_v2_offline/artifacts.jsonl"))
     parser.add_argument("--out-md", type=Path, default=None)
     parser.add_argument("--out-json", type=Path, default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    v1_recs = _load_records(args.v1_live_json)
-    v2_recs = _load_records(args.v2_offline_jsonl)
+    if args.build_parity_iso is not None:
+        bundle = build_clean_parity_stage_iso(args.build_parity_iso)
+        print(json.dumps({k: str(v) for k, v in bundle.items()}, indent=2))
+        return 0
+
+    if args.extract_v1_json_from_qcow2 is not None:
+        v1_recs = extract_v1_live_json_from_qcow2(
+            args.extract_v1_json_from_qcow2,
+            guest_json_path=args.guest_json_path,
+            out_json_path=args.v1_live_json,
+        )
+        if not args.v2_offline_jsonl.exists():
+            v2_recs, v2_summary = extract_from_qcow2(
+                args.extract_v1_json_from_qcow2,
+                run_id="clean_parity_test",
+                base_cache_path=args.base_cache_path,
+            )
+            write_outputs(v2_recs, v2_summary, args.v2_offline_jsonl.parent)
+        else:
+            v2_recs = _load_records(args.v2_offline_jsonl)
+    else:
+        v1_recs = _load_records(args.v1_live_json)
+        v2_recs = _load_records(args.v2_offline_jsonl)
+
     rep = compare_v1_v2_feature_parity(v1_recs, v2_recs)
     md = format_parity_markdown(rep)
     print(md)

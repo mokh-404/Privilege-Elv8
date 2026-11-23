@@ -322,3 +322,66 @@ def build_stage_bundle(
         "iso": iso_path,
         "cdrom_xml": xml_path,
     }
+
+
+def build_clean_parity_stage_iso(
+    out_dir: str | Path,
+    collector_ps1_path: str | Path | None = None,
+    guest_out_dir: str = r"C:\collector_out_parity",
+    run_id: str = "clean_parity_test",
+    dwell_seconds: int = 30,
+) -> dict[str, Path]:
+    """Build a zero-SSH read-only `DFIR_STAGE` ISO that runs `Collect-Artifacts.ps1` inside the clean guest.
+
+    When attached to a clean disposable overlay, `\\DFIR-StageRunner` (`Invoke-StagePayload.ps1`) executes
+    `benign_workload.ps1`, which runs `Collect-Artifacts.ps1 -OutDir C:\\collector_out_parity -RunId ...`,
+    flushes `Write-VolumeCache -DriveLetter C`, and powers off the guest cleanly (`Stop-Computer -Force`).
+    The resulting `C:\\collector_out_parity\\artifacts.json` is then read directly out of the closed
+    `win11_overlay.qcow2` in user space via `scripts/compare_v1_v2_parity.py --extract-v1-json-from-qcow2`.
+    """
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    coll_path = Path(collector_ps1_path) if collector_ps1_path is not None else (repo_root / "collector" / "Collect-Artifacts.ps1")
+    if not coll_path.exists():
+        raise FileNotFoundError(f"Collect-Artifacts.ps1 not found at {coll_path}")
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    collector_bytes = coll_path.read_bytes()
+
+    parity_workload_ps1 = f"""# Zero-SSH Clean-Image Parity Workload (Invokes v1 Collect-Artifacts.ps1 into {guest_out_dir})
+param([string]$ProfileId = "clean_parity_v1_collector")
+$ErrorActionPreference = "Stop"
+$vol = Get-Volume | Where-Object {{ $_.FileSystemLabel -eq "DFIR_STAGE" -and $_.DriveLetter }} | Select-Object -First 1
+$stageRoot = if ($vol) {{ "$($vol.DriveLetter):\\" }} else {{ $PSScriptRoot }}
+$collectorScript = Join-Path $stageRoot "COLLECT.PS1"
+$outDir = "{guest_out_dir}"
+if (-not (Test-Path -LiteralPath $outDir)) {{
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+}}
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $collectorScript -OutDir $outDir -RunId "{run_id}"
+Write-VolumeCache -DriveLetter C -ErrorAction SilentlyContinue
+"""
+    spec = StageRunSpec(
+        run_id=run_id,
+        stratum="control",
+        benign_profile_id="clean_parity_v1_collector",
+        dwell_seconds=dwell_seconds,
+        execute_payload=False,
+    )
+    bundle = build_stage_bundle(
+        spec=spec,
+        out_dir=out_path,
+        benign_script_text=parity_workload_ps1,
+    )
+    # Re-build ISO including COLLECT.PS1 alongside run_manifest.json, Invoke-StagePayload.ps1, and benign_workload.ps1
+    iso_files = {
+        "run_manifest.json": bundle["manifest"].read_bytes(),
+        "Invoke-StagePayload.ps1": bundle["bootstrapper"].read_bytes(),
+        "benign_workload.ps1": bundle["benign_workload"].read_bytes(),
+        "COLLECT.PS1": collector_bytes,
+    }
+    bundle["iso"].write_bytes(_build_minimal_iso9660("DFIR_STAGE", iso_files))
+    coll_copy = out_path / "COLLECT.PS1"
+    coll_copy.write_bytes(collector_bytes)
+    bundle["collector_ps1"] = coll_copy
+    return bundle

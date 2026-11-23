@@ -57,9 +57,11 @@ Execute strictly **in this numbered order** (all host `sudo` operations executed
    Build `docs/v2/hardening/offline_extractor.Dockerfile` (`docker build`) and validate `06_unprivileged_container_runner.sh`.
 7. **Run Negative-Egress Verification (`NEG-01`..`NEG-10`) on Clean Boot:**
    Complete the entire table above using a clean control overlay only (zero malware).
-8. **Run Clean-Image Feature Parity Comparator (`docs/v2/FEATURE_PARITY_AUDIT.md` §4 & `scripts/compare_v1_v2_parity.py`):**
-   Compare live `Collect-Artifacts.ps1` vs offline extractor on the same clean overlay:
-   `.venv/bin/python scripts/compare_v1_v2_parity.py --v1-live-json /tmp/parity_v1_live.json --v2-offline-jsonl /tmp/parity_v2_offline/artifacts.jsonl --out-md docs/v2/CLEAN_IMAGE_PARITY_REPORT.md`
+8. **Run Zero-SSH Clean-Image Feature Parity Comparator (`docs/v2/FEATURE_PARITY_AUDIT.md` §4 & `scripts/compare_v1_v2_parity.py`):**
+   - Build the read-only `DFIR_STAGE` parity ISO (packages `collector/Collect-Artifacts.ps1` for `\DFIR-StageRunner`, zero SSH/scp):
+     `.venv/bin/python scripts/compare_v1_v2_parity.py --build-parity-iso /tmp/v2_parity_stage`
+   - Boot a clean disposable overlay `win11_overlay.qcow2` with `/tmp/v2_parity_stage/run_stage_clean_parity_test.iso` attached; once the guest writes `C:\collector_out_parity\artifacts.json` and powers off cleanly, run one command to extract `C:\collector_out_parity\artifacts.json` in user space, run the offline v2 extractor on the exact same closed overlay, and verify all 19 cold-disk features:
+     `.venv/bin/python scripts/compare_v1_v2_parity.py --extract-v1-json-from-qcow2 /var/lib/libvirt/images/win11_overlay.qcow2 --base-cache-path /var/lib/dfir-quarantine-vault/win11_base_cache.json.gz --out-md docs/v2/CLEAN_IMAGE_PARITY_REPORT.md`
 9. **Initialize Quarantine Vault & Verify Supervisor Approval Conditions (`OD-V2-07`):**
    Verify dedicated isolated host user account on the ASUS host (zero personal credentials/sensitive data/production workloads), run `./docs/v2/hardening/05_quarantine_vault_setup.sh init`, sign Gate 0 (`GATE0_SIGNED_OFF`), and verify `./docs/v2/hardening/05_quarantine_vault_setup.sh preflight` passes.
 10. **Formal Operator Sign-Off (Complete Before Downloading/Executing Pilot Samples):**

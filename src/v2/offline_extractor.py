@@ -72,6 +72,83 @@ _XML_DECL_RE = re.compile(r"^\s*<\?xml[^>]*\?>", re.I)
 _FORBIDDEN_PAYLOAD_KEYS = frozenset({"raw_bytes", "payload_bytes", "file_bytes", "binary_blob", "script_text", "raw_script_text"})
 _PERSIST_EXEC_TYPES: tuple[str, ...] = ("task", "service", "run_key", "wmi_subscription", "prefetch")
 
+V2_HARNESS_PATH_PREFIXES: tuple[str, ...] = (
+    "c:\\dfir-bootstrap",
+    "c:\\collector_out_parity",
+    "c:\\collector",
+    "c:\\dfir_stage",
+    "c:\\dfir_bake",
+)
+V2_HARNESS_TASK_NAMES: frozenset[str] = frozenset({
+    "dfir-stagerunner",
+    "\\dfir-stagerunner",
+})
+V2_HARNESS_SERVICE_NAMES: frozenset[str] = frozenset({
+    "sysmon",
+    "sysmon64",
+    "sysmondrv",
+})
+V2_HARNESS_BINARY_BASENAMES: frozenset[str] = frozenset({
+    "sysmon.exe",
+    "sysmon64.exe",
+    "sysmondrv.sys",
+    "invoke-stagepayload.ps1",
+    "install-v2basebootstrap.ps1",
+    "collect-artifacts.ps1",
+})
+
+
+def is_v2_harness_footprint_record(rec: Mapping[str, Any]) -> str | None:
+    """Return a deterministic exclusion reason if `rec` belongs to the v2 lab/collector/Sysmon harness, else None."""
+    at = str(rec.get("artifact_type") or "").strip().lower()
+    nm = str(rec.get("name") or "").strip().lower().replace("/", "\\")
+    ak = str(rec.get("artifact_key") or "").strip().lower().replace("/", "\\")
+    path = str(rec.get("path") or "").strip().lower().replace("/", "\\")
+    cmd = str(rec.get("command_line") or "").strip().lower().replace("/", "\\")
+    reg_k = str(rec.get("registry_key") or "").strip().lower().replace("/", "\\")
+    reg_v = str(rec.get("registry_value") or "").strip().lower().replace("/", "\\")
+    tname = str(rec.get("task_name") or "").strip().lower().replace("/", "\\")
+    sname = str(rec.get("service_name") or "").strip().lower()
+    pf_exe = str(rec.get("pf_executable_name") or "").strip().lower()
+
+    for pref in V2_HARNESS_PATH_PREFIXES:
+        if (
+            path == pref
+            or path.startswith(pref + "\\")
+            or (pref + "\\") in cmd
+            or (pref + "\\") in reg_v
+            or (pref + "\\") in ak
+        ):
+            return f"v2_harness_path:{pref}"
+
+    if at == "task" and (
+        nm in V2_HARNESS_TASK_NAMES
+        or tname in V2_HARNESS_TASK_NAMES
+        or tname.endswith("\\dfir-stagerunner")
+        or "dfir-stagerunner" in ak
+    ):
+        return "v2_harness_task:dfir-stagerunner"
+
+    if at == "service" and (nm in V2_HARNESS_SERVICE_NAMES or sname in V2_HARNESS_SERVICE_NAMES):
+        return f"v2_harness_service:{sname or nm}"
+
+    if reg_k and any(
+        reg_k.endswith(f"\\services\\{svc}") or f"\\services\\{svc}\\" in reg_k
+        for svc in V2_HARNESS_SERVICE_NAMES
+    ):
+        return "v2_harness_service_reg:sysmon"
+
+    base_path_nm = F.path_basename(path) if path else ""
+    if (
+        nm in V2_HARNESS_BINARY_BASENAMES
+        or base_path_nm in V2_HARNESS_BINARY_BASENAMES
+        or pf_exe in V2_HARNESS_BINARY_BASENAMES
+        or (at == "prefetch" and any(nm.startswith(b + "-") for b in ("sysmon.exe", "sysmon64.exe")))
+    ):
+        return f"v2_harness_binary:{base_path_nm or pf_exe or nm}"
+
+    return None
+
 
 def compute_head_histogram(data: bytes | bytearray) -> list[int]:
     """Return 256-bin byte frequency counts strictly over the leading 1 MiB."""
@@ -1705,6 +1782,23 @@ def extract_from_qcow2(
                 file_entries=merged_entries,
             )
 
+        kept_records: list[dict[str, Any]] = []
+        dropped_harness: list[dict[str, Any]] = []
+        for rec in records:
+            drop_reason = is_v2_harness_footprint_record(rec)
+            if drop_reason is not None:
+                dropped_harness.append({
+                    "run_id": rec.get("run_id", run_id),
+                    "artifact_type": rec.get("artifact_type"),
+                    "artifact_key": rec.get("artifact_key"),
+                    "name": rec.get("name"),
+                    "path": rec.get("path"),
+                    "drop_reason": drop_reason,
+                })
+            else:
+                kept_records.append(rec)
+        records = kept_records
+
         elapsed = round(time.monotonic() - t0, 3)
         df = pd.DataFrame(records)
         summary = summarize_extraction_and_refgraph(df, disk_id=run_id)
@@ -1718,6 +1812,8 @@ def extract_from_qcow2(
             "base_cache_built": bool(build_base_cache and base_cache_path is not None),
             "base_cache_hits": int(base_cache_hits),
             "base_cache_misses": int(base_cache_misses),
+            "v2_harness_footprint_dropped_count": len(dropped_harness),
+            "v2_harness_footprint_dropped": dropped_harness,
         })
         return records, summary
     finally:
@@ -1733,6 +1829,7 @@ def extract_from_fixture(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Validate and enrich synthetic offline fixture records using identical user-space rules."""
     validated: list[dict[str, Any]] = []
+    dropped_harness: list[dict[str, Any]] = []
     for raw_r in fixture_records:
         rec = dict(raw_r)
         rec.setdefault("run_id", run_id)
@@ -1747,11 +1844,25 @@ def extract_from_fixture(
                 if ext not in _SIP_EXTS or (rec.get("file_size") or 0) == 0:
                     rec["signature_status"] = "UnknownError"
         rec["record_sha256"] = _format_record_hash(rec)
-        validated.append(validate_extracted_record(rec))
+        vrec = validate_extracted_record(rec)
+        drop_reason = is_v2_harness_footprint_record(vrec)
+        if drop_reason is not None:
+            dropped_harness.append({
+                "run_id": vrec.get("run_id", run_id),
+                "artifact_type": vrec.get("artifact_type"),
+                "artifact_key": vrec.get("artifact_key"),
+                "name": vrec.get("name"),
+                "path": vrec.get("path"),
+                "drop_reason": drop_reason,
+            })
+        else:
+            validated.append(vrec)
 
     df = pd.DataFrame(validated)
     summary = summarize_extraction_and_refgraph(df, disk_id=run_id)
     summary["extractor_version"] = EXTRACTOR_VERSION
+    summary["v2_harness_footprint_dropped_count"] = len(dropped_harness)
+    summary["v2_harness_footprint_dropped"] = dropped_harness
     return validated, summary
 
 
@@ -1829,7 +1940,13 @@ def write_outputs(records: Sequence[Mapping[str, Any]], summary: Mapping[str, An
         **summary,
     }
     man_path = write_json(manifest, out_dir / "extraction_manifest.json")
-    return {"jsonl": jsonl_path, "parquet": pq_path, "manifest": man_path}
+    dropped_rows = list(summary.get("v2_harness_footprint_dropped") or [])
+    dropped_csv = out_dir / "v2_runner_footprint_dropped.csv"
+    pd.DataFrame(
+        dropped_rows,
+        columns=["run_id", "artifact_type", "artifact_key", "name", "path", "drop_reason"],
+    ).to_csv(dropped_csv, index=False)
+    return {"jsonl": jsonl_path, "parquet": pq_path, "manifest": man_path, "dropped_csv": dropped_csv}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

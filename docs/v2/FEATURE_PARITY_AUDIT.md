@@ -61,27 +61,31 @@ All three Step F0 feature-parity recommendations below are **`confirmed by Mokh 
 
 ---
 
-## 4. Clean-Image Parity-Test Procedure (For Mokh to Run Later — DO NOT RUN HERE)
+## 4. Clean-Image Parity-Test Procedure (Zero-SSH / Zero-`scp` Workflow — For Mokh to Run Later)
 
-Execute this verification on **one clean control boot** before Pilot Stage A begins:
+Because Step 0 ([`hardening/00_bake_v2_base_image.sh`](hardening/00_bake_v2_base_image.sh)) disables `sshd` inside `win11_base.qcow2` and Step 2 ([`hardening/01_firewall_win11_isolated.sh`](hardening/01_firewall_win11_isolated.sh)) enforces default-DROP on `virbr1`, this parity check operates with **zero live SSH and zero `scp`** on **one clean control boot** before Pilot Stage A begins:
 
-1. **Snapshot Clean Overlay (VM Running, No Malware):**
-   - Boot a fresh disposable `win11_overlay.qcow2` from pristine `win11_base.qcow2` (`sha256sum` recorded before).
-   - Inside the clean guest (via SSH), run the v1 live collector into a temporary directory **outside** `C:\` scan contamination (e.g. `powershell -File C:\collector\Collect-Artifacts.ps1 -OutDir C:\collector_out_parity`).
-   - Copy `C:\collector_out_parity\artifacts.json` off to `/tmp/parity_v1_live.json`, then cleanly shut down / `sudo virsh -c qemu:///system destroy win11` **without** deleting `win11_overlay.qcow2`.
-2. **Offline Extraction of the Exact Same Closed Overlay:**
-   - Run the unprivileged container offline extractor (`Step D` / `Step F`) read-only on `/var/lib/libvirt/images/win11_overlay.qcow2` -> `/tmp/parity_v2_offline/artifacts.jsonl`.
-   - Delete `win11_overlay.qcow2` and verify `sha256sum /var/lib/libvirt/images/win11_base.qcow2` is unchanged.
-3. **Per-Feature Automated Comparison & Acceptance Thresholds (`scripts/compare_v1_v2_parity.py`):**
-   Run the automated comparator script:
+1. **Build the Read-Only Zero-SSH Parity ISO (`DFIR_STAGE`):**
+   ```bash
+   .venv/bin/python scripts/compare_v1_v2_parity.py --build-parity-iso /tmp/v2_parity_stage
+   ```
+   *(Packages `collector/Collect-Artifacts.ps1` into `/tmp/v2_parity_stage/run_stage_clean_parity_test.iso` so `\DFIR-StageRunner` automatically runs `Collect-Artifacts.ps1 -OutDir C:\collector_out_parity -RunId clean_parity_test`, flushes `C:`, and shuts down the guest cleanly via `Stop-Computer -Force`).*
+2. **Boot Clean Disposable Overlay With the Parity ISO Attached (No Malware, Zero SSH):**
+   - Create a fresh disposable `win11_overlay.qcow2` from sealed `win11_base.qcow2` (`sha256sum` verified before).
+   - Attach `/tmp/v2_parity_stage/run_stage_clean_parity_test.iso` as a read-only CD-ROM and start `win11` under `04_watchdog_and_base_hash.sh`.
+   - When `\DFIR-StageRunner` finishes writing `C:\collector_out_parity\artifacts.json`, the guest powers off cleanly (or is closed by `virsh destroy win11`) **without** deleting `win11_overlay.qcow2`.
+3. **One-Command User-Space Extraction & Per-Feature Parity Comparison (`scripts/compare_v1_v2_parity.py`):**
+   Run the automated comparator script directly against the closed `win11_overlay.qcow2`:
    ```bash
    .venv/bin/python scripts/compare_v1_v2_parity.py \
+       --extract-v1-json-from-qcow2 /var/lib/libvirt/images/win11_overlay.qcow2 \
+       --base-cache-path /var/lib/dfir-quarantine-vault/win11_base_cache.json.gz \
        --v1-live-json /tmp/parity_v1_live.json \
        --v2-offline-jsonl /tmp/parity_v2_offline/artifacts.jsonl \
        --out-md docs/v2/CLEAN_IMAGE_PARITY_REPORT.md \
        --out-json /tmp/parity_report.json
    ```
-   which joins matched records on normalized `artifact_key` across `/tmp/parity_v1_live.json` (excluding `artifact_type == "process"` and `C:\collector_out_parity`) and `/tmp/parity_v2_offline/artifacts.jsonl`, computes `features.row_features` on both, and checks:
+   *(Reads `C:\collector_out_parity\artifacts.json` directly out of `win11_overlay.qcow2` in user space via `dissect.target` into `/tmp/parity_v1_live.json`, runs `src/v2/offline_extractor.py` on the exact same closed overlay into `/tmp/parity_v2_offline/artifacts.jsonl`, deterministically filters v2 harness footprint items `\DFIR-StageRunner`, `C:\DFIR-Bootstrap\*`, `C:\collector_out_parity\*`, and `Sysmon64`/`SysmonDrv` into `v2_runner_footprint_dropped.csv`, joins matched records on normalized `artifact_key`, computes `features.row_features` on both, and checks all thresholds below before you delete `win11_overlay.qcow2` and verify `sha256sum /var/lib/libvirt/images/win11_base.qcow2`):*
    - **Exact-match features** (`ext_class`, `registry_location_class`, `name_length`, `name_entropy`, `file_size_log`, `has_double_extension`, `has_encoded_flag`, `has_url_or_ip`, `has_lolbin`, `has_hidden_attr`, `autostart_flag`): **`100%` exact equality** (`|diff| <= 1e-6` on floats for shared non-missing rows).
    - **`file_entropy`** (for rows non-null in both): **`|v2 - v1| <= 1e-6` bits** on `100%` of shared files.
    - **`signature_state`**: **`>= 98%` exact agreement** across shared SIP/non-SIP files; log every discrepancy for catalog `.cat` vs PE root trust debugging.
