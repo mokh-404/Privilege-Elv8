@@ -30,11 +30,13 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.utils.repro import utc_now_iso, write_json
 from src.v2.pilot_staging import (
+    ALLOWED_FAMILIES,
     FORBIDDEN_MALWARE_FAMILIES_AND_TAGS,
     PilotStagingError,
     StageRunSpec,
     assert_allowed_malware_policy,
     check_forbidden_malware_policy,
+    normalize_family_slug,
     read_vault_payload_in_memory,
     validate_stage_run_spec,
 )
@@ -43,7 +45,8 @@ MALWAREBAZAAR_API_URL = "https://mb-api.abuse.ch/api/v1/"
 DEFAULT_VAULT_ROOT = Path.home() / ".quarantine_vault_dfir_v2"
 DEFAULT_SETUP_SCRIPT = _REPO_ROOT / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
 
-# Priority non-destructive Windows PE categories & family tags (ZERO ransomware, wipers, or worms).
+# Priority non-destructive Windows PE categories & family tags (ZERO ransomware, wipers, or worms;
+# njrat/bladabindi/qakbot/emotet/trickbot excluded pending supervisor decision).
 CATEGORY_SEARCH_TAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("stealer", (
         "RedLine", "LummaC2", "Lumma", "AgentTesla", "Vidar", "Raccoon", "Formbook", "XLoader",
@@ -51,7 +54,7 @@ CATEGORY_SEARCH_TAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Aurora", "PhoenixKeylogger", "MassLogger",
     )),
     ("rat", (
-        "AsyncRAT", "RemcosRAT", "NjRAT", "QuasarRAT", "DcRAT", "VenomRAT", "NanoCore",
+        "AsyncRAT", "RemcosRAT", "QuasarRAT", "DcRAT", "VenomRAT", "NanoCore",
         "DarkComet", "OrcusRAT", "BitRAT", "WarzoneRAT", "AveMaria", "PhantomRAT", "PoisonIvy",
     )),
     ("loader", (
@@ -62,7 +65,7 @@ CATEGORY_SEARCH_TAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "XMRig", "xmrig", "SilentCryptoMiner", "ClipBanker", "LaplasClipper", "coinminer",
     )),
     ("trojan_installer", (
-        "CobaltStrike", "NetWire", "Pony", "Emotet", "TrickBot", "Qakbot", "IcedID",
+        "CobaltStrike", "NetWire", "Pony", "IcedID",
         "BuerLoader", "ZLoader", "exe", "persistence",
     )),
 )
@@ -83,7 +86,6 @@ _PERSISTENCE_HINT_TOKENS = (
     "amadey",
     "remcos",
     "asyncrat",
-    "njrat",
     "quasar",
     "redline",
     "lumma",
@@ -299,7 +301,7 @@ def select_pilot_families(
 
     ranked_by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for cat, items in candidates_by_category.items():
-        if check_forbidden_malware_policy(sample_category=cat) is not None:
+        if check_forbidden_malware_policy(sample_category=cat, require_allowlist=False) is not None:
             continue
         for raw in items:
             sha = str(raw.get("sha256_hash") or raw.get("sha256") or "").lower().strip()
@@ -307,14 +309,15 @@ def select_pilot_families(
                 continue
             if not _is_windows_pe_candidate(raw):
                 continue
-            fam = canonical_family_slug(raw.get("signature"), raw.get("tags"))
-            if fam == "unknown_family":
+            fam = normalize_family_slug(canonical_family_slug(raw.get("signature"), raw.get("tags")))
+            if not fam or fam == "unknownfamily" or fam not in ALLOWED_FAMILIES:
                 continue
             if check_forbidden_malware_policy(
                 sample_family=fam,
                 sample_category=cat,
                 tags=raw.get("tags") or (),
                 raw_signature=raw.get("signature"),
+                require_allowlist=True,
             ) is not None:
                 continue
             cluster_id = assign_near_dup_cluster(raw)

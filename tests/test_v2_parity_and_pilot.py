@@ -23,11 +23,16 @@ from src.v2.offline_extractor import (
     write_outputs,
 )
 from src.v2.pilot_staging import (
+    ALLOWED_FAMILIES,
+    FORBIDDEN_MALWARE_FAMILIES_AND_TAGS,
+    FORBIDDEN_SUBSTRING_STEMS,
     PilotStagingError,
     StageRunSpec,
     assert_allowed_malware_policy,
     build_clean_parity_stage_iso,
     build_dormant_batch_bundle,
+    check_forbidden_malware_policy,
+    normalize_family_slug,
     validate_stage_run_spec,
 )
 from src.v2.run_stage_a_pilot import (
@@ -243,7 +248,7 @@ def test_stage_a_pilot_orchestrator_gate0_od_v2_20_and_power_calibration(tmp_pat
     ctrl_df = pd.DataFrame(ctrl_rows)
 
     pilot_runs = []
-    families = ["fam_one", "fam_two", "fam_three", "fam_four"]
+    families = ["redline", "asyncrat", "smokeloader", "xmrig"]
     for idx, fam in enumerate(families):
         sha = hashlib.sha256(f"sample_{fam}".encode()).hexdigest()
         pair_id = f"pair_{fam}"
@@ -616,6 +621,39 @@ def _make_aes256_zip(tmp_path: Path, name: str, raw: bytes) -> Path:
 def test_forbidden_malware_policy_and_dll_pe_rejection(tmp_path):
     from scripts.v2_curate_vault_manifest import curate_pilot_vault_and_batch, validate_standalone_runnable_exe_pe
 
+    # Allowlist invariants: disjoint from blocklist, zero forbidden stems, excludes pending grey-zone families
+    assert ALLOWED_FAMILIES.isdisjoint(FORBIDDEN_MALWARE_FAMILIES_AND_TAGS)
+    assert all(stem not in fam for fam in ALLOWED_FAMILIES for stem in FORBIDDEN_SUBSTRING_STEMS)
+    pending_decision = {"njrat", "bladabindi", "qakbot", "emotet", "trickbot"}
+    assert pending_decision.isdisjoint(ALLOWED_FAMILIES | FORBIDDEN_MALWARE_FAMILIES_AND_TAGS)
+    for grey_fam in pending_decision:
+        assert check_forbidden_malware_policy(sample_family=grey_fam) is not None
+
+    # Fail-closed on empty/blank metadata and unknown non-allowlisted families
+    assert check_forbidden_malware_policy() is not None
+    assert check_forbidden_malware_policy(sample_family=None, sample_category="stealer", tags=()) is not None
+    assert check_forbidden_malware_policy(sample_family="   ", sample_category=None, tags=("persist",)) is not None
+    assert check_forbidden_malware_policy(sample_family="unknown_custom_rat", sample_category="rat") is not None
+    with pytest.raises(PilotStagingError, match="fail-closed"):
+        assert_allowed_malware_policy(sample_family=None, sample_category=None, tags=())
+
+    # 'Ransom.Win32.X' rejected across signature, family, or tags
+    for sig_val in ("Ransom.Win32.X", "Ransom.Win32.LockBit"):
+        assert check_forbidden_malware_policy(raw_signature=sig_val) is not None
+        assert check_forbidden_malware_policy(sample_family="redline", tags=(sig_val,)) is not None
+
+    # Whole-token ransomware + worm additions blocked (as tokens) without false substring matches
+    new_whole_tokens = (
+        "play", "lynx", "chaos", "cuba", "mimic", "blackbyte", "hellokitty", "lorenz",
+        "nokoyawa", "xorist", "locky", "filecoder", "thanos", "trigona", "ransomhub",
+        "phorpiex", "dorkbot", "raspberryrobin", "blackshades", "lemonduck", "tofsee", "bondat",
+    )
+    for tok in new_whole_tokens:
+        with pytest.raises(PilotStagingError, match="BLOCKED"):
+            assert_allowed_malware_policy(sample_family=tok, sample_category="loader", tags=())
+        with pytest.raises(PilotStagingError, match="BLOCKED"):
+            assert_allowed_malware_policy(sample_family="redline", sample_category="stealer", tags=(tok,))
+
     # Hard blocklist covers ransomware, wipers, and worms
     for bad_fam, bad_cat, bad_tags in (
         ("lockbit", "stealer", ()),
@@ -645,9 +683,15 @@ def test_forbidden_malware_policy_and_dll_pe_rejection(tmp_path):
                 )
             )
 
-    # Allowed families and "desktop" substring MUST pass cleanly
-    assert_allowed_malware_policy(sample_family="redline", sample_category="stealer", tags=("desktop_stealer",))
+    # Allowlisted families + benign words containing whole-token blocks as substrings ("desktop", "display", "replay") pass cleanly
+    assert_allowed_malware_policy(
+        sample_family="redline",
+        sample_category="stealer",
+        tags=("desktop_stealer", "display_helper", "replay_log"),
+    )
     assert_allowed_malware_policy(sample_family="asyncrat", sample_category="rat", tags=("persist",))
+    assert normalize_family_slug("Lumma-C2") == "lummac2"
+    assert_allowed_malware_policy(sample_family="Lumma-C2", sample_category="stealer", tags=("persist",))
 
     # pefile standalone runnable .exe gate rejects DLLs and non-PE bytes
     exe_bytes = _synth_unsigned_pe_bytes(11, 16384, is_dll=False)
@@ -838,8 +882,9 @@ def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
             sleep_fn=lambda _s: None,
         )
 
-    # 2. Canary run executes with arm-watchdog < start, verify-base-fast, and writes CANARY_PASSED
+    # 2. Canary run executes with DETONATE prompt (executed only), arm-watchdog < start, verify-base-fast, and writes bound CANARY_PASSED
     canary_cmds: list[list[str]] = []
+    prompts_seen: list[str] = []
 
     def _canary_cmd(cmd: list[str], _env=None) -> int:
         canary_cmds.append(list(cmd))
@@ -858,6 +903,8 @@ def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
             )
         return 0
 
+    clean_git = lambda _r: {"git_head": "a" * 40, "git_dirty": False}
+
     execute_stage_a_pilot_batch(
         batch_runs=canary_batch,
         runs_out_dir=runs_dir,
@@ -868,19 +915,23 @@ def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
         full_base_hash_every=25,
         run_cmd=_canary_cmd,
         sleep_fn=lambda _s: None,
+        git_state_fn=clean_git,
+        confirm_input_fn=lambda p: prompts_seen.append(p) or "DETONATE",
     )
+    assert len(prompts_seen) == 1 and "c_exec" in prompts_seen[0]
     assert stamp_file.is_file()
-    assert json.loads(stamp_file.read_text(encoding="utf-8"))["status"] == "PASS"
+    stamp_obj = json.loads(stamp_file.read_text(encoding="utf-8"))
+    assert stamp_obj["status"] == "PASS"
+    assert stamp_obj["git_head"] == "a" * 40 and stamp_obj["git_dirty"] is False
+    assert stamp_obj["ttl_seconds"] == 86400
+    assert len(stamp_obj["batch_json_sha256"]) == 64 and len(stamp_obj["base_image_sha256"]) == 64
     arm_idx = next(i for i, c in enumerate(canary_cmds) if "arm-watchdog" in c)
     start_idx = next(i for i, c in enumerate(canary_cmds) if c[-2:] == ["start", "win11"])
     assert arm_idx < start_idx
     assert any("verify-base-fast" in c for c in canary_cmds)
 
-    # 3. After CANARY_PASSED, require_canary_stamp=True allows execution & resume skips completed runs
+    # 3. After CANARY_PASSED, require_canary_stamp=True allows execution on matching batch & resume skips completed runs
     pipe_cmds: list[list[str]] = []
-    batch_b = [
-        {"spec": StageRunSpec(run_id="pipe_01", stratum="control", benign_profile_id="B_dev_04", dwell_seconds=30).__dict__, "vault_file": None},
-    ]
 
     def _pipe_cmd(cmd: list[str], _env=None) -> int:
         pipe_cmds.append(list(cmd))
@@ -888,39 +939,43 @@ def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
 
     out_dir_pipe = tmp_path / "pipe_runs"
     res_pipe = execute_stage_a_pilot_batch(
-        batch_runs=batch_b,
+        batch_runs=canary_batch[:1],
         runs_out_dir=out_dir_pipe,
         overlay_qcow2=tmp_path / "imgs" / "win11_overlay.qcow2",
         vault_root=vault_dir,
         inetsim_wait_seconds=0,
         require_canary_stamp=True,
         canary_stamp_path=stamp_file,
+        batch_json_sha256=stamp_obj["batch_json_sha256"],
         enable_pipelining=True,
         run_cmd=_pipe_cmd,
         sleep_fn=lambda _s: None,
+        git_state_fn=clean_git,
     )
     assert len(res_pipe) == 1
     assert any(
-        len(c) >= 4 and c[:3] == ["sudo", "mv", "-f"] and c[4].endswith("win11_overlay_pipe_01.qcow2")
+        len(c) >= 4 and c[:3] == ["sudo", "mv", "-f"] and c[4].endswith("win11_overlay_c_ctrl.qcow2")
         for c in pipe_cmds
     )
     assert any(
-        c[0].endswith("06_unprivileged_container_runner.sh") and c[1].endswith("win11_overlay_pipe_01.qcow2")
+        c[0].endswith("06_unprivileged_container_runner.sh") and c[1].endswith("win11_overlay_c_ctrl.qcow2")
         for c in pipe_cmds
     )
 
-    # Resume must skip already-completed pipe_01
+    # Resume must skip already-completed c_ctrl
     re_cmds: list[list[str]] = []
     res_resume = execute_stage_a_pilot_batch(
-        batch_runs=batch_b,
+        batch_runs=canary_batch[:1],
         runs_out_dir=out_dir_pipe,
         vault_root=vault_dir,
         inetsim_wait_seconds=0,
         require_canary_stamp=True,
         canary_stamp_path=stamp_file,
+        batch_json_sha256=stamp_obj["batch_json_sha256"],
         resume=True,
         run_cmd=lambda c, _e=None: re_cmds.append(list(c)) or 0,
         sleep_fn=lambda _s: None,
+        git_state_fn=clean_git,
     )
     assert res_resume == [] and re_cmds == []
 
@@ -944,7 +999,7 @@ def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
     eg_dir = tmp_path / "eg_fail_runs"
     with pytest.raises(RuntimeError, match="Unauthorized virbr1 egress"):
         execute_stage_a_pilot_batch(
-            batch_runs=[batch_b[0]],
+            batch_runs=canary_batch[:1],
             runs_out_dir=eg_dir,
             vault_root=vault_dir,
             inetsim_wait_seconds=0,
@@ -980,3 +1035,162 @@ def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
     assert len(canary_slice) == 3
     assert [r["spec"]["stratum"] for r in canary_slice] == ["control", "executed", "dormant"]
     assert canary_slice[1]["spec"]["pair_group_id"] == canary_slice[2]["spec"]["pair_group_id"]
+
+
+def test_canary_stamp_full_binding_expiry_and_detonate_prompt(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    import json
+    import os
+
+    repo = Path(__file__).resolve().parent.parent
+    setup_script = repo / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    vault_dir = tmp_path / "vault_canary_bind"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
+    marker = vault_dir / "GATE0_SIGNED_OFF"
+    marker.write_text(
+        "SIGNED_BY=Mokh\nDATE=2026-11-25\nSUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\nDEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o400)
+
+    pe_bytes = _synth_unsigned_pe_bytes(404, 16384, is_dll=False)
+    pe_sha = hashlib.sha256(pe_bytes).hexdigest()
+    zpath = _make_aes256_zip(tmp_path, "bind_sample", pe_bytes)
+    batch_file = tmp_path / "batch.json"
+
+    batch = [
+        {"spec": StageRunSpec(run_id="cb_ctrl", stratum="control", benign_profile_id="B_dev_01", dwell_seconds=30).__dict__, "vault_file": None},
+        {
+            "spec": StageRunSpec(
+                run_id="cb_exec",
+                stratum="executed",
+                benign_profile_id="B_dev_02",
+                dwell_seconds=30,
+                staging_target_path=r"C:\Users\Public\b.exe",
+                sample_sha256=pe_sha,
+                sample_family="redline",
+                pair_group_id="p_bind",
+                execute_payload=True,
+                gate0_signed_off=True,
+                dedicated_host_user_verified=True,
+            ).__dict__,
+            "vault_file": str(zpath),
+        },
+        {
+            "spec": StageRunSpec(
+                run_id="cb_dorm",
+                stratum="dormant",
+                benign_profile_id="B_dev_03",
+                dwell_seconds=30,
+                staging_target_path=r"C:\Users\Public\b.exe",
+                sample_sha256=pe_sha,
+                sample_family="redline",
+                pair_group_id="p_bind",
+                execute_payload=False,
+                gate0_signed_off=True,
+                dedicated_host_user_verified=True,
+            ).__dict__,
+            "vault_file": str(zpath),
+        },
+    ]
+    batch_file.write_text(json.dumps({"runs": batch}, indent=2), encoding="utf-8")
+
+    # 1. Non-'DETONATE' responses MUST abort BEFORE first executed canary boot starts inetsim-vm or win11
+    for bad_reply in ("yes", "detonate", ""):
+        cmds_abort: list[list[str]] = []
+        with pytest.raises(PilotStagingError, match="DETONATE"):
+            execute_stage_a_pilot_batch(
+                batch_runs=batch,
+                runs_out_dir=tmp_path / f"abort_{bad_reply or 'empty'}",
+                vault_root=vault_dir,
+                batch_json_path=batch_file,
+                inetsim_wait_seconds=0,
+                canary_mode=True,
+                run_cmd=lambda c, _e=None: cmds_abort.append(list(c)) or 0,
+                sleep_fn=lambda _s: None,
+                git_state_fn=lambda _r: {"git_head": "b" * 40, "git_dirty": False},
+                confirm_input_fn=lambda _p: bad_reply,
+            )
+        # Only cb_ctrl (control) could boot win11; cb_exec never started inetsim-vm or a second win11
+        assert not any(len(c) >= 2 and c[-2:] == ["start", "inetsim-vm"] for c in cmds_abort)
+        assert sum(1 for c in cmds_abort if len(c) >= 2 and c[-2:] == ["start", "win11"]) == 1
+
+    # 2. Successful canary writes bound stamp
+    t0 = datetime(2026, 11, 26, 1, 0, 0, tzinfo=timezone.utc)
+    runs_dir = tmp_path / "bind_runs"
+    stamp_file = runs_dir / "CANARY_PASSED"
+
+    def _run_ok(cmd: list[str], _env=None) -> int:
+        if cmd and cmd[0].endswith("06_unprivileged_container_runner.sh"):
+            rdir = Path(cmd[2])
+            rid = cmd[3]
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "extraction_manifest.json").write_text(
+                json.dumps({
+                    "run_id": rid,
+                    "total_records": 4414,
+                    "sysmon_evtx_present": (rid == "cb_exec"),
+                    "sysmon_events_count": 7 if rid == "cb_exec" else 0,
+                }),
+                encoding="utf-8",
+            )
+        return 0
+
+    execute_stage_a_pilot_batch(
+        batch_runs=batch,
+        runs_out_dir=runs_dir,
+        vault_root=vault_dir,
+        batch_json_path=batch_file,
+        base_image_sha256="1" * 64,
+        inetsim_wait_seconds=0,
+        canary_mode=True,
+        canary_stamp_path=stamp_file,
+        run_cmd=_run_ok,
+        sleep_fn=lambda _s: None,
+        git_state_fn=lambda _r: {"git_head": "b" * 40, "git_dirty": False},
+        now_fn=lambda: t0,
+        confirm_input_fn=lambda _p: "DETONATE",
+    )
+
+    unattended_batch = [batch[1]]
+    common_kw = dict(
+        batch_runs=unattended_batch,
+        runs_out_dir=tmp_path / "unattended_out",
+        vault_root=vault_dir,
+        batch_json_path=batch_file,
+        base_image_sha256="1" * 64,
+        inetsim_wait_seconds=0,
+        require_canary_stamp=True,
+        canary_stamp_path=stamp_file,
+        run_cmd=_run_ok,
+        sleep_fn=lambda _s: None,
+        git_state_fn=lambda _r: {"git_head": "b" * 40, "git_dirty": False},
+        now_fn=lambda: t0 + timedelta(hours=1),
+    )
+
+    # 3. Mismatched batch JSON rejected
+    other_batch = tmp_path / "other_batch.json"
+    other_batch.write_text('{"runs": []}', encoding="utf-8")
+    with pytest.raises(PilotStagingError, match="batch_json_sha256 mismatch"):
+        execute_stage_a_pilot_batch(**{**common_kw, "batch_json_path": other_batch})
+
+    # 4. Mismatched base image hash rejected
+    with pytest.raises(PilotStagingError, match="base_image_sha256 mismatch"):
+        execute_stage_a_pilot_batch(**{**common_kw, "base_image_sha256": "2" * 64})
+
+    # 5. Mismatched git HEAD rejected
+    with pytest.raises(PilotStagingError, match="git_head mismatch"):
+        execute_stage_a_pilot_batch(**{**common_kw, "git_state_fn": lambda _r: {"git_head": "c" * 40, "git_dirty": False}})
+
+    # 6. Dirty working tree rejected
+    with pytest.raises(PilotStagingError, match="dirty"):
+        execute_stage_a_pilot_batch(**{**common_kw, "git_state_fn": lambda _r: {"git_head": "b" * 40, "git_dirty": True}})
+
+    # 7. Expired stamp (> 24h) rejected
+    with pytest.raises(PilotStagingError, match="EXPIRED"):
+        execute_stage_a_pilot_batch(**{**common_kw, "now_fn": lambda: t0 + timedelta(hours=24, seconds=1)})
+
+    # 8. Valid fresh clean matching stamp succeeds cleanly
+    ok_res = execute_stage_a_pilot_batch(**common_kw)
+    assert len(ok_res) == 1 and ok_res[0]["run_id"] == "cb_exec"

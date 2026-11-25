@@ -48,19 +48,21 @@ FORBIDDEN_MALWARE_FAMILIES_AND_TAGS: frozenset[str] = frozenset({
     "medusa", "medusalocker", "babuk", "hive", "ragnarlocker", "darkside", "blackmatter", "avaddon", "pysa",
     "rhysida", "bianlian", "qilin", "cactus", "8base", "snatch", "mallox", "zeppelin", "avoslocker",
     "teslacrypt", "jigsaw", "badrabbit", "petya", "samsam", "globeimposter", "scarab", "cryptolocker",
-    "cryptowall", "locker",
+    "cryptowall", "locker", "play", "lynx", "chaos", "cuba", "mimic", "blackbyte", "hellokitty",
+    "lorenz", "nokoyawa", "xorist", "locky", "filecoder", "thanos", "trigona", "ransomhub",
     # Wipers
     "wiper", "diskwiper", "mbrwiper", "notpetya", "hermeticwiper", "caddywiper", "whispergate",
     "isaacwiper", "acidrain", "swiftwiper", "doublezero", "shamoon", "disttrack", "olympicdestroyer",
     "killdisk", "stonedrill", "zerocleare", "dustman", "crywiper", "azov",
-    # Self-propagating worms / file-infectors
+    # Self-propagating worms / file-infectors (whole tokens)
     "worm", "usb_worm", "usbworm", "smb_worm", "smbworm", "networm", "conficker", "downadup",
     "sality", "virut", "ramnit", "stuxnet", "mydoom", "sobig", "blaster", "sasser", "nimda",
     "slammer", "wannamine", "eternalblue", "xworm", "brontok", "vobfus", "gamarue", "andromeda",
-    "jenxcus", "neshta", "parite", "expiro",
+    "jenxcus", "neshta", "parite", "expiro", "phorpiex", "dorkbot", "raspberryrobin", "blackshades",
+    "lemonduck", "tofsee", "bondat",
 })
 
-# Substring stems (excludes "stop" so benign tokens like "desktop" are never falsely flagged).
+# Substring stems (excludes whole-token blocks like "stop", "play", "lynx", "chaos" so benign words like "desktop"/"display" pass).
 FORBIDDEN_SUBSTRING_STEMS: tuple[str, ...] = (
     "ransom", "wiper", "worm", "lockbit", "wannacry", "notpetya", "hermeticwiper",
     "caddywiper", "whispergate", "conficker", "sality", "virut", "ramnit", "djvu",
@@ -68,9 +70,36 @@ FORBIDDEN_SUBSTRING_STEMS: tuple[str, ...] = (
     "blackbasta", "cryptolocker",
 )
 
+# Reviewed positive allowlist (normalized lowercase alphanumeric slugs).
+# Note: njrat / bladabindi / qakbot / emotet / trickbot are intentionally excluded pending supervisor review.
+ALLOWED_FAMILIES: frozenset[str] = frozenset({
+    # InfoStealers
+    "redline", "redlinestealer", "lummac2", "lumma", "lummastealer", "agenttesla", "vidar",
+    "raccoon", "raccoonstealer", "formbook", "xloader", "snakekeylogger", "lokibot",
+    "metastealer", "risepro", "stealc", "rhadamanthys", "aurora", "aurorastealer",
+    "phoenixkeylogger", "masslogger", "azorult", "arkei", "marsstealer", "predatorthethief",
+    "recordbreaker", "whitesnake",
+    # Non-worm RATs / Backdoors
+    "asyncrat", "remcos", "remcosrat", "quasar", "quasarrat", "dcrat", "venomrat",
+    "nanocore", "nanocorerat", "darkcomet", "orcus", "orcusrat", "bitrat",
+    "warzone", "warzonerat", "avemaria", "phantomrat", "poisonivy", "netwire",
+    "gh0st", "ghostrat", "lime", "limerat", "revenge", "revengerat", "cobaltstrike",
+    # Non-worm Loaders / Droppers
+    "smokeloader", "amadey", "privateloader", "guloader", "bumblebee", "systembc",
+    "purecrypter", "hijackloader", "latrodectus", "dbatloader", "modiloader", "bazarloader",
+    "buer", "buerloader", "zloader", "icedid", "matanbuchus", "pikabot", "darkgate", "pony",
+    # Coinminers / Clippers
+    "xmrig", "silentcryptominer", "clipbanker", "laplasclipper", "coinminer", "cryptobot",
+})
+
 
 class PilotStagingError(RuntimeError):
     """Raised when a staging request violates Gate 0, safety blocklist, or paired-stratum invariants."""
+
+
+def normalize_family_slug(raw: str | None) -> str:
+    """Normalize a family/signature string to lowercase ASCII alphanumeric characters."""
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
 
 
 def check_forbidden_malware_policy(
@@ -78,18 +107,23 @@ def check_forbidden_malware_policy(
     sample_category: str | None = None,
     tags: Sequence[str] = (),
     raw_signature: str | None = None,
+    *,
+    require_allowlist: bool = True,
 ) -> str | None:
-    """Return a block reason if metadata matches ransomware, wiper, or worm blocklists; else None."""
+    """Fail-closed policy check: enforce blocklist (ransomware/wiper/worm) and ALLOWED_FAMILIES allowlist."""
     fields: list[tuple[str, str]] = []
-    if sample_family:
+    if sample_family and str(sample_family).strip():
         fields.append(("sample_family", str(sample_family)))
-    if sample_category:
+    if sample_category and str(sample_category).strip():
         fields.append(("sample_category", str(sample_category)))
-    if raw_signature:
+    if raw_signature and str(raw_signature).strip():
         fields.append(("raw_signature", str(raw_signature)))
     for t in tags or ():
         if t is not None and str(t).strip():
             fields.append(("tag", str(t)))
+
+    if not fields:
+        return "Unlabeled malware policy metadata rejected (fail-closed: all family/category/tags/signature empty)"
 
     for fname, val in fields:
         low = val.strip().lower()
@@ -104,6 +138,17 @@ def check_forbidden_malware_policy(
             for stem in FORBIDDEN_SUBSTRING_STEMS:
                 if stem in cand:
                     return f"Forbidden malware policy match ({fname}={val!r}, stem={stem!r})"
+
+    if require_allowlist:
+        fam_source = sample_family if (sample_family and str(sample_family).strip()) else raw_signature
+        norm_fam = normalize_family_slug(fam_source)
+        if not norm_fam:
+            return "Unlabeled sample rejected (fail-closed: missing sample_family/raw_signature)"
+        if norm_fam not in ALLOWED_FAMILIES:
+            return (
+                f"Sample family {fam_source!r} (normalized={norm_fam!r}) is NOT in reviewed ALLOWED_FAMILIES"
+            )
+
     return None
 
 

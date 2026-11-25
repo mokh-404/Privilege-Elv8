@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -39,7 +44,7 @@ from src.v2.labeler_v2 import (
     label_dormant_run,
     label_executed_run,
 )
-from src.v2.offline_extractor import summarize_extraction_and_refgraph
+from src.v2.offline_extractor import GOLDEN_BASE_IMAGE_SHA256, summarize_extraction_and_refgraph
 from src.v2.pilot_staging import (
     PilotStagingError,
     StageRunSpec,
@@ -49,6 +54,10 @@ from src.v2.pilot_staging import (
 )
 from src.v2.stats_v2 import compute_lofo_table, cross_stratum_execution_delta
 from src.v2.training import run_nested_family_cv
+
+
+CANARY_STAMP_TTL_SECONDS = 24 * 3600
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.I)
 
 
 def build_create_overlay_command(base_qcow2: str | Path, overlay_qcow2: str | Path) -> list[str]:
@@ -189,12 +198,102 @@ def _parse_json_snapshot(raw_stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def compute_batch_json_sha256(
+    batch_json_path: str | Path | None = None,
+    batch_runs: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Return lowercase SHA-256 of the batch JSON file (or canonical serialized `batch_runs`)."""
+    if batch_json_path is not None:
+        p = Path(batch_json_path)
+        if not p.is_file():
+            raise PilotStagingError(f"Batch JSON file not found for SHA-256 binding: {p}")
+        return hashlib.sha256(p.read_bytes()).hexdigest().lower()
+
+    normalized: list[dict[str, Any]] = []
+    for entry in batch_runs or ():
+        e = dict(entry)
+        sp = e.get("spec")
+        if isinstance(sp, StageRunSpec):
+            e["spec"] = asdict(sp)
+        normalized.append(e)
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest().lower()
+
+
+def get_git_head_state(repo_root: str | Path) -> dict[str, Any]:
+    """Return `{'git_head': <commit_sha>, 'git_dirty': <bool>}` for `repo_root`."""
+    rpath = str(repo_root)
+    head_cp = subprocess.run(["git", "-C", rpath, "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head_cp.returncode != 0 or not head_cp.stdout.strip():
+        return {"git_head": "unknown", "git_dirty": True}
+    st_cp = subprocess.run(["git", "-C", rpath, "status", "--porcelain"], capture_output=True, text=True)
+    dirty = (st_cp.returncode != 0) or bool(st_cp.stdout.strip())
+    return {"git_head": head_cp.stdout.strip().lower(), "git_dirty": bool(dirty)}
+
+
+def resolve_base_image_sha256(
+    base_qcow2: str | Path,
+    hash_file: str | Path = "/var/lib/libvirt/images/v2_base_hashes.sha256",
+    explicit_base_sha256: str | None = None,
+) -> str:
+    """Resolve expected 64-hex SHA-256 for `base_qcow2` (explicit -> `HASH_FILE` -> `GOLDEN_BASE_IMAGE_SHA256`)."""
+    if explicit_base_sha256 is not None:
+        cand = str(explicit_base_sha256).strip().lower()
+        if not _SHA256_RE.match(cand):
+            raise PilotStagingError(f"Invalid explicit base_image_sha256: {explicit_base_sha256!r}")
+        return cand
+
+    hpath = Path(hash_file)
+    tgt_str = str(base_qcow2)
+    tgt_name = Path(base_qcow2).name
+    if hpath.is_file():
+        for line in hpath.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) != 2:
+                continue
+            digest, fname = parts[0].strip().lower(), parts[1].lstrip("*").strip()
+            if _SHA256_RE.match(digest) and (fname == tgt_str or Path(fname).name == tgt_name):
+                return digest
+    return GOLDEN_BASE_IMAGE_SHA256.lower()
+
+
+def _parse_utc_iso(raw: Any, field_name: str) -> datetime:
+    if not isinstance(raw, str) or not raw.strip():
+        raise PilotStagingError(f"BLOCKED (--canary gate): Canary stamp missing {field_name!r}")
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError as exc:
+        raise PilotStagingError(f"BLOCKED (--canary gate): Invalid {field_name!r} timestamp {raw!r}") from exc
+    if dt.tzinfo is None:
+        raise PilotStagingError(f"BLOCKED (--canary gate): Timezone-naive timestamp in {field_name!r}: {raw!r}")
+    return dt.astimezone(timezone.utc)
+
+
 def verify_canary_run_outputs(
     results_log: Sequence[Mapping[str, Any]],
     runs_out_dir: str | Path,
     stamp_path: str | Path,
+    *,
+    batch_json_sha256: str,
+    base_image_sha256: str,
+    git_head: str,
+    git_dirty: bool,
+    now_utc: datetime | None = None,
+    ttl_seconds: int = CANARY_STAMP_TTL_SECONDS,
 ) -> dict[str, Any]:
-    """Validate `--canary` outputs (control+dormant+executed, container manifests, Sysmon EVTX) & write stamp."""
+    """Validate `--canary` outputs (control+dormant+executed, Sysmon EVTX) & write cryptographically bound stamp."""
+    if not _SHA256_RE.match(str(batch_json_sha256 or "")):
+        raise PilotStagingError(f"CANARY FAILED: Invalid batch_json_sha256={batch_json_sha256!r}")
+    if not _SHA256_RE.match(str(base_image_sha256 or "")):
+        raise PilotStagingError(f"CANARY FAILED: Invalid base_image_sha256={base_image_sha256!r}")
+    if not git_head or not str(git_head).strip():
+        raise PilotStagingError("CANARY FAILED: Invalid git_head for canary stamp binding")
+    if int(ttl_seconds) <= 0:
+        raise PilotStagingError(f"CANARY FAILED: ttl_seconds must be positive, got {ttl_seconds}")
+
     out_root = Path(runs_out_dir)
     strata_seen = {str(r.get("stratum") or "") for r in results_log}
     missing_strata = [s for s in ("control", "dormant", "executed") if s not in strata_seen]
@@ -219,9 +318,17 @@ def verify_canary_run_outputs(
                 )
             exec_sysmon_total += int(man.get("sysmon_events_count") or 0)
 
+    verified_dt = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expires_dt = verified_dt + timedelta(seconds=int(ttl_seconds))
     stamp_payload = {
         "status": "PASS",
-        "verified_at_utc": utc_now_iso(),
+        "verified_at_utc": verified_dt.isoformat(),
+        "expires_at_utc": expires_dt.isoformat(),
+        "ttl_seconds": int(ttl_seconds),
+        "batch_json_sha256": str(batch_json_sha256).lower(),
+        "base_image_sha256": str(base_image_sha256).lower(),
+        "git_head": str(git_head).strip().lower(),
+        "git_dirty": bool(git_dirty),
         "runs_out_dir": str(out_root),
         "n_canary_runs": len(results_log),
         "run_ids": [r["run_id"] for r in results_log],
@@ -231,6 +338,93 @@ def verify_canary_run_outputs(
     sp.parent.mkdir(parents=True, exist_ok=True)
     sp.write_text(json.dumps(stamp_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return stamp_payload
+
+
+def validate_canary_stamp(
+    stamp_path: str | Path,
+    *,
+    expected_batch_sha256: str,
+    expected_base_sha256: str,
+    expected_git_head: str,
+    expected_git_dirty: bool,
+    now_utc: datetime | None = None,
+    ttl_seconds: int = CANARY_STAMP_TTL_SECONDS,
+    reject_dirty: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed validation of `CANARY_PASSED` stamp binding, git cleanliness, and 24h expiry."""
+    sp = Path(stamp_path)
+    if not sp.is_file():
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Required canary stamp missing at {sp}. "
+            "Run with --canary first before unattended malware execution."
+        )
+    try:
+        stamp_data = json.loads(sp.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise PilotStagingError(f"BLOCKED (--canary gate): Invalid canary stamp {sp}: {exc}") from exc
+    if not isinstance(stamp_data, dict):
+        raise PilotStagingError(f"BLOCKED (--canary gate): Canary stamp {sp} is not a JSON object.")
+
+    if stamp_data.get("status") != "PASS":
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Canary stamp status is {stamp_data.get('status')!r}, expected 'PASS'."
+        )
+
+    st_batch = str(stamp_data.get("batch_json_sha256") or "").strip().lower()
+    if not _SHA256_RE.match(st_batch) or st_batch != str(expected_batch_sha256).strip().lower():
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Canary stamp batch_json_sha256 mismatch "
+            f"(stamp={st_batch or 'missing'}, current={str(expected_batch_sha256).lower()}). Re-run --canary."
+        )
+
+    st_base = str(stamp_data.get("base_image_sha256") or "").strip().lower()
+    if not _SHA256_RE.match(st_base) or st_base != str(expected_base_sha256).strip().lower():
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Canary stamp base_image_sha256 mismatch "
+            f"(stamp={st_base or 'missing'}, current={str(expected_base_sha256).lower()}). Re-run --canary."
+        )
+
+    st_head = str(stamp_data.get("git_head") or "").strip().lower()
+    cur_head = str(expected_git_head or "").strip().lower()
+    if not st_head or st_head == "unknown" or cur_head == "unknown" or st_head != cur_head:
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Canary stamp git_head mismatch "
+            f"(stamp={st_head or 'missing'}, current={cur_head or 'missing'}). Commit & re-run --canary."
+        )
+
+    if not isinstance(stamp_data.get("git_dirty"), bool):
+        raise PilotStagingError("BLOCKED (--canary gate): Canary stamp missing boolean 'git_dirty' field.")
+    st_dirty = bool(stamp_data["git_dirty"])
+    if st_dirty != bool(expected_git_dirty):
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Git working tree dirty state changed since canary "
+            f"(stamp git_dirty={st_dirty}, current git_dirty={bool(expected_git_dirty)}). Re-run --canary."
+        )
+    if reject_dirty and (st_dirty or bool(expected_git_dirty)):
+        raise PilotStagingError(
+            "BLOCKED (--canary gate): Unattended malware runs refuse dirty git working trees "
+            f"(stamp git_dirty={st_dirty}, current git_dirty={bool(expected_git_dirty)}). Commit changes & re-run --canary."
+        )
+
+    verified_dt = _parse_utc_iso(stamp_data.get("verified_at_utc"), "verified_at_utc")
+    expires_dt = _parse_utc_iso(stamp_data.get("expires_at_utc"), "expires_at_utc")
+    cur_now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if verified_dt > cur_now + timedelta(seconds=60):
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Canary stamp verified_at_utc is in the future ({verified_dt.isoformat()})."
+        )
+    age_sec = (cur_now - verified_dt).total_seconds()
+    if age_sec > float(ttl_seconds) or cur_now > expires_dt:
+        raise PilotStagingError(
+            f"BLOCKED (--canary gate): Canary stamp EXPIRED (verified={verified_dt.isoformat()}, "
+            f"expires={expires_dt.isoformat()}, age={age_sec:.0f}s > {ttl_seconds}s). Re-run --canary."
+        )
+
+    if int(stamp_data.get("n_canary_runs") or 0) < 3 or int(stamp_data.get("executed_sysmon_events_total") or 0) <= 0:
+        raise PilotStagingError(
+            "BLOCKED (--canary gate): Canary stamp lacks valid >=3 runs and Sysmon EVTX verification."
+        )
+    return stamp_data
 
 
 def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
@@ -280,6 +474,14 @@ def execute_stage_a_pilot_batch(
     benign_pools_root: str | Path | None = None,
     max_in_drop_burst: int = 2000,
     cmd_output_fn: Callable[[list[str], Mapping[str, str] | None], tuple[int, str]] | None = None,
+    batch_json_path: str | Path | None = None,
+    batch_json_sha256: str | None = None,
+    base_image_sha256: str | None = None,
+    canary_ttl_seconds: int = CANARY_STAMP_TTL_SECONDS,
+    reject_dirty_git: bool = True,
+    git_state_fn: Callable[[Path], Mapping[str, Any]] | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+    confirm_input_fn: Callable[[str], str] = input,
 ) -> list[dict[str, Any]]:
     """Execute or dry-run a Stage A/B batch with detached watchdog, egress checks, base checks & optional pipelining."""
     repo_root = Path(__file__).resolve().parent.parent.parent
@@ -294,6 +496,16 @@ def execute_stage_a_pilot_batch(
     eff_canary_stamp = Path(canary_stamp_path) if canary_stamp_path is not None else (out_root / "CANARY_PASSED")
     checkpoint_path = out_root / "completed_runs.jsonl"
     egress_audit_path = out_root / "egress_audit.jsonl"
+
+    eff_batch_sha256 = (
+        str(batch_json_sha256).strip().lower()
+        if batch_json_sha256 is not None
+        else compute_batch_json_sha256(batch_json_path=batch_json_path, batch_runs=batch_runs)
+    )
+    eff_base_sha256 = resolve_base_image_sha256(base_qcow2, explicit_base_sha256=base_image_sha256)
+    git_state = dict(git_state_fn(repo_root) if git_state_fn is not None else get_git_head_state(repo_root))
+    eff_git_head = str(git_state.get("git_head") or "unknown").strip().lower()
+    eff_git_dirty = bool(git_state.get("git_dirty", True))
 
     parsed_entries: list[tuple[StageRunSpec, Mapping[str, Any]]] = []
     has_malware_run = False
@@ -311,6 +523,11 @@ def execute_stage_a_pilot_batch(
             raise PilotStagingError(
                 f"canary_mode requires at least 1 control, 1 dormant, and 1 executed run (got {sorted(canary_strata)})"
             )
+        if eff_git_dirty and not dry_run:
+            print(
+                "WARNING: Working tree has uncommitted changes (git_dirty=True); unattended batches will reject this canary stamp.",
+                file=sys.stderr,
+            )
 
     if has_malware_run and not dry_run:
         if not (vroot / "GATE0_SIGNED_OFF").is_file():
@@ -321,19 +538,16 @@ def execute_stage_a_pilot_batch(
         if rc_pre != 0:
             raise PilotStagingError(f"Vault preflight failed with exit code {rc_pre}")
         if require_canary_stamp and not canary_mode:
-            if not eff_canary_stamp.is_file():
-                raise PilotStagingError(
-                    f"BLOCKED (--canary gate): Required canary stamp missing at {eff_canary_stamp}. "
-                    "Run with --canary first before unattended malware execution."
-                )
-            try:
-                stamp_data = json.loads(eff_canary_stamp.read_text(encoding="utf-8"))
-            except Exception as exc:
-                raise PilotStagingError(f"BLOCKED (--canary gate): Invalid canary stamp {eff_canary_stamp}: {exc}") from exc
-            if stamp_data.get("status") != "PASS":
-                raise PilotStagingError(
-                    f"BLOCKED (--canary gate): Canary stamp status is {stamp_data.get('status')!r}, expected 'PASS'."
-                )
+            validate_canary_stamp(
+                eff_canary_stamp,
+                expected_batch_sha256=eff_batch_sha256,
+                expected_base_sha256=eff_base_sha256,
+                expected_git_head=eff_git_head,
+                expected_git_dirty=eff_git_dirty,
+                now_utc=(now_fn() if now_fn is not None else None),
+                ttl_seconds=canary_ttl_seconds,
+                reject_dirty=reject_dirty_git,
+            )
 
     completed_ids = _load_completed_run_ids(checkpoint_path) if (resume and not canary_mode and not dry_run) else set()
     pending_entries = [(spec, entry) for spec, entry in parsed_entries if spec.run_id not in completed_ids]
@@ -378,8 +592,25 @@ def execute_stage_a_pilot_batch(
             _append_jsonl(checkpoint_path, rec_out)
         return rec_out
 
+    detonate_confirmed = False
     try:
         for run_idx, (spec, entry) in enumerate(pending_entries, start=1):
+            if canary_mode and not dry_run and spec.stratum == "executed" and not detonate_confirmed:
+                prompt = (
+                    f"[CANARY SAFETY CONFIRMATION] About to boot INetSim + Win11 VM and DETONATE malware "
+                    f"(run_id={spec.run_id!r}, family={spec.sample_family!r}, sha256={spec.sample_sha256!r}). "
+                    "Type DETONATE to proceed: "
+                )
+                try:
+                    ans = str(confirm_input_fn(prompt)).strip()
+                except (EOFError, KeyboardInterrupt) as exc:
+                    raise PilotStagingError("CANARY ABORTED: Missing operator 'DETONATE' confirmation.") from exc
+                if ans != "DETONATE":
+                    raise PilotStagingError(
+                        f"CANARY ABORTED: Expected exact confirmation 'DETONATE', got {ans!r}."
+                    )
+                detonate_confirmed = True
+
             run_dir = out_root / spec.run_id
             stage_dir = stage_tmp_root / spec.run_id
             iso_path = stage_dir / f"run_stage_{spec.run_id}.iso"
@@ -524,7 +755,17 @@ def execute_stage_a_pilot_batch(
                     raise RuntimeError(f"Final full base-image SHA-256 verification failed (rc={rc_end})")
 
     if canary_mode and not dry_run:
-        verify_canary_run_outputs(results_log, out_root, eff_canary_stamp)
+        verify_canary_run_outputs(
+            results_log,
+            out_root,
+            eff_canary_stamp,
+            batch_json_sha256=eff_batch_sha256,
+            base_image_sha256=eff_base_sha256,
+            git_head=eff_git_head,
+            git_dirty=eff_git_dirty,
+            now_utc=(now_fn() if now_fn is not None else None),
+            ttl_seconds=canary_ttl_seconds,
+        )
 
     return results_log
 
@@ -870,6 +1111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         enable_pipelining=args.pipelined,
         resume=not args.no_resume,
         benign_pools_root=args.benign_pools_root,
+        batch_json_path=args.batch_json,
     )
     print(json.dumps({"completed_runs": len(executed), "runs": executed}, indent=2))
     return 0

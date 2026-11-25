@@ -16,12 +16,64 @@ FAST_META_FILE="${FAST_META_FILE:-/var/lib/libvirt/images/v2_base_fast_meta.env}
 VIRSH_BIN="${VIRSH_BIN:-sudo virsh}"
 IPTABLES_BIN="${IPTABLES_BIN:-sudo iptables}"
 MAX_IN_DROP_BURST="${MAX_IN_DROP_BURST:-2000}"
+FORCE_RECORD="${FORCE_RECORD:-0}"
+
+# Pinned golden SHA-256 of sealed win11_base.qcow2 (refused on mismatch in record-base/verify-base/verify-base-fast)
+GOLDEN_BASE_SHA256="${GOLDEN_BASE_SHA256:-d2facced4255e3ae1cb821249d5e6330e380f639cee8a5aae19ef99be690835c}"
+# Review the SHA-256 printed by `record-base` for win11_VARS.fd.base, then pin it below before unattended collection
+GOLDEN_NVRAM_SHA256="${GOLDEN_NVRAM_SHA256:-}"
 
 read -r -a VIRSH_CMD <<< "$VIRSH_BIN"
 read -r -a IPTABLES_CMD <<< "$IPTABLES_BIN"
 
+GOLDEN_BASE_SHA256_LC=""
+GOLDEN_NVRAM_SHA256_LC=""
+
+_validate_golden_pins() {
+    if [[ -z "$GOLDEN_BASE_SHA256" || ! "$GOLDEN_BASE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "ERROR: GOLDEN_BASE_SHA256 must be a valid 64-hex SHA-256 digest (got '${GOLDEN_BASE_SHA256}')." >&2
+        exit 1
+    fi
+    GOLDEN_BASE_SHA256_LC="$(printf '%s' "$GOLDEN_BASE_SHA256" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$GOLDEN_NVRAM_SHA256" ]]; then
+        echo "WARNING: GOLDEN_NVRAM_SHA256 is unset! Review win11_VARS.fd.base SHA-256 and pin GOLDEN_NVRAM_SHA256 in 04_watchdog_and_base_hash.sh before unattended malware collection." >&2
+        GOLDEN_NVRAM_SHA256_LC=""
+    elif [[ ! "$GOLDEN_NVRAM_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "ERROR: GOLDEN_NVRAM_SHA256 must be empty or a valid 64-hex SHA-256 digest (got '${GOLDEN_NVRAM_SHA256}')." >&2
+        exit 1
+    else
+        GOLDEN_NVRAM_SHA256_LC="$(printf '%s' "$GOLDEN_NVRAM_SHA256" | tr '[:upper:]' '[:lower:]')"
+    fi
+}
+
+_hash_file_entry_sha() {
+    local tgt="$1"
+    awk -v tgt="$tgt" -v bname="$(basename "$tgt")" '
+        {
+            f = $2; sub(/^\*/, "", f);
+            if (f == tgt || f == bname) { print tolower($1); exit }
+        }
+    ' "$HASH_FILE"
+}
+
+_backup_existing_file() {
+    local src="$1"
+    if [[ ! -f "$src" ]]; then
+        return 0
+    fi
+    local ts backup
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${src}.bak.${ts}"
+    if [[ -e "$backup" ]]; then
+        backup="${backup}.$$"
+    fi
+    cp -p "$src" "$backup"
+    echo "[+] Backed up existing $src -> $backup"
+}
+
 _verify_base_immutability_and_nvram() {
     local check_lsattr="${1:-1}"
+    _validate_golden_pins
     if [[ ! -f "$HASH_FILE" ]]; then
         echo "ERROR: Hash baseline file missing: $HASH_FILE (run record-base first)" >&2
         exit 1
@@ -53,14 +105,19 @@ _verify_base_immutability_and_nvram() {
         fi
     fi
 
-    # Verify full SHA-256 of NVRAM_BASE (528 KiB) against HASH_FILE
-    local expected_nvram actual_nvram
-    expected_nvram="$(awk -v tgt="$NVRAM_BASE" -v bname="$(basename "$NVRAM_BASE")" '
-        {
-            f = $2; sub(/^\*/, "", f);
-            if (f == tgt || f == bname) { print tolower($1); exit }
-        }
-    ' "$HASH_FILE")"
+    local expected_base expected_nvram actual_nvram
+    expected_base="$(_hash_file_entry_sha "$BASE_IMG")"
+    if [[ -z "$expected_base" ]]; then
+        echo "ERROR: Base image entry ($BASE_IMG) missing from $HASH_FILE" >&2
+        exit 1
+    fi
+    if [[ "$expected_base" != "$GOLDEN_BASE_SHA256_LC" ]]; then
+        echo "ERROR: HASH_FILE base SHA-256 mismatch vs pinned GOLDEN_BASE_SHA256! expected=$GOLDEN_BASE_SHA256_LC recorded=$expected_base" >&2
+        exit 1
+    fi
+
+    # Verify full SHA-256 of NVRAM_BASE (528 KiB) against HASH_FILE and optional GOLDEN_NVRAM_SHA256 pin
+    expected_nvram="$(_hash_file_entry_sha "$NVRAM_BASE")"
     if [[ -z "$expected_nvram" ]]; then
         echo "ERROR: NVRAM baseline entry ($NVRAM_BASE) missing from $HASH_FILE" >&2
         exit 1
@@ -68,6 +125,10 @@ _verify_base_immutability_and_nvram() {
     actual_nvram="$(sha256sum "$NVRAM_BASE" | awk '{print tolower($1)}')"
     if [[ "$actual_nvram" != "$expected_nvram" ]]; then
         echo "ERROR: NVRAM baseline SHA-256 mismatch! expected=$expected_nvram actual=$actual_nvram" >&2
+        exit 1
+    fi
+    if [[ -n "$GOLDEN_NVRAM_SHA256_LC" && "$actual_nvram" != "$GOLDEN_NVRAM_SHA256_LC" ]]; then
+        echo "ERROR: NVRAM SHA-256 mismatch vs pinned GOLDEN_NVRAM_SHA256! expected=$GOLDEN_NVRAM_SHA256_LC actual=$actual_nvram" >&2
         exit 1
     fi
 
@@ -196,24 +257,17 @@ case "$cmd" in
         if [[ -n "${2:-}" ]]; then
             BASE_IMG="$2"
         fi
-        echo "[*] Verifying 0444 read-only mode on base image..."
-        stat -c '%a %n' "$BASE_IMG" "$NVRAM_BASE"
-        sha256sum "$BASE_IMG" "$NVRAM_BASE" | tee "$HASH_FILE"
-        {
-            echo "BASE_IMG=$(printf '%q' "$BASE_IMG")"
-            echo "BASE_STAT=$(stat -c '%i:%s:%b:%Y' "$BASE_IMG")"
-            echo "NVRAM_BASE=$(printf '%q' "$NVRAM_BASE")"
-            echo "NVRAM_SHA256=$(sha256sum "$NVRAM_BASE" | awk '{print tolower($1)}')"
-            if [[ -f "$INETSIM_BASE" ]]; then
-                echo "INETSIM_BASE=$(printf '%q' "$INETSIM_BASE")"
-                echo "INETSIM_STAT=$(stat -c '%i:%s:%b:%Y' "$INETSIM_BASE")"
-            fi
-        } > "$FAST_META_FILE"
-        echo "[+] Recorded immutable baseline hashes to $HASH_FILE and fast metadata to $FAST_META_FILE"
-        ;;
-    verify-base)
-        if [[ ! -f "$HASH_FILE" ]]; then
-            echo "ERROR: Hash baseline file missing: $HASH_FILE (run record-base first)" >&2
+        _validate_golden_pins
+        if [[ -f "$HASH_FILE" && "${FORCE_RECORD:-0}" != "1" ]]; then
+            echo "ERROR: Refusing to overwrite existing $HASH_FILE (re-run with FORCE_RECORD=1 only after intentional base verification)." >&2
+            exit 1
+        fi
+        if [[ ! -f "$BASE_IMG" ]]; then
+            echo "ERROR: Base image missing: $BASE_IMG" >&2
+            exit 1
+        fi
+        if [[ ! -f "$NVRAM_BASE" ]]; then
+            echo "ERROR: NVRAM baseline missing: $NVRAM_BASE" >&2
             exit 1
         fi
         perm="$(stat -c '%a' "$BASE_IMG")"
@@ -221,7 +275,89 @@ case "$cmd" in
             echo "ERROR: Base image permissions drifted! Expected 444, got $perm on $BASE_IMG" >&2
             exit 1
         fi
+        echo "[*] Verifying 0444 read-only mode on base image and NVRAM..."
+        stat -c '%a %n' "$BASE_IMG" "$NVRAM_BASE"
+        echo "[*] Computing SHA-256 of $BASE_IMG and $NVRAM_BASE (15+ GiB base image may take ~60-90s)..." >&2
+        actual_base_sha="$(sha256sum "$BASE_IMG" | awk '{print tolower($1)}')"
+        actual_nvram_sha="$(sha256sum "$NVRAM_BASE" | awk '{print tolower($1)}')"
+
+        if [[ "$actual_base_sha" != "$GOLDEN_BASE_SHA256_LC" ]]; then
+            echo "ERROR: Base image SHA-256 mismatch vs pinned GOLDEN_BASE_SHA256! expected=$GOLDEN_BASE_SHA256_LC actual=$actual_base_sha ($BASE_IMG)" >&2
+            exit 1
+        fi
+        if [[ -n "$GOLDEN_NVRAM_SHA256_LC" && "$actual_nvram_sha" != "$GOLDEN_NVRAM_SHA256_LC" ]]; then
+            echo "ERROR: NVRAM SHA-256 mismatch vs pinned GOLDEN_NVRAM_SHA256! expected=$GOLDEN_NVRAM_SHA256_LC actual=$actual_nvram_sha ($NVRAM_BASE)" >&2
+            exit 1
+        fi
+        if [[ -z "$GOLDEN_NVRAM_SHA256_LC" ]]; then
+            echo "WARNING: Review and pin GOLDEN_NVRAM_SHA256=${actual_nvram_sha} in docs/v2/hardening/04_watchdog_and_base_hash.sh" >&2
+        fi
+
+        mkdir -p "$(dirname "$HASH_FILE")" "$(dirname "$FAST_META_FILE")"
+        if [[ -f "$HASH_FILE" ]]; then
+            _backup_existing_file "$HASH_FILE"
+        fi
+        if [[ -f "$FAST_META_FILE" ]]; then
+            _backup_existing_file "$FAST_META_FILE"
+        fi
+
+        tmp_hash="$(mktemp "${HASH_FILE}.tmp.XXXXXX")"
+        printf '%s  %s\n%s  %s\n' "$actual_base_sha" "$BASE_IMG" "$actual_nvram_sha" "$NVRAM_BASE" | tee "$tmp_hash"
+        chmod 0644 "$tmp_hash"
+        mv -f "$tmp_hash" "$HASH_FILE"
+
+        tmp_meta="$(mktemp "${FAST_META_FILE}.tmp.XXXXXX")"
+        {
+            echo "BASE_IMG=$(printf '%q' "$BASE_IMG")"
+            echo "BASE_STAT=$(stat -c '%i:%s:%b:%Y' "$BASE_IMG")"
+            echo "NVRAM_BASE=$(printf '%q' "$NVRAM_BASE")"
+            echo "NVRAM_SHA256=$actual_nvram_sha"
+            if [[ -f "$INETSIM_BASE" ]]; then
+                echo "INETSIM_BASE=$(printf '%q' "$INETSIM_BASE")"
+                echo "INETSIM_STAT=$(stat -c '%i:%s:%b:%Y' "$INETSIM_BASE")"
+            fi
+        } > "$tmp_meta"
+        chmod 0644 "$tmp_meta"
+        mv -f "$tmp_meta" "$FAST_META_FILE"
+        echo "[+] Recorded immutable baseline hashes to $HASH_FILE and fast metadata to $FAST_META_FILE"
+        ;;
+    verify-base)
+        _validate_golden_pins
+        if [[ ! -f "$HASH_FILE" ]]; then
+            echo "ERROR: Hash baseline file missing: $HASH_FILE (run record-base first)" >&2
+            exit 1
+        fi
+        if [[ ! -f "$BASE_IMG" ]]; then
+            echo "ERROR: Base image missing: $BASE_IMG" >&2
+            exit 1
+        fi
+        if [[ ! -f "$NVRAM_BASE" ]]; then
+            echo "ERROR: NVRAM baseline missing: $NVRAM_BASE" >&2
+            exit 1
+        fi
+        perm="$(stat -c '%a' "$BASE_IMG")"
+        if [[ "$perm" != "444" ]]; then
+            echo "ERROR: Base image permissions drifted! Expected 444, got $perm on $BASE_IMG" >&2
+            exit 1
+        fi
+        expected_base="$(_hash_file_entry_sha "$BASE_IMG")"
+        if [[ -z "$expected_base" || "$expected_base" != "$GOLDEN_BASE_SHA256_LC" ]]; then
+            echo "ERROR: HASH_FILE base SHA-256 mismatch vs pinned GOLDEN_BASE_SHA256! expected=$GOLDEN_BASE_SHA256_LC recorded=${expected_base:-missing}" >&2
+            exit 1
+        fi
         sha256sum -c "$HASH_FILE"
+        actual_base_sha="$(sha256sum "$BASE_IMG" | awk '{print tolower($1)}')"
+        if [[ "$actual_base_sha" != "$GOLDEN_BASE_SHA256_LC" ]]; then
+            echo "ERROR: Base image SHA-256 mismatch vs pinned GOLDEN_BASE_SHA256! expected=$GOLDEN_BASE_SHA256_LC actual=$actual_base_sha ($BASE_IMG)" >&2
+            exit 1
+        fi
+        if [[ -n "$GOLDEN_NVRAM_SHA256_LC" ]]; then
+            actual_nvram_sha="$(sha256sum "$NVRAM_BASE" | awk '{print tolower($1)}')"
+            if [[ "$actual_nvram_sha" != "$GOLDEN_NVRAM_SHA256_LC" ]]; then
+                echo "ERROR: NVRAM SHA-256 mismatch vs pinned GOLDEN_NVRAM_SHA256! expected=$GOLDEN_NVRAM_SHA256_LC actual=$actual_nvram_sha ($NVRAM_BASE)" >&2
+                exit 1
+            fi
+        fi
         echo "[+] Base image & NVRAM full SHA-256 verification PASSED."
         ;;
     verify-base-fast)

@@ -339,6 +339,7 @@ exit 0
         HASH_FILE=str(hash_file),
         FAST_META_FILE=str(fast_meta),
         SKIP_LSATTR_CHECK="1",
+        GOLDEN_BASE_SHA256=__import__("hashlib").sha256(b"QCOW2_STUB_BASE_BYTES").hexdigest(),
         VIRSH_BIN=str(mock_virsh),
         IPTABLES_BIN=str(mock_ipt),
         WATCHDOG_BACKEND="setsid",
@@ -519,3 +520,78 @@ sys.exit(0)
     assert full_calls[0][0] == "build"
     assert str(dockerfile) in full_calls[0]
     assert "--pull=false" not in full_calls[0]
+
+
+def test_watchdog_golden_base_pin_no_overwrite_backup_and_nvram_warning(tmp_path):
+    import hashlib
+    import os
+
+    wd_sh = HARDENING_DIR / "04_watchdog_and_base_hash.sh"
+    wd_txt = wd_sh.read_text(encoding="utf-8")
+    assert 'GOLDEN_BASE_SHA256="${GOLDEN_BASE_SHA256:-d2facced4255e3ae1cb821249d5e6330e380f639cee8a5aae19ef99be690835c}"' in wd_txt
+    assert 'GOLDEN_NVRAM_SHA256="${GOLDEN_NVRAM_SHA256:-}"' in wd_txt
+
+    base_img = tmp_path / "win11_base.qcow2"
+    nvram = tmp_path / "win11_VARS.fd.base"
+    hash_file = tmp_path / "v2_base_hashes.sha256"
+    fast_meta = tmp_path / "v2_base_fast_meta.env"
+    base_bytes = b"STUB_QCOW2_BASE_PIN_TEST"
+    nvram_bytes = b"STUB_NVRAM_PIN_TEST"
+    base_img.write_bytes(base_bytes)
+    nvram.write_bytes(nvram_bytes)
+    base_img.chmod(0o444)
+
+    stub_base_sha = hashlib.sha256(base_bytes).hexdigest()
+    stub_nvram_sha = hashlib.sha256(nvram_bytes).hexdigest()
+
+    base_env = dict(
+        os.environ,
+        BASE_IMG=str(base_img),
+        NVRAM_BASE=str(nvram),
+        INETSIM_BASE=str(tmp_path / "missing_inetsim.qcow2"),
+        HASH_FILE=str(hash_file),
+        FAST_META_FILE=str(fast_meta),
+        SKIP_LSATTR_CHECK="1",
+    )
+
+    # 1. Default pinned GOLDEN_BASE_SHA256 refuses mismatched base image without writing HASH_FILE
+    r_bad_pin = subprocess.run(["bash", str(wd_sh), "record-base"], env=base_env, capture_output=True, text=True)
+    assert r_bad_pin.returncode != 0
+    assert "GOLDEN_BASE_SHA256" in r_bad_pin.stderr
+    assert not hash_file.exists()
+
+    # 2. Tampered HASH_FILE for a non-golden base image fails verify-base AND verify-base-fast
+    hash_file.write_text(f"{stub_base_sha}  {base_img}\n{stub_nvram_sha}  {nvram}\n", encoding="utf-8")
+    assert subprocess.run(["bash", str(wd_sh), "verify-base"], env=base_env, capture_output=True, text=True).returncode != 0
+    assert subprocess.run(["bash", str(wd_sh), "verify-base-fast"], env=base_env, capture_output=True, text=True).returncode != 0
+    hash_file.unlink()
+
+    # 3. Matching GOLDEN_BASE_SHA256 + unset GOLDEN_NVRAM_SHA256 records hashes & warns loudly
+    env_ok = dict(base_env, GOLDEN_BASE_SHA256=stub_base_sha, GOLDEN_NVRAM_SHA256="")
+    r_rec = subprocess.run(["bash", str(wd_sh), "record-base"], env=env_ok, capture_output=True, text=True)
+    assert r_rec.returncode == 0
+    assert "WARNING:" in r_rec.stderr and "GOLDEN_NVRAM_SHA256" in r_rec.stderr
+    assert hash_file.exists() and fast_meta.exists()
+
+    # 4. Re-running record-base without FORCE_RECORD=1 refuses to overwrite HASH_FILE
+    r_no_ow = subprocess.run(["bash", str(wd_sh), "record-base"], env=env_ok, capture_output=True, text=True)
+    assert r_no_ow.returncode != 0
+    assert "Refusing to overwrite" in r_no_ow.stderr
+    assert not list(tmp_path.glob("v2_base_hashes.sha256.bak.*"))
+
+    # 5. Mismatched GOLDEN_NVRAM_SHA256 refuses even with FORCE_RECORD=1 and writes no backup
+    env_bad_nv = dict(env_ok, GOLDEN_NVRAM_SHA256="f" * 64, FORCE_RECORD="1")
+    r_bad_nv = subprocess.run(["bash", str(wd_sh), "record-base"], env=env_bad_nv, capture_output=True, text=True)
+    assert r_bad_nv.returncode != 0
+    assert "GOLDEN_NVRAM_SHA256" in r_bad_nv.stderr
+    assert not list(tmp_path.glob("v2_base_hashes.sha256.bak.*"))
+    assert subprocess.run(["bash", str(wd_sh), "verify-base"], env=env_bad_nv, capture_output=True, text=True).returncode != 0
+
+    # 6. FORCE_RECORD=1 with valid GOLDEN_NVRAM_SHA256 creates timestamped backup & passes verify-base
+    env_pin_nv = dict(env_ok, GOLDEN_NVRAM_SHA256=stub_nvram_sha, FORCE_RECORD="1")
+    r_force = subprocess.run(["bash", str(wd_sh), "record-base"], env=env_pin_nv, capture_output=True, text=True)
+    assert r_force.returncode == 0
+    assert "WARNING:" not in r_force.stderr
+    assert len(list(tmp_path.glob("v2_base_hashes.sha256.bak.*"))) == 1
+    assert len(list(tmp_path.glob("v2_base_fast_meta.env.bak.*"))) == 1
+    assert subprocess.run(["bash", str(wd_sh), "verify-base"], env=env_pin_nv, capture_output=True, text=True).returncode == 0
