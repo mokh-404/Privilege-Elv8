@@ -51,16 +51,33 @@ if ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
     echo "ERROR: Container runtime $CONTAINER_RT not found (note: podman is not installed on this host)." >&2
     exit 1
 fi
-if pgrep -x qemu-system-x86_64 >/dev/null 2>&1; then
-    if sudo virsh -c qemu:///system domstate win11 2>/dev/null | grep -qi running; then
-        echo "ABORT: win11 domain is still running! Run virsh destroy before offline overlay parsing." >&2
-        exit 1
-    fi
-fi
 
 mkdir -p "$RUN_OUT_DIR"
 ABS_QCOW2="$(realpath "$OVERLAY_QCOW2")"
 ABS_OUT="$(realpath "$RUN_OUT_DIR")"
+
+VIRSH_BIN="${VIRSH_BIN:-sudo virsh}"
+read -r -a VIRSH_CMD <<< "$VIRSH_BIN"
+if [[ "${FORCE_VM_CHECK:-0}" == "1" ]] || pgrep -x qemu-system-x86_64 >/dev/null 2>&1; then
+    if "${VIRSH_CMD[@]}" -c qemu:///system domstate win11 2>/dev/null | grep -qi running; then
+        if ! active_blk_out="$("${VIRSH_CMD[@]}" -c qemu:///system domblklist win11 2>/dev/null)"; then
+            echo "ABORT: win11 is running and domblklist failed; refusing offline extraction of $ABS_QCOW2." >&2
+            exit 1
+        fi
+        while IFS= read -r blk_path; do
+            [[ -z "$blk_path" ]] && continue
+            resolved_blk="$(realpath -m "$blk_path" 2>/dev/null || printf '%s' "$blk_path")"
+            if [[ "$resolved_blk" == "$ABS_QCOW2" ]]; then
+                echo "ABORT: Target overlay '$ABS_QCOW2' is still attached to running win11 domain! Run virsh destroy before offline parsing." >&2
+                exit 1
+            fi
+        done < <(
+            printf '%s\n' "$active_blk_out" \
+                | awk '{for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' || true
+        )
+    fi
+fi
+
 chmod 0777 "$ABS_OUT"
 
 restore_out_perms() {

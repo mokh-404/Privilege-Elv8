@@ -27,6 +27,10 @@ VARS_BASE="${VARS_BASE:-/var/lib/libvirt/qemu/nvram/win11_VARS.fd.base}"
 VARS_LIVE="${VARS_LIVE:-/var/lib/libvirt/qemu/nvram/win11_VARS.fd}"
 BASE_CACHE="${BASE_CACHE:-/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz}"
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
+URI="${LIBVIRT_URI:-qemu:///system}"
+DOMAIN="${DOMAIN:-win11}"
+VIRSH_BIN="${VIRSH_BIN:-sudo virsh}"
+read -r -a VIRSH_CMD <<< "$VIRSH_BIN"
 
 usage() {
     cat <<EOF
@@ -41,8 +45,14 @@ EOF
 prepare_overlay() {
     local base="${1:-$BASE_IMG}"
     local overlay="${2:-$OVERLAY_IMG}"
-    if [[ -n "$(pgrep -a qemu || true)" ]]; then
-        echo "ERROR: Active QEMU process detected. Shut down running VMs before modifying overlays." >&2
+    local dom_state
+    dom_state="$("${VIRSH_CMD[@]}" -c "$URI" domstate "$DOMAIN" 2>/dev/null | tr '[:upper:]' '[:lower:]' | xargs || true)"
+    if [[ "$dom_state" == "running" || "$dom_state" == "paused" || "$dom_state" == "in shutdown" ]]; then
+        echo "ERROR: Domain $DOMAIN is active ($dom_state). Shut down $DOMAIN before modifying overlays." >&2
+        exit 1
+    fi
+    if [[ -z "$dom_state" ]] && pgrep -af "qemu-system.*(-name[[:space:]].*${DOMAIN}|${overlay})" >/dev/null 2>&1; then
+        echo "ERROR: Active QEMU process detected for $DOMAIN/$overlay. Shut down running VM before modifying overlays." >&2
         exit 1
     fi
     if [[ ! -f "$base" ]]; then

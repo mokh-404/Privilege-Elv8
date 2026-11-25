@@ -14,6 +14,7 @@ import pytest
 
 from scripts.compare_v1_v2_parity import compare_v1_v2_feature_parity, format_parity_markdown
 from src import config
+from src.v2.benign_generator_v2 import _synth_unsigned_pe_bytes
 from src.v2.labeler_v2 import drop_v2_harness_footprint
 from src.v2.offline_extractor import (
     expand_target_like_v1,
@@ -21,13 +22,23 @@ from src.v2.offline_extractor import (
     is_v2_harness_footprint_record,
     write_outputs,
 )
-from src.v2.pilot_staging import PilotStagingError, StageRunSpec, build_clean_parity_stage_iso
+from src.v2.pilot_staging import (
+    PilotStagingError,
+    StageRunSpec,
+    assert_allowed_malware_policy,
+    build_clean_parity_stage_iso,
+    build_dormant_batch_bundle,
+    validate_stage_run_spec,
+)
 from src.v2.run_stage_a_pilot import (
+    _select_canary_subset,
     build_container_extraction_command,
     build_create_overlay_command,
     compute_od_v2_20_pilot_gate,
+    evaluate_egress_delta,
     evaluate_stage_a_pilot_runs,
     execute_stage_a_pilot_batch,
+    verify_canary_run_outputs,
     write_stage_a_pilot_report,
 )
 
@@ -320,7 +331,7 @@ def test_stage_a_pilot_orchestrator_gate0_od_v2_20_and_power_calibration(tmp_pat
     assert summary["od_v2_20_gate"]["v2_refgraph_status"] == "confirmatory_secondary"
     assert summary["executed_detonation_success_rate_pct"] == 100.0
     assert summary["statistical_power_calibration"]["n_pilot_families"] == 4
-    assert set(summary["statistical_power_calibration"]["mde_by_f_test"].keys()) == {10, 12, 15}
+    assert set(summary["statistical_power_calibration"]["mde_by_f_test"].keys()) == {10, 15, 22, 25}
 
     rep_path = write_stage_a_pilot_report(summary, tmp_path / "STAGE_A_PILOT_REPORT.md")
     assert rep_path.exists()
@@ -399,21 +410,34 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
     vault_dir = tmp_path / "vault"
     subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
 
-    # Gate 0 must block curation until GATE0_SIGNED_OFF exists
+    # Gate 0 must block curation until GATE0_SIGNED_OFF exists with 0400 mode & required fields
     with pytest.raises(PilotStagingError, match="Gate 0 sign-off marker missing"):
         curate_pilot_vault_and_batch(vault_root=vault_dir, setup_script=setup_script, target_families=6)
 
-    (vault_dir / "GATE0_SIGNED_OFF").write_text("SIGNED_BY_TEST\n", encoding="utf-8")
+    marker = vault_dir / "GATE0_SIGNED_OFF"
+    marker.write_text("SIGNED_BY_TEST\n", encoding="utf-8")
+    with pytest.raises(PilotStagingError, match="Vault preflight check failed"):
+        curate_pilot_vault_and_batch(vault_root=vault_dir, setup_script=setup_script, target_families=6)
+
+    marker.write_text(
+        "SIGNED_BY=Mokh\n"
+        "DATE=2026-11-25\n"
+        "SUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\n"
+        "DEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o400)
 
     # Missing ABUSECH_AUTH_KEY must fail cleanly when no client is injected
     monkeypatch.delenv("ABUSECH_AUTH_KEY", raising=False)
     with pytest.raises(RuntimeError, match="ABUSECH_AUTH_KEY"):
         curate_pilot_vault_and_batch(vault_root=vault_dir, setup_script=setup_script, target_families=6)
 
-    # Create 6 distinct synthetic AES-256 zip payloads (plus 1 near-duplicate imphash + 1 non-Windows APK)
+    # Create 6 distinct valid PE32+ .exe AES-256 zip payloads (all allowed non-destructive families)
     families = [
-        ("lockbit", "ransomware", "exe", "lockbit"),
         ("redline", "stealer", "exe", "RedLine"),
+        ("lummac2", "stealer", "exe", "LummaC2"),
         ("smokeloader", "loader", "exe", "smokeloader"),
         ("asyncrat", "rat", "exe", "asyncrat"),
         ("xmrig", "miner", "exe", "xmrig"),
@@ -422,7 +446,7 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
     zips_by_sha: dict[str, bytes] = {}
     records_by_tag: dict[str, list[dict[str, object]]] = {}
     for idx, (fam, cat, ftype, query_tag) in enumerate(families):
-        raw = f"MZ_PILOT_SAMPLE_{fam}_{idx}".encode("utf-8")
+        raw = _synth_unsigned_pe_bytes(seed=500 + idx, size_bytes=16384 + idx * 512, is_dll=False)
         sha = hashlib.sha256(raw).hexdigest()
         src_p = tmp_path / f"{fam}.exe"
         src_p.write_bytes(raw)
@@ -452,16 +476,17 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
             "signature": fam,
             "file_name": f"{fam}.exe",
             "file_type": ftype,
-            "file_size": 65536 + idx * 1024,
+            "file_size": len(raw),
             "imphash": f"{idx + 1:032x}",
             "tags": [fam, "persist", cat],
         }
         records_by_tag[query_tag] = [entry]
-    # Add an Android APK that must be filtered out and a duplicate imphash that must be deduplicated
+    # Add an Android APK, duplicate imphash, and forbidden lockbit ransomware candidate that must ALL be filtered out
     first_sha = next(iter(zips_by_sha))
-    dup_raw = b"MZ_DUPLICATE_FAMILY_BYTES"
+    dup_raw = _synth_unsigned_pe_bytes(seed=999, size_bytes=18432, is_dll=False)
     dup_sha = hashlib.sha256(dup_raw).hexdigest()
-    records_by_tag["ransomware"] = [
+    ransom_sha = hashlib.sha256(b"forbidden_lockbit").hexdigest()
+    records_by_tag["stealer"] = [
         {
             "sha256_hash": hashlib.sha256(b"apk_skip").hexdigest(),
             "signature": "AndroidBad",
@@ -470,14 +495,22 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
             "file_size": 50000,
         },
         {
+            "sha256_hash": ransom_sha,
+            "signature": "LockBit",
+            "file_name": "lockbit.exe",
+            "file_type": "exe",
+            "file_size": 90000,
+            "tags": ["ransomware"],
+        },
+        {
             "sha256_hash": dup_sha,
             "signature": "OtherDup",
             "file_name": "dup.exe",
             "file_type": "exe",
-            "file_size": 70000,
+            "file_size": len(dup_raw),
             "imphash": f"{1:032x}",
         },
-        *records_by_tag["lockbit"],
+        *records_by_tag["RedLine"],
     ]
 
     class _FakeFeedClient:
@@ -491,12 +524,14 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
         vault_root=vault_dir,
         setup_script=setup_script,
         target_families=6,
+        min_families=6,
         n_control_boots=3,
         dwell_seconds=45,
         client=_FakeFeedClient(),
     )
     assert cur["n_families"] == 6
-    assert cur["n_total_runs"] == 15  # 3 controls + 6 * (dormant + executed)
+    assert cur["n_total_runs"] == 15  # 3 controls + 6 * (executed + dormant)
+    assert "lockbit" not in set(cur["families"])
     batch_payload = json.loads(Path(cur["batch_path"]).read_text(encoding="utf-8"))
     runs = batch_payload["runs"]
 
@@ -527,7 +562,7 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
     assert len(inetsim_starts) == 1 and len(inetsim_destroys) == 1
     assert inetsim_starts[0] < win_starts[2] < inetsim_destroys[0]
 
-    # Verify abort cleanup destroys inetsim-vm even if watchdog aborts win11
+    # Verify abort cleanup destroys inetsim-vm and disarms watchdog even if watchdog aborts win11
     recorded_abort: list[list[str]] = []
 
     def _abort_cmd(cmd: list[str], env_over=None) -> int:
@@ -546,4 +581,402 @@ def test_unattended_pilot_batch_inetsim_lifecycle_and_vault_curator(tmp_path, mo
             sleep_fn=lambda _s: None,
         )
     assert ["sudo", "virsh", "-c", "qemu:///system", "destroy", "inetsim-vm"] in recorded_abort
+    assert any("disarm-watchdog" in c for c in recorded_abort)
     assert (vault_dir / "archives" / f"{first_sha}.zip").exists()
+
+
+def _make_aes256_zip(tmp_path: Path, name: str, raw: bytes) -> Path:
+    bsdtar_bin = shutil.which("bsdtar")
+    assert bsdtar_bin is not None
+    src = tmp_path / f"{name}.bin"
+    src.write_bytes(raw)
+    zpath = tmp_path / f"{name}.zip"
+    subprocess.run(
+        [
+            bsdtar_bin,
+            "--format",
+            "zip",
+            "--options",
+            "zip:encryption=aes256",
+            "--passphrase",
+            "infected",
+            "-cf",
+            str(zpath),
+            "-C",
+            str(tmp_path),
+            src.name,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    src.unlink()
+    return zpath
+
+
+def test_forbidden_malware_policy_and_dll_pe_rejection(tmp_path):
+    from scripts.v2_curate_vault_manifest import curate_pilot_vault_and_batch, validate_standalone_runnable_exe_pe
+
+    # Hard blocklist covers ransomware, wipers, and worms
+    for bad_fam, bad_cat, bad_tags in (
+        ("lockbit", "stealer", ()),
+        ("stop", "stealer", ()),
+        ("hermeticwiper", "loader", ()),
+        ("conficker", "rat", ()),
+        ("benign_slug", "ransomware", ()),
+        ("benign_slug", "stealer", ("usb_worm",)),
+    ):
+        with pytest.raises(PilotStagingError, match="BLOCKED"):
+            assert_allowed_malware_policy(sample_family=bad_fam, sample_category=bad_cat, tags=bad_tags)
+        with pytest.raises(PilotStagingError, match="BLOCKED"):
+            validate_stage_run_spec(
+                StageRunSpec(
+                    run_id="bad_policy",
+                    stratum="executed",
+                    benign_profile_id="B_dev_01",
+                    staging_target_path=r"C:\Users\Public\x.exe",
+                    sample_sha256="a" * 64,
+                    sample_family=bad_fam,
+                    sample_category=bad_cat,
+                    sample_tags=tuple(bad_tags),
+                    pair_group_id="p_bad",
+                    execute_payload=True,
+                    gate0_signed_off=True,
+                    dedicated_host_user_verified=True,
+                )
+            )
+
+    # Allowed families and "desktop" substring MUST pass cleanly
+    assert_allowed_malware_policy(sample_family="redline", sample_category="stealer", tags=("desktop_stealer",))
+    assert_allowed_malware_policy(sample_family="asyncrat", sample_category="rat", tags=("persist",))
+
+    # pefile standalone runnable .exe gate rejects DLLs and non-PE bytes
+    exe_bytes = _synth_unsigned_pe_bytes(11, 16384, is_dll=False)
+    dll_bytes = _synth_unsigned_pe_bytes(12, 16384, is_dll=True)
+    meta_ok = validate_standalone_runnable_exe_pe(exe_bytes)
+    assert meta_ok["is_exe"] is True and meta_ok["is_dll"] is False
+
+    with pytest.raises(PilotStagingError, match="IMAGE_FILE_DLL"):
+        validate_standalone_runnable_exe_pe(dll_bytes)
+    with pytest.raises(PilotStagingError, match="MZ"):
+        validate_standalone_runnable_exe_pe(b"\x7fELF" + b"\x00" * 128)
+
+    # Curator must reject a DLL pretending to have .exe extension BEFORE saving to vault
+    import os
+
+    repo = Path(__file__).resolve().parent.parent
+    setup_script = repo / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    vault_dir = tmp_path / "vault_dll"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
+    marker = vault_dir / "GATE0_SIGNED_OFF"
+    marker.write_text(
+        "SIGNED_BY=Mokh\nDATE=2026-11-25\nSUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\nDEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o400)
+
+    dll_sha = hashlib.sha256(dll_bytes).hexdigest()
+    dll_zip = _make_aes256_zip(tmp_path, "dll_disguised", dll_bytes).read_bytes()
+
+    class _DllFeed:
+        def query_tag(self, tag: str, limit: int = 50):
+            if tag.lower() == "redline":
+                return [{
+                    "sha256_hash": dll_sha,
+                    "signature": "RedLine",
+                    "file_name": "fake.exe",
+                    "file_type": "exe",
+                    "file_size": len(dll_bytes),
+                    "tags": ["redline"],
+                }]
+            return []
+
+        def download_sample_zip(self, sha256_hash: str) -> bytes:
+            return dll_zip
+
+    with pytest.raises(PilotStagingError, match="IMAGE_FILE_DLL"):
+        curate_pilot_vault_and_batch(
+            vault_root=vault_dir,
+            setup_script=setup_script,
+            target_families=1,
+            min_families=1,
+            client=_DllFeed(),
+        )
+    assert not (vault_dir / "archives" / f"{dll_sha}.zip").exists()
+
+
+def test_dormant_batch_staging_dev_only_and_zero_rebake_iso(tmp_path):
+    xorriso_bin = shutil.which("xorriso")
+    assert xorriso_bin is not None
+
+    pe0 = _synth_unsigned_pe_bytes(201, 16384, is_dll=False)
+    pe1 = _synth_unsigned_pe_bytes(202, 16896, is_dll=False)
+    sha0 = hashlib.sha256(pe0).hexdigest()
+    sha1 = hashlib.sha256(pe1).hexdigest()
+    z0 = _make_aes256_zip(tmp_path, "db0", pe0)
+    z1 = _make_aes256_zip(tmp_path, "db1", pe1)
+
+    batch_items = (
+        {"sample_sha256": sha0, "staging_target_path": r"C:\Users\Public\db_a.exe", "pair_group_id": "p0", "sample_family": "redline"},
+        {"sample_sha256": sha1, "staging_target_path": r"C:\Users\Public\db_b.exe", "pair_group_id": "p1", "sample_family": "asyncrat"},
+    )
+
+    with pytest.raises(PilotStagingError, match="strictly restricted to split_pool='dev'"):
+        validate_stage_run_spec(
+            StageRunSpec(
+                run_id="db_bad_test",
+                stratum="dormant_batch",
+                benign_profile_id="B_test_01",
+                split_pool="blind_test",
+                execute_payload=False,
+                gate0_signed_off=True,
+                dedicated_host_user_verified=True,
+                batch_samples=batch_items,
+            )
+        )
+
+    spec_dev = StageRunSpec(
+        run_id="db_dev_01",
+        stratum="dormant_batch",
+        benign_profile_id="B_dev_01",
+        split_pool="dev",
+        dwell_seconds=50,
+        execute_payload=False,
+        gate0_signed_off=True,
+        dedicated_host_user_verified=True,
+        batch_samples=batch_items,
+    )
+    out = build_dormant_batch_bundle(
+        spec=spec_dev,
+        out_dir=tmp_path / "db_bundle",
+        sample_vault_files={sha0: z0, sha1: z1},
+        benign_script_text="Write-Host 'benign_dev'\n",
+    )
+    ext_dir = tmp_path / "db_iso_ext"
+    ext_dir.mkdir()
+    subprocess.run(
+        [xorriso_bin, "-osirrox", "on", "-indev", str(out["iso"]), "-extract", "/", str(ext_dir)],
+        check=True,
+        capture_output=True,
+    )
+    assert (ext_dir / "batch_payloads" / "sample_00.bin").read_bytes() == pe0
+    assert (ext_dir / "batch_payloads" / "sample_01.bin").read_bytes() == pe1
+    ps1_txt = (ext_dir / "benign_workload.ps1").read_text(encoding="utf-8")
+    assert "Start-Process" not in ps1_txt
+    assert "batch_samples" in ps1_txt
+    assert not (tmp_path / "db_bundle" / "batch_payloads").exists()
+
+
+def test_pilot_safety_watchdog_canary_egress_pipelining_and_resume(tmp_path):
+    import json
+    import os
+
+    repo = Path(__file__).resolve().parent.parent
+    setup_script = repo / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    vault_dir = tmp_path / "vault_safety"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
+    marker = vault_dir / "GATE0_SIGNED_OFF"
+    marker.write_text(
+        "SIGNED_BY=Mokh\nDATE=2026-11-25\nSUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\nDEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o400)
+
+    pe_bytes = _synth_unsigned_pe_bytes(303, 16384, is_dll=False)
+    pe_sha = hashlib.sha256(pe_bytes).hexdigest()
+    zpath = _make_aes256_zip(tmp_path, "canary_sample", pe_bytes)
+
+    canary_batch = [
+        {"spec": StageRunSpec(run_id="c_ctrl", stratum="control", benign_profile_id="B_dev_01", dwell_seconds=30).__dict__, "vault_file": None},
+        {
+            "spec": StageRunSpec(
+                run_id="c_dorm",
+                stratum="dormant",
+                benign_profile_id="B_dev_02",
+                dwell_seconds=30,
+                staging_target_path=r"C:\Users\Public\c.exe",
+                sample_sha256=pe_sha,
+                sample_family="redline",
+                pair_group_id="p_can",
+                execute_payload=False,
+                gate0_signed_off=True,
+                dedicated_host_user_verified=True,
+            ).__dict__,
+            "vault_file": str(zpath),
+        },
+        {
+            "spec": StageRunSpec(
+                run_id="c_exec",
+                stratum="executed",
+                benign_profile_id="B_dev_03",
+                dwell_seconds=30,
+                staging_target_path=r"C:\Users\Public\c.exe",
+                sample_sha256=pe_sha,
+                sample_family="redline",
+                pair_group_id="p_can",
+                execute_payload=True,
+                gate0_signed_off=True,
+                dedicated_host_user_verified=True,
+            ).__dict__,
+            "vault_file": str(zpath),
+        },
+    ]
+
+    # 1. require_canary_stamp=True blocks before canary stamp exists
+    runs_dir = tmp_path / "canary_runs"
+    stamp_file = runs_dir / "CANARY_PASSED"
+    with pytest.raises(PilotStagingError, match="CANARY"):
+        execute_stage_a_pilot_batch(
+            batch_runs=[canary_batch[2]],
+            runs_out_dir=runs_dir,
+            vault_root=vault_dir,
+            inetsim_wait_seconds=0,
+            require_canary_stamp=True,
+            canary_stamp_path=stamp_file,
+            run_cmd=lambda _c, _e=None: 0,
+            sleep_fn=lambda _s: None,
+        )
+
+    # 2. Canary run executes with arm-watchdog < start, verify-base-fast, and writes CANARY_PASSED
+    canary_cmds: list[list[str]] = []
+
+    def _canary_cmd(cmd: list[str], _env=None) -> int:
+        canary_cmds.append(list(cmd))
+        if cmd and cmd[0].endswith("06_unprivileged_container_runner.sh"):
+            rdir = Path(cmd[2])
+            rid = cmd[3]
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "extraction_manifest.json").write_text(
+                json.dumps({
+                    "run_id": rid,
+                    "total_records": 4414,
+                    "sysmon_evtx_present": (rid == "c_exec"),
+                    "sysmon_events_count": 12 if rid == "c_exec" else 0,
+                }),
+                encoding="utf-8",
+            )
+        return 0
+
+    execute_stage_a_pilot_batch(
+        batch_runs=canary_batch,
+        runs_out_dir=runs_dir,
+        vault_root=vault_dir,
+        inetsim_wait_seconds=0,
+        canary_mode=True,
+        canary_stamp_path=stamp_file,
+        full_base_hash_every=25,
+        run_cmd=_canary_cmd,
+        sleep_fn=lambda _s: None,
+    )
+    assert stamp_file.is_file()
+    assert json.loads(stamp_file.read_text(encoding="utf-8"))["status"] == "PASS"
+    arm_idx = next(i for i, c in enumerate(canary_cmds) if "arm-watchdog" in c)
+    start_idx = next(i for i, c in enumerate(canary_cmds) if c[-2:] == ["start", "win11"])
+    assert arm_idx < start_idx
+    assert any("verify-base-fast" in c for c in canary_cmds)
+
+    # 3. After CANARY_PASSED, require_canary_stamp=True allows execution & resume skips completed runs
+    pipe_cmds: list[list[str]] = []
+    batch_b = [
+        {"spec": StageRunSpec(run_id="pipe_01", stratum="control", benign_profile_id="B_dev_04", dwell_seconds=30).__dict__, "vault_file": None},
+    ]
+
+    def _pipe_cmd(cmd: list[str], _env=None) -> int:
+        pipe_cmds.append(list(cmd))
+        return 0
+
+    out_dir_pipe = tmp_path / "pipe_runs"
+    res_pipe = execute_stage_a_pilot_batch(
+        batch_runs=batch_b,
+        runs_out_dir=out_dir_pipe,
+        overlay_qcow2=tmp_path / "imgs" / "win11_overlay.qcow2",
+        vault_root=vault_dir,
+        inetsim_wait_seconds=0,
+        require_canary_stamp=True,
+        canary_stamp_path=stamp_file,
+        enable_pipelining=True,
+        run_cmd=_pipe_cmd,
+        sleep_fn=lambda _s: None,
+    )
+    assert len(res_pipe) == 1
+    assert any(
+        len(c) >= 4 and c[:3] == ["sudo", "mv", "-f"] and c[4].endswith("win11_overlay_pipe_01.qcow2")
+        for c in pipe_cmds
+    )
+    assert any(
+        c[0].endswith("06_unprivileged_container_runner.sh") and c[1].endswith("win11_overlay_pipe_01.qcow2")
+        for c in pipe_cmds
+    )
+
+    # Resume must skip already-completed pipe_01
+    re_cmds: list[list[str]] = []
+    res_resume = execute_stage_a_pilot_batch(
+        batch_runs=batch_b,
+        runs_out_dir=out_dir_pipe,
+        vault_root=vault_dir,
+        inetsim_wait_seconds=0,
+        require_canary_stamp=True,
+        canary_stamp_path=stamp_file,
+        resume=True,
+        run_cmd=lambda c, _e=None: re_cmds.append(list(c)) or 0,
+        sleep_fn=lambda _s: None,
+    )
+    assert res_resume == [] and re_cmds == []
+
+    # 4. Egress packet-counter delta > 0 MUST fail loudly and log egress_audit.jsonl
+    snap_calls = {"n": 0}
+
+    def _egress_leak_output(cmd: list[str], _env=None) -> tuple[int, str]:
+        if "check-egress" in cmd:
+            snap_calls["n"] += 1
+            pkts = 0 if snap_calls["n"] == 1 else 2
+            return 0, json.dumps({
+                "bridge": "virbr1",
+                "firewall_rules_valid": True,
+                "fwd_drop_pkts": pkts,
+                "fwd_drop_bytes": pkts * 60,
+                "in_drop_pkts": 0,
+                "in_drop_bytes": 0,
+            })
+        return 0, ""
+
+    eg_dir = tmp_path / "eg_fail_runs"
+    with pytest.raises(RuntimeError, match="Unauthorized virbr1 egress"):
+        execute_stage_a_pilot_batch(
+            batch_runs=[batch_b[0]],
+            runs_out_dir=eg_dir,
+            vault_root=vault_dir,
+            inetsim_wait_seconds=0,
+            run_cmd=lambda _c, _e=None: 0,
+            cmd_output_fn=_egress_leak_output,
+            sleep_fn=lambda _s: None,
+        )
+    assert (eg_dir / "egress_audit.jsonl").exists()
+
+    # 5. _select_canary_subset slices a 15-run batch down to [control, executed, paired_dormant]
+    large_batch = [
+        {"spec": StageRunSpec(run_id=f"ctrl_{i}", stratum="control", benign_profile_id="B_dev_01").__dict__}
+        for i in range(3)
+    ]
+    for i, fam in enumerate(("redline", "asyncrat", "smokeloader", "xmrig", "amadey", "lummac2")):
+        for st in ("executed", "dormant"):
+            large_batch.append({
+                "spec": StageRunSpec(
+                    run_id=f"p_{i}_{fam}_{st}",
+                    stratum=st,
+                    benign_profile_id="B_dev_01",
+                    staging_target_path=r"C:\Users\Public\x.exe",
+                    sample_sha256="f" * 64,
+                    sample_family=fam,
+                    pair_group_id=f"pg_{i}_{fam}",
+                    execute_payload=(st == "executed"),
+                    gate0_signed_off=True,
+                    dedicated_host_user_verified=True,
+                ).__dict__
+            })
+    assert len(large_batch) == 15
+    canary_slice = _select_canary_subset(large_batch)
+    assert len(canary_slice) == 3
+    assert [r["spec"]["stratum"] for r in canary_slice] == ["control", "executed", "dormant"]
+    assert canary_slice[1]["spec"]["pair_group_id"] == canary_slice[2]["spec"]["pair_group_id"]

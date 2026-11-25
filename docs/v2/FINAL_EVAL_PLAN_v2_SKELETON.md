@@ -2,164 +2,76 @@
 
 > [!WARNING]
 > **DRAFT SKELETON — NOT FINAL.**  
-> No numbers, thresholds, split hashes, or technique/family selections are filled in here. **Do NOT execute v2 `--final`** until the Stage A pilot is complete, the blind test set is frozen, ALL `[TBD]` fields below are populated from committed artifacts, and this document is committed cleanly as `FINAL_EVAL_PLAN_v2.md`.
+> No numbers, thresholds, split hashes, or family selections are filled in here. **Do NOT execute v2 `--final`** until the Stage A pilot and Stage B collection are complete, blinded human review is adjudicated, the blind test set is frozen, ALL `[TBD]` fields below are populated from committed artifacts, and this document is committed cleanly as `FINAL_EVAL_PLAN_v2.md`.
 
-**Status:** `[TBD: DRAFT SKELETON — awaiting pilot, safety gate, & blind freeze]`  
-**Repository:** `dfir-triage-ml` | **Planned Script/Entry:** `[TBD]`  
-**Dataset Artifact:** `[TBD: data/processed/dataset_v2.parquet]`  
-**Primary Target Schemas:** `full_20`, `no_content` *(plus pre-registered secondary `v2_refgraph` and `[TBD: optional v2_extended]` strictly outside the primary winner rule)*
+**Status:** `[TBD: DRAFT SKELETON — awaiting Stage A pilot, Stage B collection, & blind freeze]`  
+**Repository:** `dfir-triage-ml` | **Comparative Study Target:** `~20` ML, LTR, Deep Tabular, Unsupervised & Rule Arms (`full_20`, `no_content`)  
+**Dataset Artifact:** `[TBD: data/processed/dataset_v2.parquet]`
 
 ---
 
 ## 1. Blind Holdout Lock & One-Shot Execution Guard
 
-- **Holdout Unit of Grouping:** Disjoint **`sample_family`**, **`ssdeep`/TLSH near-duplicate cluster**, `sample_sha256`, **`pair_group_id`** (linking paired `dormant` and `executed` runs of the exact same binary), and **benign VM session / software-profile pool** (`0` cross-split family, binary, pair, benign-key, or benign-run overlap verified by hard assertions). Specifically, hard assertions MUST verify that paired `(sample_sha256, execution_state)` runs (`execution_state in {"dormant", "executed"}`, linked via `pair_group_id` / `sample_sha256`) never straddle `dev` and `blind_test` — both runs of every paired binary and its entire `sample_family` + fuzzy-hash cluster reside strictly in the same split pool. Frozen v1 `dataset_v1.parquet` (`emulated` stratum) is restricted strictly to `split_pool == "dev"`; the v2 blind test is **100% new** (`0` v1 rows/keys/techniques).
-- **Blind-Test Split Ratios:** `[TBD: dev families / blind_test families; dev benign sessions / blind_test benign sessions]` (target `>= 25–30` total families, `>= 10–15` blind-test families; Stage A pilot calibrates feasibility).
+- **Holdout Unit of Grouping:** Disjoint **`sample_family`**, **`ssdeep`/`ppdeep`/`tlsh`/`imphash` near-duplicate cluster**, `sample_sha256`, **`pair_group_id`** (pairing `executed` and `dormant` runs of the exact same binary), and **benign host profile / asset pool** (`DEV_WORKLOAD_PROFILES` `B_dev_01..20` vs `BLIND_TEST_WORKLOAD_PROFILES` `B_test_01..10`, `0` cross-split SHA-256, filename, package, key, or `run_id` overlap).
+- **Scale Target (`OD-V2-01`):**
+  - **Tier 2 Target:** `1,000` usable standalone-`.exe` real malware samples (`800` dev / `200` blind test) across `50–60` non-destructive families (`F_test = 20–25` blind test, `>= 15` floor, per-family caps `<= 30` dev / `<= 15` test) + `200` benign-only runs (`160` dev / `40` test).
+  - **Checkpoint 1 (Tier 1):** `400` usable (`300`/`100`), `30` families (`15` blind test) + `100` benign-only runs (`80`/`20`).
+  - **Hard Exclusions (`OD-V2-08`):** Zero ransomware, wipers, or self-propagating worms.
+  - **v1 `emulated` Stratum (`OD-V2-02`):** Frozen `dataset_v1.parquet` (`1,104` cold-disk `dev` rows excluding `75` live `process` rows) restricted strictly to `split_pool == "dev"` (`0%` blind test).
 - **Pre-Modeling Seal:**
-  - `data/splits/v2_blind_test_manifest.json` committed at `[TBD: freeze_commit_sha]` **before** any developer dev-CV run, hyperparameter tuning, or threshold selection.
-  - Canonical **`blind_test_sha256`**: `[TBD]` (covers sorted test `run_id`, `sample_sha256`, `sample_family`, `execution_state`, `artifact_key`, `label`, and all evaluated feature columns).
-  - Pre-final code/bugfix commit (must strictly predate `--final`): `[TBD]`.
-- **One-Shot Audit Guard:**
-  - `run_v2_final` verifies `compute_frozen_test_hash(df) == manifest["blind_test_sha256"]` and aborts if `results/logs/final_eval_audit_v2.jsonl` contains any `"status": "executed"` entry (unless `--force` is explicitly logged).
-  - All primary (`full_20`, `no_content`) and pre-registered secondary configurations execute in **one single audited `--final` pass**.
+  - `data/splits/v2_blind_test_manifest.json` (`blind_test_sha256`) committed at `[TBD: freeze_commit_sha]` **before** any dev-CV run, hyperparameter tuning, calibration, or threshold selection.
+  - One-shot guard via `results/logs/final_eval_audit_v2.jsonl` refuses duplicate `--final` runs without explicit `--force`.
 
 ---
 
-## 2. Feature Configurations at `--final`
+## 2. Feature Schemas & Prevalence Separation
 
-All forbidden columns (`ORACLE_FEATURES`, `RULE_FEATURES`, `META_COLUMNS` incl. all 15 v2 provenance/pairing fields `schema_version`, `sample_sha256`, `sample_family`, `sample_category`, `sample_source`, `execution_state`, `run_duration_s`, `detonation_exit_status`, `process_tree_root_guid`, `attribution_method`, `attribution_confidence`, `packer_cluster`, `label_review_status`, `stratum`, `pair_group_id`, raw `REFGRAPH_EDGE_COLUMNS` `ref_targets`, `ref_type`, `linked_artifact_keys`, and `LABEL_COL`) are strictly barred from `X` via `assert_no_forbidden_inputs()`.
+All `FORBIDDEN_MODEL_INPUTS` (`ORACLE_FEATURES`, `RULE_FEATURES`, `META_COLUMNS` incl. 15 v2 provenance columns, `REFGRAPH_EDGE_COLUMNS`, `LABEL_COL`) are barred from `X` via `assert_no_forbidden_inputs()`.
 
-### Primary Schemas (Dual-Config Confirmatory Benchmark)
-1. **`full_20`** *(primary benchmark schema; identical 20 locked features to v1 for cross-version continuity)*:
-   - Categorical (6): `artifact_type`, `path_class`, `ext_class`, `signature_state`, `parent_process_class`, `registry_location_class`
-   - Numeric (8): `path_depth`, `name_length`, `name_entropy`, `file_size_log`, `file_entropy`, `cmdline_length`, `cmdline_entropy`, `cmdline_nonalnum_ratio`
-   - Binary (6): `has_double_extension`, `has_encoded_flag`, `has_url_or_ip`, `has_lolbin`, `has_hidden_attr`, `autostart_flag`
-2. **`no_content`** *(18 features; drops `file_size_log`, `file_entropy` — isolates non-byte structural signals & tests dormant visibility limits)*.
-
-### Secondary Pre-Registered Schemas (Strictly Outside `full_20`/`no_content` & Winner Rule)
-3. **`v2_refgraph` (`OD-V2-13`, `OD-V2-16`, `OD-V2-17`, `OD-V2-18`, Secondary Pre-Registered Arm):**
-   - Built **ONLY** from schema-validated static cross-references and raw pointer fields captured offline (`OD-V2-16`, [`hardening/POINTER_CAPTURE_SPEC.md`](hardening/POINTER_CAPTURE_SPEC.md); zero executable payloads), exposed as `ref_targets`, `ref_type`, and `linked_artifact_keys` (`src.config.REFGRAPH_EDGE_COLUMNS`) per [`REFGRAPH_SPEC.md`](REFGRAPH_SPEC.md).
-   - **Zero leakage rule:** Links must **NEVER** use labels, labeling provenance, Sysmon event logs, process trees (`pid`, `ppid`, `parent_name`, `process_tree_root_guid`), or timestamps (`LeakageError` enforced by `assert_graph_inputs_clean()`). Raw pointer and edge columns are strictly barred from `full_20` and `no_content` via `FORBIDDEN_MODEL_INPUTS`.
-   - Evaluates three interpretable propagation baselines (`OD-V2-17`): **`(a)` base ranker alone**, **`(b)` naive undirected propagation**, and **`(c)` hub-attenuated typed propagation** (Heterogeneous GNNs such as R-GCN/GAT remain deferred outside v2 core per `OD-V2-18`).
-   - Reported strictly in its own secondary table block; **never** enters `full_20`/`no_content` or the primary dual-config winner rule.
-4. **`[TBD: optional v2_extended]`** *(strictly secondary if added, never mixed into the `full_20`/`no_content` primary winner rule)*.
+- **Primary Dual Schemas (`OD-V2-11`):**
+  1. **`full_20`** (locked 20 features matching v1 for `H3` cross-version transfer parity)
+  2. **`no_content`** (18 features dropping `file_size_log` and `file_entropy`)
+  *(Note: `v2_refgraph` is descoped from v2 core per 2026-11-25 strategic pivot.)*
+- **Train-vs-Test Prevalence Separation (`OD-V2-12`):**
+  - **Dev Pointwise/Unsupervised (`dev_dedup`):** Fold-local / dev-only cross-run OS-baseline deduplication (`deduplicate_dev_os_baseline`) collapses untouched identical `baseline` rows on `(artifact_key, stable_content_hash)` (`~61k–91k` rows).
+  - **Dev LTR (`dev_ltr`):** Per-host `qid=run_id` query groups retaining all positives, all `benign_drift`, and `200` stratified baseline negatives/host (`~400k` rows).
+  - **Blind Test (`MAIN VIEW`):** **ZERO cross-run deduplication** (`~1.96M` rows across `440` independent hosts, `0.0714%` positive prevalence). Secondary benign-subsampled view (`200` benign/host) reported with explicit inverse-probability weights.
 
 ---
 
-## 3. Evaluation Strata & Yield Summary (Locked Post-Pilot)
+## 3. Model Arms, Equal `20`-Trial Nested CV & Natural-Prevalence Calibration
 
-Performance will be reported **separately for each stratum** and `[TBD: overall stratified summary]`, with **natural (full-host snapshot) prevalence as the main evaluation view** and a **subsampled prevalence view as secondary** (with stratum/sampling weights explicitly disclosed; `OD-V2-12`). For cross-stratum evaluation, `dormant` and `executed` runs are **paired by exact `sample_sha256` (`pair_group_id`)** and staged at the matching initial filesystem path:
-1. **`executed` Stratum (~60–70% of real-malware runs):** `[TBD: N_dev_runs / N_test_runs; dev pos / neg; test pos / neg; N_families; N_paired_sha256]`.
-2. **`dormant` Stratum (~30–40% of real-malware runs):** `[TBD: N_dev_runs / N_test_runs; dev pos / neg; test pos / neg; N_families; N_paired_sha256]` (paired `sample_sha256` binaries staged without execution at the matching initial staging path).
-3. **`emulated` Stratum (`dev` / training pool ONLY; `0%` of blind test):** Frozen v1 (`dataset_v1.parquet`: `1,549` rows, `103` pos) disclosed explicitly as an `"emulated"` training-pool stratum (`[TBD: dev training weight / ablation disclosure]`). Per confirmed `OD-V2-02` Step F0 parity rulings (`2026-11-23`), the `75` live `artifact_type == "process"` rows are excluded when training mixed-stratum models (`1,179 -> 1,104` cold-disk v1 `dev` rows, while `dataset_v1.parquet` remains unmodified on disk), the `27` Win32-locked OS files with missing `file_entropy` are documented/aligned, and `run_key` values stay raw (`--no-expand-env` default) in `full_20`.
-
-Rows flagged `ambiguous_unattributed` during automated Sysmon/ETW + diff labeling are audited in `label_corrections_v2.csv` / blind human adjudication before `blind_test_sha256` freeze and are **not** silently coerced to `benign_drift`.
-
----
-
-## 4. Primary & Secondary Metrics
-
-### Primary Confirmatory Metric & Uncertainty
-- **Primary Metric:** Overall and per-stratum (`executed`, `dormant`) frozen-test **PR-AUC** (`average_precision_score`) under both `full_20` and `no_content` (natural full-host prevalence main view; subsampled prevalence secondary view with weights disclosed).
-- **Bootstrap Confidence Intervals (Unadjusted Effect-Size Spread):** Family- and session-clustered bootstrap 95% CIs (`n_boot = [TBD: >= 2000]`, `seed = [TBD]`), explicitly reflecting **out-of-sample family generalization** (not merely run-to-run variation across fixed families). Unadjusted 95% percentile CIs are reported alongside `p_raw` and Holm-adjusted `p_adj` for effect-size estimation only.
-- **Random Baseline:** Exact finite-sample expected PR-AUC computed via `[TBD: 10,000]` random permutations (reporting Monte Carlo mean, SD, and 5th–95th percentile band) rather than a single arbitrary seed draw.
-- **Deployable Operating Points (Dev-Calibrated Only):** Thresholds for `[TBD: target benign val FPR e.g. 1% and fixed alert budgets]` selected strictly from **nested dev OOF predictions** and evaluated once on blind test (never calibrated on test positives/negatives).
-
-### Secondary Pre-Registered Metrics & Diagnostics (`OD-V2-13`, `OD-V2-14`, `OD-V2-15`)
-- **Top-`k` Ranking & Slice Views:** `tie_expected_precision_at_k` and `tie_expected_recall_at_k` at `k in {10, 20, 50, 100}`, plus `ROC-AUC`. Combined hard-negative drift slices (`benign_drift`-only negatives; `file+run_key+task+service` hard-negative view), per-`artifact_type`, and per-family (`N_test_families` breakdown).
-- **Tail-Risk & Analyst-Effort Metrics (`OD-V2-14`, Secondary Pre-Registered):**
-  - `worst_positive_rank` (1-indexed rank and percentile of the worst-ranked positive artifact),
-  - Recall at analyst review budgets (`k in {10, 20, 50, 100}`),
-  - Positives in bottom 50% and bottom 90% of model scores (`pos_in_bottom_50pct`, `pos_in_bottom_90pct`),
-  - `effort@recall` (`effort_at_recall_50`, `effort_at_recall_80`, `effort_at_recall_90` — count and fraction of artifacts reviewed to reach 50%, 80%, and 90% recall).
-  - **Random Tail Audit Sample-Size Calculator *(Future Work Only)*:** Observing `0` missed positives in $n$ uniform random tail draws yields a 95% upper bound on the missed-positive rate of $p_{\text{upper}}(n) = 1 - 0.05^{1/n}$ (e.g., $n = 5 \to 45.1\%$, $n = 59 \to 5.0\%$, $n = 300 \to 1.0\%$). Any live/field tail audit is deferred strictly as **future work only**.
-- **Referential-Graph Arm (`v2_refgraph`, `OD-V2-13`, `OD-V2-16`, `OD-V2-17`, Secondary Pre-Registered):**
-  - **Three-Variant Comparison (`OD-V2-17`):** Compare `(a)` unpropagated OOF base ranker alone vs `(b)` naive undirected unsplit propagation (hub-collapse baseline) vs `(c)` hub-attenuated typed propagation (context-split unidirectional `EXECUTES_IMAGE`, training-pool-only IHF weighting, four-state `$MFT` ref resolution, and additive per-edge source contributions per [`REFGRAPH_SPEC.md`](REFGRAPH_SPEC.md)). Heterogeneous GNNs (`R-GCN`, `GAT`) remain deferred outside v2 core (`OD-V2-18`).
-  - **Per-Stratum Reporting:** Reported in its own secondary table block **separately per blind-test stratum (`executed`, `dormant`)** (plus dev-only `emulated` disclosure where applicable), alongside per-`artifact_type` static link coverage and `resolved` / `dangling` / `ambiguous` MFT/path counts.
-  - **Evaluation Metrics Compared Across `(a)`, `(b)`, `(c)`:** `PR-AUC`, `effort@recall` (`50%`, `80%`, `90%` — artifact count and fraction), recall at fixed analyst review budgets (`k in {10, 20, 50, 100}`), and `OD-V2-14` tail-risk metrics (`worst_positive_rank`, `pos_in_bottom_50pct`, `pos_in_bottom_90pct`), with family-clustered paired bootstrap 95% CIs and two-sided paired family-clustered bootstrap `p_raw` for `(c) vs (a)` and `(c) vs (b)` (strictly outside the primary dual-config winner rule).
-  - **Strict OOF & Anti-Leakage Invariants:** Graph propagation consumes **strictly out-of-fold (OOF) base scores** inside dev CV and `--final` tuning (never in-sample fits); `RefGraphIDFModel` ($\text{df}_{\text{train}}$, $|\mathcal{D}_{\text{train}}|$) and degree statistics fit solely on training folds (`assert_graph_inputs_clean()` blocks labels, provenance, Sysmon, process-tree fields, and timestamps with `LeakageError`).
-  - **Pre-Scoring Pilot Go/No-Go Gate (`OD-V2-20` — *confirmed by Mokh 2026-11-23*):**
-    - Computed on **Stage A pilot data BEFORE any model training or scoring**: measure the fraction of persistence and execution-type artifacts (`artifact_type in {"task", "service", "run_key", "wmi_subscription", "prefetch"}`) that have **at least one uniquely resolved static link** (`resolved_single` target in `linked_artifact_keys`).
-    - **Decision Rule:** If fewer than **`50%`** of pilot persistence/execution-type artifacts have `>= 1` uniquely resolved link, `v2_refgraph` is downgraded and reported strictly as **exploratory only** (`[TBD: Stage A pilot persistence/execution unique-link coverage = ___% -> secondary pre-registered vs. exploratory-only status]`; clean-image dry-run baseline after `TaskCache` + `CLSID` upgrade: **`99.62%` across `792/795` rows**, with `task` at `99.63%` (`271/272`)).
-
-### Cross-Stratum Execution Delta (`executed` vs `dormant` on Paired `sample_sha256` Binaries, `OD-V2-15`, Secondary Pre-Registered)
-Evaluated strictly over paired `sample_sha256` binaries ($s \in \mathcal{S}_{\text{paired}}$, linked by `pair_group_id`) tested in both `dormant` (unexecuted staging run) and `executed` (detonated from the matching initial staging path) strata within the same split pool:
-1. **Stratum-Conditional PR-AUC & Recall@k Delta ($\Delta_{\text{exec}}$):**
-   $$\Delta_{\text{exec}}(M, C) = \text{Metric}(M, C \mid \text{executed}) - \text{Metric}(M, C \mid \text{dormant})$$
-   computed across configurations $C \in \{\text{full\_20}, \text{no\_content}, \text{drop\_signature}, \text{no\_content\_no\_sig}\}$ *(plus secondary `v2_refgraph`)* with **family-clustered paired bootstrap 95% CIs** (`n_boot = [TBD: >= 2000]`), resampling whole malware families/clusters so paired `executed` and `dormant` runs of family $f$ are always resampled together.
-2. **Sample-Level First-Detection Rank / Effort Delta ($\Delta_{\text{first\_hit}}$):**
-   Because detonation emits multiple host artifacts whereas `dormant` runs contain only the quiescent binary row (resulting in differing row-level positive prevalences across strata), define for each paired sample $s \in \mathcal{S}_{\text{paired}}$:
-   - $\text{Rank}_{\min}(s, \text{stratum})$: the 1-indexed rank (and normalized percentile effort $\text{Rank}_{\min} / N_{\text{run}}$) of the **highest-scored `attacker_induced` artifact** produced by sample $s$ within its host run;
-   - Report **median and IQR** of $\Delta_{\text{first\_hit}}(s) = \text{Rank}_{\min}(s, \text{dormant}) - \text{Rank}_{\min}(s, \text{executed})$ alongside **Intrusion-Detection Recall@k** (fraction of paired malware samples $s \in \mathcal{S}_{\text{paired}}$ with at least one `attacker_induced` artifact inside the top $k \in \{5, 10, 20, 50\}$ ranked host leads).
-3. **Byte/Signature Evasion Resilience Hypothesis (Pre-Registered Secondary Contrast):**
-   Explicitly test the pre-registered hypothesis that under `dormant` staging, removing file content and signature signals (`full_20` $\to$ `no_content` / `drop_signature` / `no_content_no_sig`) causes a severe ranking drop ($\Delta_{\text{ablation, dormant}}$), whereas after detonation (`executed`), the multi-artifact OS execution footprint preserves ranking performance under the exact same feature deprivation:
-   $$|\Delta_{\text{ablation, executed}}| < |\Delta_{\text{ablation, dormant}}|$$
-   evaluated via family-clustered paired bootstrap 95% CIs and two-sided paired family-clustered bootstrap p-values (`p_raw`).
-
-- **Rule Baselines, Learning Curves & Explainability:** `rules_binary` and `rules_count`; family-grouped dev learning curve across `[TBD: fractions]` × `K = 5` seeds; scale-invariant SHAP normalized share & rank comparison, AE reconstruction error, IF permutation drop, and RF/XGB/MLP error analysis.
+- **Evaluated Arms (~20 Total):**
+  - *Linear / Kernel / Instance:* `lr`, `linear_svc` (+ Platt), `nystroem_rbf`, `knn_capped` (`15k` stratified index cap)
+  - *Classical & Boosted Trees:* `dt`, `rf`, `et`, `histgbdt`, `xgb`, `lgbm`, `catboost`
+  - *Learning-to-Rank (`dev_ltr`):* `xgb_ranker`, `lgbm_ranker`
+  - *Neural / Deep Tabular (RTX 2050 CUDA):* `mlp`, `ft_transformer` / `resnet_tabular` *(optional `tabpfn_10k` exploratory-only if weights available)*
+  - *Unsupervised (`y == 0` benign fit):* `iforest`, `ae`, `nystroem_ocsvm`, `lof_capped` (`15k` benign index cap)
+  - *Deterministic / Baselines / Hybrid:* `rules_binary`, `rules_count`, `mc_random` (`10,000` perms), `rule_ml_hybrid`
+- **Equal Tuning Budget (`OD-V2-06`):** **ALL tuned models** receive an **identical `20`-trial random/Optuna budget** inside **`5`-fold outer × `3`-fold inner** family-grouped nested CV (`V2_N_SEARCH_TRIALS = 20`, `V2_OUTER_FOLDS = 5`, `V2_INNER_FOLDS = 3`), evaluated across **`K = 5` final seeds (`[42, 43, 44, 45, 46]`)**.
+- **Natural-Prevalence Calibration & Thresholds:** Probability calibrators (`Platt` / `Isotonic`) and dev-calibrated `1%` & `5%` FPR thresholds are fitted strictly on **natural-prevalence dev OOF predictions** (or exact dev-only Bayes prior-odds adjustment from `dev_dedup` to natural dev prevalence), NEVER on raw `dev_dedup` (`~7%`) prevalence.
 
 ---
 
-## 5. Multi-Seed Training, Nested Dev CV & Equal Tuning Budgets
+## 4. Hypotheses (`H1`–`H4`), Multiple-Comparison Control & 5-Axis Selection
 
-- **Models Evaluated (All Preserved in Every Table):** Supervised: `rf`, `xgb`, `mlp`, `lr`; Unsupervised (benign-only `fit` + benign-only `pre.fit`, `n_attack_seen_in_fit_ == 0`): `ae`, `iforest` (default selection strictly label-free; any labeled-val selection explicitly tagged `"label-selected"`).
-- **Nested Family-Grouped CV (Dev):** Outer `[TBD: 5]`-fold family-grouped CV estimates unbiased dev PR-AUC (+ leave-one-family-out LOFO table); inner `[TBD: 4]`-fold family-grouped CV tunes hyperparameters with an **equal trial budget `[TBD: 30 (fallback 20 if pilot compute heavy)]`** per tuned arm (including `v2_refgraph` propagation hyperparameters tuned solely inside inner nested CV over OOF base predictions and training-fold-only IHF statistics).
-- **Early Stopping & Effective Training Size:** `mlp` and `ae` early-stop exclusively on disjoint **inner** grouped validation splits (never outer CV validation folds). Unsupervised `iforest` and all non-early-stopped arms train on `100%` of eligible dev rows (never dropping a fold for unused `X_val`). Config-matched hyperparameters are mandatory for `full_20` vs `no_content`, `v2_refgraph`, and all ablations.
-- **Multi-Seed `--final` Protocol:** Run across `K = 5` independent seeds (`seeds = [TBD: 42, 43, 44, 45, 46]`), reporting single-seed mean ± std PR-AUC alongside the K-seed ensemble score for both dev and blind test.
-
----
-
-## 6. Pre-Registered Confirmatory Comparisons & Winner Rule
-
-- **Fixed Pre-Registered Comparison Family (No Post-Hoc `best_ml` Selection):**
-  - `[TBD: finalize exact pair list, e.g.:]`
-    1. `xgb` vs `rf`
-    2. `rf` vs `mlp`
-    3. `xgb` vs `mlp`
-    4. `rf` vs `rules_count` & `rf` vs `rules_binary`
-    5. `xgb` vs `rules_count` & `xgb` vs `rules_binary`
-    6. `mlp` vs `rules_count` & `mlp` vs `rules_binary`
-- **Multiple-Comparison Adjustment (Bootstrap p-Values Only — Do NOT Adjust CIs):**
-  - For each pre-registered pair $(A, B)$ within a primary slice (`executed`, `dormant`, `[pooled]`) and primary config (`full_20`, `no_content`), compute the **two-sided paired family-clustered bootstrap p-value** from the $B$ paired bootstrap replicates $\{\Delta_b = \text{PR-AUC}_b(A) - \text{PR-AUC}_b(B)\}_{b=1}^B$:
-    $$p_{\text{raw}} = 2 \cdot \min\left(\frac{1 + \#\{\Delta_b \le 0\}}{1 + B}, \; \frac{1 + \#\{\Delta_b \ge 0\}}{1 + B}\right)$$
-  - Apply **Holm-Bonferroni step-down adjustment to `p_raw`** across the fixed pre-registered comparison family (`p_adj`, significance threshold `alpha = 0.05`). **Holm-Bonferroni adjusts bootstrap p-values, NOT percentile confidence intervals**; unadjusted 95% family-clustered bootstrap CIs are reported alongside `p_raw` and `p_adj` for effect-size context only.
-- **Exact Dual-Configuration Winner Rule:**
-  - Declare $A$ better than $B$ (`a_better` or `b_better`) **only if Holm-adjusted `p_adj < 0.05` in the SAME direction in BOTH `full_20` and `no_content`**.
-  - Otherwise declare **`not distinguishable`** (neither config has `p_adj < 0.05`) or **`configuration-dependent`** (`p_adj < 0.05` in only one config, or opposite directions).
-  - Secondary arms (`v2_refgraph`, `[TBD: optional v2_extended]`) and secondary metrics (`OD-V2-14` tail-risk/effort, `OD-V2-15` Cross-Stratum Execution Delta $\Delta_{\text{exec}}$, $\Delta_{\text{first\_hit}}$, Intrusion-Detection Recall@k, and Byte/Signature Evasion Resilience Hypothesis $|\Delta_{\text{ablation, executed}}| < |\Delta_{\text{ablation, dormant}}|$) are strictly outside this confirmatory winner rule and are evaluated using family-clustered paired bootstrap 95% CIs (resampling whole families/clusters together) and two-sided paired family-clustered bootstrap p-values (`p_raw`).
-
-### Statistical-Power Note (Family-Clustered Paired Bootstrap Under Blind-Test Family Count $F_{\text{test}}$)
-- **Expected Blind-Test Family Count ($F_{\text{test}}$):** `[TBD: exact F_test locked post-pilot; target >= 10–15 distinct malware families + disjoint ssdeep/TLSH clusters per OD-V2-01]`, paired across `executed` and `dormant` strata (`OD-V2-05`, `OD-V2-09`) alongside `[TBD: B_test]` disjoint blind-test benign host sessions.
-- **Effective Degrees of Freedom & Minimum Detectable Effect ($\text{MDE}$):**
-  - Because `family_clustered_paired_bootstrap_p` resamples whole malware family/packer/pair clusters ($F_{\text{test}}$ positive clusters) and whole benign sessions ($B_{\text{test}}$ negative clusters), the sampling variance of a paired model difference $\Delta = \text{PR-AUC}(A) - \text{PR-AUC}(B)$ is dominated by between-family heterogeneity $\hat{\sigma}_{\Delta,\text{family}}^2 / F_{\text{test}}$ rather than the raw artifact count $N_{\text{rows}}$.
-  - Under the 9-pair Holm-Bonferroni family (`alpha = 0.05`, strictest step-1 raw threshold $\alpha / 9 \approx 0.0056$, finite-bootstrap resolution floor $2 / (1 + B_{\text{boot}})$ requiring $B_{\text{boot}} \ge 2000$), the approximate two-sided minimum detectable paired PR-AUC difference at 80% power scales as:
-    $$\text{MDE}_{\Delta\text{PR-AUC}} \approx \frac{\left(z_{1 - \alpha/(2m)} + z_{0.80}\right) \cdot \hat{\sigma}_{\Delta,\text{family}}}{\sqrt{F_{\text{test}}}} \approx \frac{3.62 \cdot \hat{\sigma}_{\Delta,\text{family}}}{\sqrt{F_{\text{test}}}}$$
-  - **Qualitative Interpretation (Pre-Pilot):** With $F_{\text{test}} \in [10, 15]$ blind-test families, the family-clustered paired bootstrap + Holm-Bonferroni procedure is powered to detect **consistent moderate-to-large cross-family improvements** ($\Delta\text{PR-AUC} \gtrsim 0.94\text{--}1.15\,\hat{\sigma}_{\Delta,\text{family}}$, e.g., large separation between tree ensembles and static heuristic rule counts or naive hub-collapsed propagation), whereas **small single-digit PR-AUC differences among top supervised rankers** (such as `xgb` vs `rf` when $\Delta\text{PR-AUC} \ll \hat{\sigma}_{\Delta,\text{family}}$) are expected to remain **`not distinguishable`** and must be reported as such rather than over-claimed.
-  - **Post-Pilot Numerical Calibration (`[TBD]`):**
-    - Empirical dev/pilot between-family paired-difference SD $\hat{\sigma}_{\Delta,\text{family}}$: `[TBD: populate from Stage A pilot / nested dev OOF]`.
-    - Locked blind-test cluster counts $(F_{\text{test}}, B_{\text{test}})$ and simulated 80%-power $\text{MDE}_{\Delta\text{PR-AUC}}$ (step-1 Holm $\alpha/9$ and step-9 $\alpha$): `[TBD: populate after pilot before --final]`.
+- **Pre-Registered Hypotheses (`REPLAN_COMPARATIVE_STUDY.md` §6):**
+  - **`H1` (Split-Leakage Sensitivity):** Random row split vs family + fuzzy-hash grouped split (`>= +0.05` vs falsified `< 0.02`).
+  - **`H2` (Provenance-Label Trust):** Strict `labeler_v2` provenance vs heuristic pseudo-labels anchored by blinded human review (`kappa >= 0.70`, `400` friend / `80` Mokh overlap).
+  - **`H3` (Emulated vs Real Transfer):** `emulated-only` vs `real-matched` (size-matched control) vs `real-full` vs `mixed` tested on unseen blind real malware.
+  - **`H4` (Decisive Paradigm Separation):** Omnibus Friedman + Nemenyi CD + pre-registered `m = 10` paradigm-representative Holm-Bonferroni contrasts + 5-axis decision scorecard.
+- **Per-State & Descriptive Contrasts:** Report `executed`, `dormant`, and pooled real-malware metrics separately alongside evasion ablations (`drop_signature`, `no_content`, `no_content_no_sig`) strictly as plain descriptive tables (zero novelty claim).
+- **Two-Stage Inference & 5-Axis Selection:**
+  1. Stage 1: Omnibus Friedman ($\alpha = 0.05$) + Nemenyi CD over blind-test family-level `AP`.
+  2. Stage 2: Pre-registered `m = 10` paradigm-representative contrasts (selected on dev OOF before unblinding test) evaluated with family-clustered paired bootstrap ($B \ge 2000$) + step-down Holm-Bonferroni (`p_adj < 0.05` on p-values only; unadjusted 95% CIs reported for spread).
+  3. 5-Axis Scorecard: Discrimination (`35%`), Effort & Tail Risk (`25%`), Evasion Resilience (`15%`), Stability/LOFO/ECE (`15%`), CPU Inference + Top-25 SHAP Latency (`10%`, disqualified if `> 5.0s/host` or fails `rules_count`/`mc_random`).
 
 ---
 
-## 7. Deferred Post-v2-Final Stretch Items (`OD-V2-19` — Strictly After v2 `--final`)
+## 5. Pre-`--final` Sign-Off Gate
 
-The following stretch evaluations are explicitly **deferred until after v2 `--final` completes**, must never influence v2 dev modeling or blind-test freeze decisions, and keep external prior-art comparisons in [`NOVELTY_VERIFICATION.md`](NOVELTY_VERIFICATION.md) tagged **`UNVERIFIED`** until primary sources are checked (to our knowledge, pending verification):
-1. **Timestomp / Temporal-Baseline Robustness Experiment:** Evaluate static pointer-based propagation alongside a temporal-window grouping baseline before and after deterministic timestamp perturbation on synthetic images.
-2. **Prefetch-Disabled Windows Server Ablation (`EnablePrefetcher = 0`):** Quantify secondary `v2_refgraph` degradation and fallback link yield when `.pf` records are absent and links rely solely on `$MFT`, Registry (`Run`/`CLSID`/`Services`), Scheduled Tasks, WMI, Amcache, Shimcache, and LNK/JumpLists.
-3. **Public Third-Party Corpora (`ADFIR`, `NIST CFReDS`, `Magnet CTF`):** Evaluated strictly as **qualitative case studies with zero hyperparameter tuning** and zero feedback into v2 split selection.
-
----
-
-## 8. Pre-`--final` Execution & Sign-Off Gate
-
-```text
-[TBD: Exact v2 CLI commands populated and verified after Phase 4 dev run completes]
-```
-
-### Mandatory Sign-Off Checklist Before Removing `DRAFT SKELETON` Status
-- [ ] Written supervisor approval recorded (**Granted `2026-11-23` by Supervisor Marawan, AASTMT — *"Research Approval Request: Controlled Malware Analysis for DFIR Triage"*, separate institutional/legal ethics review *"Not Required — Waived by Supervisor"***) and Operator executed & signed off Gate 0 safety checklist (`NEG-01..10`, base hash, vault verify, ASUS dedicated isolated user check; `V2_PLAN.md` §7, `OD-V2-07`).
-- [ ] Stage A pilot completed and yield metrics recorded in `docs/v2/` (`[TBD: pilot report link]`), including pre-scoring `OD-V2-20` *(confirmed by Mokh 2026-11-23)* persistence/execution unique-link coverage check (`>= 50%` vs exploratory-only downgrade) and empirical between-family SD $\hat{\sigma}_{\Delta,\text{family}}$ for the §6 Statistical-Power Note.
-- [ ] Independent blinded human review completed (friend = primary blinded reviewer, Mokh = 20% overlap scorer; `review_sample_v2.csv`, $\kappa = \text{[TBD]}$) and `label_corrections_v2.csv` committed.
-- [ ] `v2_blind_test_manifest.json` (`blind_test_sha256`) frozen before any dev modeling.
-- [ ] Nested dev CV + multi-seed learning curves + dev thresholds frozen cleanly in git.
-- [ ] All `[TBD]` placeholders in this document replaced with exact verified values and committed prior to running `--final`.
+- [ ] Written Supervisor Marawan (AASTMT) approvals (`2026-11-23` + `2026-11-25` addendum) and Mokh `0400` `GATE0_SIGNED_OFF` + `preflight` + `--canary` (`CANARY_PASSED`) verified.
+- [ ] Stage A Pilot completed (`docs/v2/STAGE_A_PILOT_REPORT.md`) with calibrated detonation yield and empirical between-family SD $\hat{\sigma}_{\Delta,\text{family}}$.
+- [ ] Disjoint `dev`/`blind_test` benign pool audit passed (`check_template_quantization` PASS, `0` cross-split overlap).
+- [ ] Blinded human review completed (`400` friend / `80` Mokh overlap, $\kappa = \text{[TBD]}$) and `label_corrections_v2.csv` committed.
+- [ ] `v2_blind_test_manifest.json` (`blind_test_sha256`) frozen before any dev modeling, and all `[TBD]` placeholders populated.

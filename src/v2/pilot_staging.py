@@ -1,21 +1,17 @@
-"""Zero-SSH / Zero-Guest-Agent offline run staging builder for Stage A Pilot (`OD-V2-04`, `OD-V2-05`, `OD-V2-07`).
+"""Zero-SSH / Zero-Guest-Agent offline run staging builder (`OD-V2-04`, `OD-V2-05`, `OD-V2-07`, `OD-V2-09`).
 
 Because `01_firewall_win11_isolated.sh` drops all host-to-guest traffic on `virbr1` and
 `02_domain_xml_hardening.md` removes `qemu-guest-agent`, SPICE clipboard/file transfer, and shared folders,
-Stage A pilot runs stage their deterministic manifest, benign workload script, and (after Gate 0 sign-off)
-paired `dormant` / `executed` payload via a per-run **read-only ISO-9660 virtual CD-ROM** (`DFIR_STAGE`)
-attached before `virsh start win11`.
+runs stage their deterministic manifest, procedural benign workload, and (after Gate 0 sign-off)
+paired `dormant` / `dormant_batch` / `executed` payloads via a per-run **read-only ISO-9660 virtual CD-ROM**
+(`DFIR_STAGE`) attached before `virsh start win11`.
 
-An in-guest pre-baked bootstrapper (`C:\\DFIR-Bootstrap\\Invoke-StagePayload.ps1`, registered under
-`\\DFIR-StageRunner` during clean base image prep before sealing `chmod 0444`) reads the read-only
-`DFIR_STAGE` volume at boot:
-- `control` runs: executes only the deterministic benign workload (`execute_payload = False`).
-- `dormant` runs (requires Gate 0 sign-off): copies the payload to `staging_target_path` (matching its
-  paired `executed` run), verifies its SHA-256 on disk, and **never executes it**.
-- `executed` runs (requires Gate 0 sign-off): copies the payload to the matching `staging_target_path`,
-  verifies its SHA-256, emits a Sysmon/ETW root marker, and detonates it.
-The host watchdog terminates the VM via `virsh destroy` after `dwell_seconds`, and `offline_extractor.py`
-parses the closed overlay in user space (`--base-cache-path`). Zero SSH or `qemu-ga` channels ever open.
+Safety policy:
+- Enforces centralized fail-closed `FORBIDDEN_MALWARE_FAMILIES_AND_TAGS` blocking ransomware, wipers,
+  and self-propagating worms across single-sample and dev-only `dormant_batch` specs.
+- `dormant_batch` is strictly forbidden on `split_pool == "blind_test"` (blind-test dormant stays 1 sample/boot)
+  and stages files inside `benign_workload.ps1` with `stratum="dormant_batch"` so the pre-baked
+  `C:\\DFIR-Bootstrap\\Invoke-StagePayload.ps1` works without re-baking `win11_base.qcow2`.
 """
 from __future__ import annotations
 
@@ -30,29 +26,112 @@ import shutil
 import struct
 import subprocess
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import zipfile
 
 from src.utils.repro import utc_now_iso
+from src.v2.benign_generator_v2 import generate_benign_workload_bundle
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.I)
 SUPERVISOR_APPROVAL_REF = (
-    "Supervisor Marawan (AASTMT) written approval 2026-11-23 — "
+    "Supervisor Marawan (AASTMT) written approval 2026-11-23 + comparative study addendum 2026-11-25 — "
     "'Research Approval Request: Controlled Malware Analysis for DFIR Triage' "
-    "(Institutional Ethics Review: Not Required — Waived by Supervisor)"
+    "(Institutional Ethics Review: Not Required — Waived by Supervisor; hard exclusion of ransomware/wipers/worms)"
+)
+
+# Fail-closed blocklist covering ransomware, wipers, and self-propagating worms (exact tokens/slugs).
+FORBIDDEN_MALWARE_FAMILIES_AND_TAGS: frozenset[str] = frozenset({
+    # Ransomware
+    "ransom", "ransomware", "lockbit", "blackcat", "alphv", "conti", "ryuk", "revil", "sodinokibi",
+    "stop", "djvu", "stopdjvu", "phobos", "makop", "dharma", "crysis", "wannacry", "wcry", "wannacrypt",
+    "cerber", "gandcrab", "maze", "egregor", "netwalker", "clop", "cl0p", "blackbasta", "royal", "akira",
+    "medusa", "medusalocker", "babuk", "hive", "ragnarlocker", "darkside", "blackmatter", "avaddon", "pysa",
+    "rhysida", "bianlian", "qilin", "cactus", "8base", "snatch", "mallox", "zeppelin", "avoslocker",
+    "teslacrypt", "jigsaw", "badrabbit", "petya", "samsam", "globeimposter", "scarab", "cryptolocker",
+    "cryptowall", "locker",
+    # Wipers
+    "wiper", "diskwiper", "mbrwiper", "notpetya", "hermeticwiper", "caddywiper", "whispergate",
+    "isaacwiper", "acidrain", "swiftwiper", "doublezero", "shamoon", "disttrack", "olympicdestroyer",
+    "killdisk", "stonedrill", "zerocleare", "dustman", "crywiper", "azov",
+    # Self-propagating worms / file-infectors
+    "worm", "usb_worm", "usbworm", "smb_worm", "smbworm", "networm", "conficker", "downadup",
+    "sality", "virut", "ramnit", "stuxnet", "mydoom", "sobig", "blaster", "sasser", "nimda",
+    "slammer", "wannamine", "eternalblue", "xworm", "brontok", "vobfus", "gamarue", "andromeda",
+    "jenxcus", "neshta", "parite", "expiro",
+})
+
+# Substring stems (excludes "stop" so benign tokens like "desktop" are never falsely flagged).
+FORBIDDEN_SUBSTRING_STEMS: tuple[str, ...] = (
+    "ransom", "wiper", "worm", "lockbit", "wannacry", "notpetya", "hermeticwiper",
+    "caddywiper", "whispergate", "conficker", "sality", "virut", "ramnit", "djvu",
+    "phobos", "makop", "blackcat", "alphv", "revil", "conti", "ryuk", "clop",
+    "blackbasta", "cryptolocker",
 )
 
 
 class PilotStagingError(RuntimeError):
-    """Raised when a Stage A pilot staging request violates Gate 0 or paired-stratum invariants."""
+    """Raised when a staging request violates Gate 0, safety blocklist, or paired-stratum invariants."""
+
+
+def check_forbidden_malware_policy(
+    sample_family: str | None = None,
+    sample_category: str | None = None,
+    tags: Sequence[str] = (),
+    raw_signature: str | None = None,
+) -> str | None:
+    """Return a block reason if metadata matches ransomware, wiper, or worm blocklists; else None."""
+    fields: list[tuple[str, str]] = []
+    if sample_family:
+        fields.append(("sample_family", str(sample_family)))
+    if sample_category:
+        fields.append(("sample_category", str(sample_category)))
+    if raw_signature:
+        fields.append(("raw_signature", str(raw_signature)))
+    for t in tags or ():
+        if t is not None and str(t).strip():
+            fields.append(("tag", str(t)))
+
+    for fname, val in fields:
+        low = val.strip().lower()
+        tokens = [tok for tok in re.split(r"[^a-z0-9_]+", low) if tok]
+        sub_tokens = [tok for tok in re.split(r"[^a-z0-9]+", low) if tok]
+        slug = re.sub(r"[^a-z0-9]+", "", low)
+        all_candidates = set(tokens) | set(sub_tokens) | ({slug} if slug else set())
+
+        for cand in all_candidates:
+            if cand in FORBIDDEN_MALWARE_FAMILIES_AND_TAGS:
+                return f"Forbidden malware policy match ({fname}={val!r}, token={cand!r})"
+            for stem in FORBIDDEN_SUBSTRING_STEMS:
+                if stem in cand:
+                    return f"Forbidden malware policy match ({fname}={val!r}, stem={stem!r})"
+    return None
+
+
+def assert_allowed_malware_policy(
+    sample_family: str | None = None,
+    sample_category: str | None = None,
+    tags: Sequence[str] = (),
+    raw_signature: str | None = None,
+) -> None:
+    """Fail closed with `PilotStagingError` if sample metadata matches a forbidden category/family."""
+    reason = check_forbidden_malware_policy(
+        sample_family=sample_family,
+        sample_category=sample_category,
+        tags=tags,
+        raw_signature=raw_signature,
+    )
+    if reason is not None:
+        raise PilotStagingError(
+            f"BLOCKED (Supervisor Marawan safety policy — zero ransomware/wiper/worm): {reason}"
+        )
 
 
 @dataclass(frozen=True)
 class StageRunSpec:
-    """Deterministic specification for one zero-SSH Stage A pilot VM run."""
+    """Deterministic specification for one zero-SSH Win11 VM run."""
 
     run_id: str
-    stratum: str  # "control" | "dormant" | "executed"
+    stratum: str  # "control" | "dormant" | "executed" | "dormant_batch"
     benign_profile_id: str
     dwell_seconds: int = 120
     staging_target_path: str | None = None
@@ -63,13 +142,19 @@ class StageRunSpec:
     gate0_signed_off: bool = False
     dedicated_host_user_verified: bool = False
     supervisor_approval_ref: str = SUPERVISOR_APPROVAL_REF
+    sample_category: str | None = None
+    sample_tags: tuple[str, ...] = ()
+    split_pool: str = "dev"
+    batch_samples: tuple[dict[str, Any], ...] = ()
 
 
 def validate_stage_run_spec(spec: StageRunSpec) -> None:
-    """Enforce Gate 0 (`OD-V2-07`) and paired `dormant`/`executed` staging invariants (`OD-V2-05`, `OD-V2-09`)."""
+    """Enforce Gate 0 (`OD-V2-07`), safety exclusion policy, and paired/batch staging invariants."""
     st = str(spec.stratum).strip().lower()
-    if st not in ("control", "dormant", "executed"):
-        raise PilotStagingError(f"Invalid stratum {spec.stratum!r}; must be 'control', 'dormant', or 'executed'")
+    if st not in ("control", "dormant", "executed", "dormant_batch"):
+        raise PilotStagingError(
+            f"Invalid stratum {spec.stratum!r}; must be 'control', 'dormant', 'executed', or 'dormant_batch'"
+        )
     if int(spec.dwell_seconds) < 10 or int(spec.dwell_seconds) > 1800:
         raise PilotStagingError(f"dwell_seconds must be in [10, 1800], got {spec.dwell_seconds}")
 
@@ -78,9 +163,11 @@ def validate_stage_run_spec(spec: StageRunSpec) -> None:
             raise PilotStagingError("control stratum must have execute_payload=False")
         if spec.sample_sha256 is not None:
             raise PilotStagingError("control stratum must not stage any malware sample_sha256")
+        if spec.batch_samples:
+            raise PilotStagingError("control stratum must not carry batch_samples")
         return
 
-    # dormant or executed malware run -> enforce Gate 0 & Supervisor Marawan (AASTMT) conditions
+    # Malware runs -> enforce Gate 0 & Supervisor Marawan (AASTMT) conditions
     if not spec.gate0_signed_off:
         raise PilotStagingError(
             f"Gate 0 (OD-V2-07) is NOT signed off: refusing to stage {st!r} run {spec.run_id!r}. "
@@ -91,10 +178,57 @@ def validate_stage_run_spec(spec: StageRunSpec) -> None:
             "ASUS host condition (OD-V2-07b) not verified: dedicated isolated user account with zero personal "
             "credentials/sensitive data must be verified before staging malware runs."
         )
+
+    if st == "dormant_batch":
+        pool = str(spec.split_pool).strip().lower()
+        if pool != "dev":
+            raise PilotStagingError(
+                f"dormant_batch is strictly restricted to split_pool='dev' (got {spec.split_pool!r}); "
+                "blind_test dormant runs MUST be 1 sample per boot."
+            )
+        if spec.execute_payload:
+            raise PilotStagingError("dormant_batch must have execute_payload=False")
+        items = list(spec.batch_samples or ())
+        if not (1 <= len(items) <= 20):
+            raise PilotStagingError(f"dormant_batch requires 1..20 samples per overlay, got {len(items)}")
+        seen_shas: set[str] = set()
+        seen_paths: set[str] = set()
+        for idx, item in enumerate(items):
+            sha = str(item.get("sample_sha256") or "").strip().lower()
+            tpath = str(item.get("staging_target_path") or "").strip()
+            pid = str(item.get("pair_group_id") or "").strip()
+            if not _SHA256_RE.match(sha):
+                raise PilotStagingError(f"batch_samples[{idx}] invalid 64-hex sample_sha256: {sha!r}")
+            if not tpath.lower().startswith("c:\\") or not tpath.lower().endswith(".exe"):
+                raise PilotStagingError(
+                    f"batch_samples[{idx}] staging_target_path must be a C:\\...\\.exe path, got {tpath!r}"
+                )
+            if not pid:
+                raise PilotStagingError(f"batch_samples[{idx}] missing pair_group_id")
+            assert_allowed_malware_policy(
+                sample_family=item.get("sample_family"),
+                sample_category=item.get("sample_category"),
+                tags=item.get("sample_tags") or item.get("tags") or (),
+                raw_signature=item.get("raw_signature"),
+            )
+            if sha in seen_shas:
+                raise PilotStagingError(f"Duplicate sample_sha256 in dormant_batch: {sha}")
+            if tpath.lower() in seen_paths:
+                raise PilotStagingError(f"Duplicate staging_target_path in dormant_batch: {tpath}")
+            seen_shas.add(sha)
+            seen_paths.add(tpath.lower())
+        return
+
+    # Single-sample dormant or executed run
+    assert_allowed_malware_policy(
+        sample_family=spec.sample_family,
+        sample_category=spec.sample_category,
+        tags=spec.sample_tags or (),
+    )
     if not spec.sample_sha256 or not _SHA256_RE.match(str(spec.sample_sha256)):
         raise PilotStagingError(f"Valid 64-hex sample_sha256 required for {st!r} run, got {spec.sample_sha256!r}")
     if not spec.pair_group_id or not str(spec.pair_group_id).strip():
-        raise PilotStagingError(f"pair_group_id required to pair dormant/executed runs (OD-V2-05/09)")
+        raise PilotStagingError("pair_group_id required to pair dormant/executed runs (OD-V2-05/09)")
     if not spec.staging_target_path or not str(spec.staging_target_path).lower().startswith("c:\\"):
         raise PilotStagingError(
             f"staging_target_path must be an explicit C:\\ path shared by paired dormant & executed runs, "
@@ -161,13 +295,6 @@ def _build_minimal_iso9660(volume_label: str, files: dict[str, bytes]) -> bytes:
     sector_size = 2048
     label = volume_label.upper()[:32].ljust(32)
 
-    # Layout:
-    # Sectors 0..15: System Area (zeros)
-    # Sector 16: Primary Volume Descriptor (PVD)
-    # Sector 17: Volume Descriptor Set Terminator
-    # Sector 18: Path Table (L-table)
-    # Sector 19: Root Directory Record
-    # Sector 20+: File data extents
     sorted_names = sorted(files.keys())
     next_sector = 20
     file_sectors: dict[str, tuple[int, int]] = {}
@@ -195,27 +322,24 @@ def _build_minimal_iso9660(volume_label: str, files: dict[str, bytes]) -> bytes:
         rec[1] = 0
         rec[2:10] = _both32(extent_lba)
         rec[10:18] = _both32(data_len)
-        rec[18:25] = bytes([126, 11, 23, 0, 0, 0, 0])  # 2026-11-23 UTC
+        rec[18:25] = bytes([126, 11, 25, 0, 0, 0, 0])  # 2026-11-25 UTC
         rec[25] = flags
         rec[28:32] = _both16(1)
         rec[32] = id_len
         rec[33 : 33 + id_len] = ident
         return bytes(rec)
 
-    # Root directory sector (Sector 19)
     root_dir = bytearray()
     root_dir.extend(_dir_record(b"\x00", 19, sector_size, 0x02))
     root_dir.extend(_dir_record(b"\x01", 19, sector_size, 0x02))
     for idx, name in enumerate(sorted_names):
         lba, dlen = file_sectors[name]
-        # Store both an ISO 8.3 upper identifier and attach full name metadata in manifest
         stem = re.sub(r"[^A-Z0-9_]", "_", Path(name).stem.upper())[:8] or f"FILE{idx}"
         ext = re.sub(r"[^A-Z0-9_]", "", Path(name).suffix.upper().lstrip("."))[:3]
         iso_id = (f"{stem}.{ext};1" if ext else f"{stem}.;1").encode("ascii")
         root_dir.extend(_dir_record(iso_id, lba, dlen, 0x00))
     image[19 * sector_size : 19 * sector_size + len(root_dir)] = root_dir[:sector_size]
 
-    # Path table (Sector 18)
     pt = bytearray(10)
     pt[0] = 1
     pt[1] = 0
@@ -224,7 +348,6 @@ def _build_minimal_iso9660(volume_label: str, files: dict[str, bytes]) -> bytes:
     pt[8] = 0
     image[18 * sector_size : 18 * sector_size + len(pt)] = pt
 
-    # Primary Volume Descriptor (Sector 16)
     pvd = bytearray(sector_size)
     pvd[0] = 1
     pvd[1:6] = b"CD001"
@@ -242,14 +365,12 @@ def _build_minimal_iso9660(volume_label: str, files: dict[str, bytes]) -> bytes:
     pvd[881] = 1
     image[16 * sector_size : 17 * sector_size] = pvd
 
-    # Terminator (Sector 17)
     term = bytearray(sector_size)
     term[0] = 255
     term[1:6] = b"CD001"
     term[6] = 1
     image[17 * sector_size : 18 * sector_size] = term
 
-    # File extents
     for name in sorted_names:
         lba, dlen = file_sectors[name]
         start = lba * sector_size
@@ -384,6 +505,16 @@ def read_vault_payload_in_memory(
     return cp.stdout
 
 
+def _clean_iso_relpath(raw_name: str) -> str:
+    name = str(raw_name).strip()
+    if not name or name.startswith(("/", "\\")) or "\\" in name:
+        raise ValueError(f"ISO staging path must use clean relative POSIX segments, got {raw_name!r}")
+    parts = name.split("/")
+    if any(not p or p in (".", "..") for p in parts):
+        raise ValueError(f"Unsafe ISO staging path segment in {raw_name!r}")
+    return "/".join(parts)
+
+
 def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str, bytes]) -> Path:
     """Build a read-only ISO image with Joliet + RockRidge long filenames via `xorriso` (or pure-Python fallback)."""
     iso_p = Path(iso_path)
@@ -393,10 +524,7 @@ def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str,
 
     clean_files: dict[str, bytes] = {}
     for raw_name, payload in files.items():
-        name = str(raw_name)
-        if not name or "/" in name or "\\" in name or name in (".", ".."):
-            raise ValueError(f"ISO staging filename must be a clean root basename, got {raw_name!r}")
-        clean_files[name] = bytes(payload)
+        clean_files[_clean_iso_relpath(str(raw_name))] = bytes(payload)
 
     xorriso_bin = shutil.which("xorriso")
     alt_mkisofs = shutil.which("genisoimage") or shutil.which("mkisofs")
@@ -406,13 +534,15 @@ def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str,
         with tempfile.TemporaryDirectory(prefix="dfir_stage_iso_", dir=tmp_base) as tmp_dir:
             stage_root = Path(tmp_dir)
             os.chmod(stage_root, 0o700)
-            payload_tmp = stage_root / "payload.bin"
+            sensitive_paths: list[tuple[Path, int]] = []
             try:
                 for fname, payload in clean_files.items():
                     fpath = stage_root / fname
+                    fpath.parent.mkdir(parents=True, exist_ok=True)
                     fpath.write_bytes(payload)
-                    if fname == "payload.bin":
+                    if fname == "payload.bin" or fname.startswith("batch_payloads/"):
                         os.chmod(fpath, 0o400)
+                        sensitive_paths.append((fpath, len(payload)))
                 if xorriso_bin:
                     cmd = [
                         xorriso_bin,
@@ -439,28 +569,48 @@ def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str,
                     ]
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
             finally:
-                if payload_tmp.exists():
-                    try:
-                        os.chmod(payload_tmp, 0o600)
-                        payload_tmp.write_bytes(b"\x00" * min(len(clean_files.get("payload.bin", b"")), 4096))
-                        payload_tmp.unlink()
-                    except Exception:
-                        pass
+                for spath, slen in sensitive_paths:
+                    if spath.exists():
+                        try:
+                            os.chmod(spath, 0o600)
+                            spath.write_bytes(b"\x00" * min(slen, 4096))
+                            spath.unlink()
+                        except Exception:
+                            pass
         return iso_p
 
-    iso_p.write_bytes(_build_minimal_iso9660(volume_label, clean_files))
+    root_only = {k: v for k, v in clean_files.items() if "/" not in k}
+    iso_p.write_bytes(_build_minimal_iso9660(volume_label, root_only))
     return iso_p
+
+
+def _write_cdrom_xml(xml_path: Path, iso_path: Path) -> None:
+    xml_path.write_text(
+        f"""<disk type='file' device='cdrom'>
+  <driver name='qemu' type='raw'/>
+  <source file='{iso_path.resolve()}'/>
+  <target dev='sdc' bus='sata'/>
+  <readonly/>
+</disk>
+""",
+        encoding="utf-8",
+    )
 
 
 def build_stage_bundle(
     spec: StageRunSpec,
     out_dir: str | Path,
     sample_vault_file: str | Path | None = None,
-    benign_script_text: str = "# Benign workload placeholder\n",
+    benign_script_text: str | None = None,
     extra_iso_files: Mapping[str, bytes] | None = None,
     archive_password: str | bytes | None = "infected",
+    benign_pools_root: str | Path | None = None,
+    run_seed: int | None = None,
 ) -> dict[str, Path]:
     """Validate `spec`, decrypt vault sample into RAM (if malware run), verify SHA-256, and build `DFIR_STAGE` ISO."""
+    if str(spec.stratum).strip().lower() == "dormant_batch":
+        raise PilotStagingError("Use build_dormant_batch_bundle(...) for dormant_batch specs")
+
     validate_stage_run_spec(spec)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -486,9 +636,29 @@ def build_stage_bundle(
             )
         iso_files["payload.bin"] = payload_bytes
 
+    benign_manifest_path: Path | None = None
+    if benign_script_text is None:
+        ben_bundle = generate_benign_workload_bundle(
+            run_id=spec.run_id,
+            split_pool=spec.split_pool,
+            benign_profile_id=spec.benign_profile_id,
+            run_seed=run_seed,
+            benign_pools_root=benign_pools_root,
+        )
+        eff_benign_text = ben_bundle["ps1_text"]
+        for bname, bbytes in ben_bundle["extra_iso_files"].items():
+            iso_files[str(bname)] = bytes(bbytes)
+        benign_manifest_path = out_path / "benign_manifest.json"
+        benign_manifest_path.write_text(
+            json.dumps(ben_bundle["benign_manifest"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        eff_benign_text = str(benign_script_text)
+
     manifest_bytes = json.dumps(manifest_dict, indent=2, sort_keys=True).encode("utf-8")
     bootstrapper_bytes = generate_guest_bootstrapper_ps1().encode("utf-8")
-    benign_bytes = _inject_isolated_net_preamble(str(benign_script_text)).encode("utf-8")
+    benign_bytes = _inject_isolated_net_preamble(eff_benign_text).encode("utf-8")
 
     iso_files["run_manifest.json"] = manifest_bytes
     iso_files["Invoke-StagePayload.ps1"] = bootstrapper_bytes
@@ -508,23 +678,166 @@ def build_stage_bundle(
     build_stage_iso(iso_path, "DFIR_STAGE", iso_files)
 
     xml_path = out_path / "cdrom_device.xml"
-    xml_path.write_text(
-        f"""<disk type='file' device='cdrom'>
-  <driver name='qemu' type='raw'/>
-  <source file='{iso_path.resolve()}'/>
-  <target dev='sdc' bus='sata'/>
-  <readonly/>
-</disk>
-""",
-        encoding="utf-8",
-    )
-    return {
+    _write_cdrom_xml(xml_path, iso_path)
+    out = {
         "manifest": manifest_path,
         "bootstrapper": bootstrap_path,
         "benign_workload": benign_path,
         "iso": iso_path,
         "cdrom_xml": xml_path,
     }
+    if benign_manifest_path is not None:
+        out["benign_manifest"] = benign_manifest_path
+    return out
+
+
+_DORMANT_BATCH_PS1_LOOP = r"""
+# Stage dev-only dormant batch payloads (NEVER executes any staged binary; compatible with baked Invoke-StagePayload.ps1)
+$batchVol = Get-Volume | Where-Object { $_.FileSystemLabel -eq "DFIR_STAGE" -and $_.DriveLetter } | Select-Object -First 1
+if ($batchVol) {
+    $bStageRoot = "$($batchVol.DriveLetter):\"
+    $bManifestPath = Join-Path $bStageRoot "run_manifest.json"
+    if (Test-Path -LiteralPath $bManifestPath) {
+        $bMan = Get-Content -LiteralPath $bManifestPath -Raw | ConvertFrom-Json
+        if ($bMan.stratum -eq "dormant_batch" -and $bMan.batch_samples) {
+            foreach ($bs in $bMan.batch_samples) {
+                $srcRel = ([string]$bs.iso_rel_path).Replace("/", "\")
+                $srcFile = Join-Path $bStageRoot $srcRel
+                $dstFile = [string]$bs.staging_target_path
+                $dstDir = Split-Path -Parent $dstFile
+                if (-not (Test-Path -LiteralPath $dstDir)) {
+                    New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+                }
+                Copy-Item -LiteralPath $srcFile -Destination $dstFile -Force
+                $actual = (Get-FileHash -LiteralPath $dstFile -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actual -ne ([string]$bs.sample_sha256).ToLowerInvariant()) {
+                    throw "SHA-256 mismatch on dormant_batch sample: $actual != $($bs.sample_sha256)"
+                }
+            }
+        }
+    }
+}
+"""
+
+
+def build_dormant_batch_bundle(
+    spec: StageRunSpec,
+    out_dir: str | Path,
+    sample_vault_files: Mapping[str, str | Path] | Sequence[str | Path],
+    benign_script_text: str | None = None,
+    extra_iso_files: Mapping[str, bytes] | None = None,
+    archive_password: str | bytes | None = "infected",
+    benign_pools_root: str | Path | None = None,
+    run_seed: int | None = None,
+) -> dict[str, Path]:
+    """Build a zero-rebake dev-only `dormant_batch` ISO staging up to 20 dormant samples inside `benign_workload.ps1`.
+
+    Hard-refuses `split_pool != "dev"` so blind-test dormant runs remain strictly 1 sample per boot.
+    """
+    validate_stage_run_spec(spec)
+    if str(spec.stratum).strip().lower() != "dormant_batch":
+        raise PilotStagingError(f"build_dormant_batch_bundle requires stratum='dormant_batch', got {spec.stratum!r}")
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    items = list(spec.batch_samples)
+
+    if isinstance(sample_vault_files, Mapping):
+        vault_by_sha = {str(k).lower(): Path(v) for k, v in sample_vault_files.items()}
+        resolved_vaults = [vault_by_sha.get(str(it["sample_sha256"]).lower()) for it in items]
+    else:
+        if len(sample_vault_files) != len(items):
+            raise PilotStagingError(
+                f"sample_vault_files count ({len(sample_vault_files)}) != batch_samples count ({len(items)})"
+            )
+        resolved_vaults = [Path(v) for v in sample_vault_files]
+
+    iso_files: dict[str, bytes] = {}
+    batch_manifest_entries: list[dict[str, Any]] = []
+    for idx, (item, vpath) in enumerate(zip(items, resolved_vaults)):
+        if vpath is None:
+            raise PilotStagingError(f"Missing vault archive for dormant_batch sample {item['sample_sha256']}")
+        sha = str(item["sample_sha256"]).lower()
+        payload_bytes = read_vault_payload_in_memory(vpath, password=archive_password)
+        actual_sha = hashlib.sha256(payload_bytes).hexdigest().lower()
+        if actual_sha != sha:
+            raise PilotStagingError(f"Vault SHA-256 mismatch for {sha}: got {actual_sha}")
+        iso_rel = f"batch_payloads/sample_{idx:02d}.bin"
+        iso_files[iso_rel] = payload_bytes
+        batch_manifest_entries.append({
+            "iso_rel_path": iso_rel,
+            "staging_target_path": str(item["staging_target_path"]),
+            "sample_sha256": sha,
+            "sample_family": item.get("sample_family"),
+            "sample_category": item.get("sample_category"),
+            "pair_group_id": str(item["pair_group_id"]),
+            "packer_cluster": item.get("packer_cluster"),
+        })
+
+    benign_manifest_path: Path | None = None
+    if benign_script_text is None:
+        ben_bundle = generate_benign_workload_bundle(
+            run_id=spec.run_id,
+            split_pool="dev",
+            benign_profile_id=spec.benign_profile_id,
+            run_seed=run_seed,
+            benign_pools_root=benign_pools_root,
+        )
+        eff_benign_text = ben_bundle["ps1_text"]
+        for bname, bbytes in ben_bundle["extra_iso_files"].items():
+            iso_files[str(bname)] = bytes(bbytes)
+        benign_manifest_path = out_path / "benign_manifest.json"
+        benign_manifest_path.write_text(
+            json.dumps(ben_bundle["benign_manifest"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        eff_benign_text = str(benign_script_text)
+
+    combined_ps1 = _inject_isolated_net_preamble(eff_benign_text) + "\n" + _DORMANT_BATCH_PS1_LOOP
+    manifest_dict: dict[str, Any] = {
+        **asdict(spec),
+        "stratum": "dormant_batch",
+        "execute_payload": False,
+        "batch_samples": batch_manifest_entries,
+        "generated_at_utc": utc_now_iso(),
+        "staging_transport": "readonly_iso9660_cdrom",
+        "live_ssh_used": False,
+        "qemu_guest_agent_used": False,
+    }
+    manifest_bytes = json.dumps(manifest_dict, indent=2, sort_keys=True).encode("utf-8")
+    bootstrapper_bytes = generate_guest_bootstrapper_ps1().encode("utf-8")
+    benign_bytes = combined_ps1.encode("utf-8")
+
+    iso_files["run_manifest.json"] = manifest_bytes
+    iso_files["Invoke-StagePayload.ps1"] = bootstrapper_bytes
+    iso_files["benign_workload.ps1"] = benign_bytes
+    if extra_iso_files:
+        for ename, epayload in extra_iso_files.items():
+            iso_files[str(ename)] = bytes(epayload)
+
+    manifest_path = out_path / "run_manifest.json"
+    manifest_path.write_bytes(manifest_bytes)
+    bootstrap_path = out_path / "Invoke-StagePayload.ps1"
+    bootstrap_path.write_bytes(bootstrapper_bytes)
+    benign_path = out_path / "benign_workload.ps1"
+    benign_path.write_bytes(benign_bytes)
+
+    iso_path = out_path / f"run_stage_{spec.run_id}.iso"
+    build_stage_iso(iso_path, "DFIR_STAGE", iso_files)
+
+    xml_path = out_path / "cdrom_device.xml"
+    _write_cdrom_xml(xml_path, iso_path)
+    out = {
+        "manifest": manifest_path,
+        "bootstrapper": bootstrap_path,
+        "benign_workload": benign_path,
+        "iso": iso_path,
+        "cdrom_xml": xml_path,
+    }
+    if benign_manifest_path is not None:
+        out["benign_manifest"] = benign_manifest_path
+    return out
 
 
 def build_clean_parity_stage_iso(
@@ -534,15 +847,7 @@ def build_clean_parity_stage_iso(
     run_id: str = "clean_parity_test",
     dwell_seconds: int = 30,
 ) -> dict[str, Path]:
-    """Build a zero-SSH read-only `DFIR_STAGE` ISO that runs `Collect-Artifacts.ps1` inside the clean guest.
-
-    When attached to a clean disposable overlay, `\\DFIR-StageRunner` (`Invoke-StagePayload.ps1`) executes
-    `benign_workload.ps1`, which runs `Collect-Artifacts.ps1 -OutDir C:\\collector_out_parity`
-    (writing stdout/stderr to `C:\\collector_out_parity\\parity_stdout.log`),
-    flushes `Write-VolumeCache -DriveLetter C`, and powers off the guest cleanly (`Stop-Computer -Force`).
-    The resulting `C:\\collector_out_parity\\artifacts.json` is then read directly out of the closed
-    `win11_overlay.qcow2` in user space via `scripts/compare_v1_v2_parity.py --extract-v1-json-from-qcow2`.
-    """
+    """Build a zero-SSH read-only `DFIR_STAGE` ISO that runs `Collect-Artifacts.ps1` inside the clean guest."""
     repo_root = Path(__file__).resolve().parent.parent.parent
     coll_path = Path(collector_ps1_path) if collector_ps1_path is not None else (repo_root / "collector" / "Collect-Artifacts.ps1")
     if not coll_path.exists():

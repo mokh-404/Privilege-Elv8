@@ -3,16 +3,15 @@
 Enforces:
 - Completely separate from dataset build (`export_blinded_review_sample` never overwrites existing populated files).
 - Strictly blinded exports (strips labels, reasons, family names, launcher, pair/attribution provenance).
-- Friend acts as primary blinded reviewer; Mokh scores stratified 20% overlap slice for Cohen's kappa.
+- Stratified 400-row primary export cap (200 positives stratified by stratum+family, 100 benign_drift, 100 ambiguous)
+  and proportional 20% (80-row) overlap slice for Mokh Cohen's kappa (`OD-V2-10`).
 - Validates distinct `reviewer_id`s, valid UTC timestamps, non-empty non-boilerplate `human_notes`.
 """
 from __future__ import annotations
 
-import json
-import math
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -56,6 +55,117 @@ REVIEW_VISIBLE_COLS: tuple[str, ...] = (
 REQUIRED_REVIEWER_COLS: tuple[str, ...] = ("reviewer_id", "reviewed_at_utc", "human_label", "human_notes")
 
 
+def _stratified_positive_indices(
+    pos_df: pd.DataFrame,
+    max_positives: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Select up to `max_positives` positives balanced across stratum (`executed`/`dormant`) and `sample_family`."""
+    if len(pos_df) <= max_positives:
+        return np.sort(pos_df.index.to_numpy())
+
+    strata_col = "stratum" if "stratum" in pos_df.columns else ("execution_state" if "execution_state" in pos_df.columns else None)
+    fam_col = "sample_family" if "sample_family" in pos_df.columns else None
+
+    if strata_col is None:
+        strata_groups: list[pd.DataFrame] = [pos_df]
+    else:
+        strata_vals = pos_df[strata_col].fillna("unknown").astype(str).str.strip().str.lower()
+        ordered_strata = sorted(strata_vals.unique())
+        strata_groups = [pos_df[strata_vals == s] for s in ordered_strata]
+
+    # Allocate quota across strata proportionally with exact remainder distribution
+    n_strata = len(strata_groups)
+    base_q = max_positives // n_strata
+    rem_q = max_positives % n_strata
+    stratum_quotas: list[int] = []
+    # First pass: cap each stratum at its available rows and track leftover capacity
+    avail = [len(g) for g in strata_groups]
+    raw_alloc = [min(avail[i], base_q + (1 if i < rem_q else 0)) for i in range(n_strata)]
+    deficit = max_positives - sum(raw_alloc)
+    if deficit > 0:
+        for i in range(n_strata):
+            extra = min(deficit, avail[i] - raw_alloc[i])
+            raw_alloc[i] += extra
+            deficit -= extra
+            if deficit == 0:
+                break
+    stratum_quotas = raw_alloc
+
+    chosen: list[Any] = []
+    for sub_df, quota in zip(strata_groups, stratum_quotas):
+        if quota <= 0 or len(sub_df) == 0:
+            continue
+        if fam_col is None:
+            pick = rng.choice(sub_df.index.to_numpy(), size=quota, replace=False)
+            chosen.extend(pick.tolist())
+            continue
+
+        fams = sub_df[fam_col].fillna("unknown").astype(str).str.strip().str.lower()
+        fam_pools: dict[str, list[Any]] = {}
+        for fam in sorted(fams.unique()):
+            idxs = sub_df.index[fams == fam].to_numpy().copy()
+            rng.shuffle(idxs)
+            fam_pools[fam] = idxs.tolist()
+
+        fam_order = sorted(fam_pools.keys())
+        rng.shuffle(fam_order)
+        picked_in_stratum: list[Any] = []
+        while len(picked_in_stratum) < quota and any(fam_pools.values()):
+            for fam in fam_order:
+                if len(picked_in_stratum) >= quota:
+                    break
+                if fam_pools[fam]:
+                    picked_in_stratum.append(fam_pools[fam].pop())
+        chosen.extend(picked_in_stratum)
+
+    return np.sort(np.asarray(chosen))
+
+
+def _proportional_overlap_indices(
+    labels: np.ndarray,
+    overlap_frac: float,
+    rng: np.random.Generator,
+) -> list[int]:
+    """Allocate `round(overlap_frac * len(labels))` stratified overlap indices via largest-remainder."""
+    n_total = len(labels)
+    target_total = max(1, int(round(float(overlap_frac) * n_total))) if n_total > 0 else 0
+    target_total = min(n_total, target_total)
+
+    unique_lbls = list(dict.fromkeys(labels.tolist()))
+    pools: dict[Any, np.ndarray] = {lbl: np.flatnonzero(labels == lbl) for lbl in unique_lbls}
+
+    exact_shares = {lbl: float(overlap_frac) * len(idxs) for lbl, idxs in pools.items()}
+    counts = {lbl: min(len(pools[lbl]), int(np.floor(exact_shares[lbl]))) for lbl in unique_lbls}
+
+    # Ensure every non-empty stratum gets >= 1 row if target_total allows
+    for lbl in unique_lbls:
+        if counts[lbl] == 0 and len(pools[lbl]) > 0 and sum(counts.values()) < target_total:
+            counts[lbl] = 1
+
+    remaining = target_total - sum(counts.values())
+    if remaining > 0:
+        remainders = sorted(
+            unique_lbls,
+            key=lambda l: (exact_shares[l] - counts[l], len(pools[l])),
+            reverse=True,
+        )
+        for lbl in remainders:
+            if remaining <= 0:
+                break
+            if counts[lbl] < len(pools[lbl]):
+                counts[lbl] += 1
+                remaining -= 1
+
+    ov_indices: list[int] = []
+    for lbl in unique_lbls:
+        n_ov = counts[lbl]
+        if n_ov > 0:
+            ov_pick = rng.choice(pools[lbl], size=n_ov, replace=False)
+            ov_indices.extend(int(i) for i in ov_pick)
+    return sorted(set(ov_indices))
+
+
 def export_blinded_review_sample(
     df: pd.DataFrame,
     primary_out_csv: str | Path,
@@ -64,8 +174,11 @@ def export_blinded_review_sample(
     overlap_frac: float = 0.20,
     seed: int = config.SEED,
     max_per_stratum: int = 100,
+    max_positives: int = 200,
+    max_drift: int | None = None,
+    max_ambiguous: int | None = None,
 ) -> dict[str, Any]:
-    """Export blinded primary review CSV (friend) + 20% overlap CSV (Mokh) + separate answer key."""
+    """Export blinded primary review CSV (friend, capped at 400 default) + 20% overlap CSV (Mokh) + answer key."""
     primary_out_csv = Path(primary_out_csv)
     overlap_out_csv = Path(overlap_out_csv)
     sealed_key_json = Path(sealed_key_json)
@@ -76,14 +189,25 @@ def export_blinded_review_sample(
                 f"Refusing to overwrite existing review file {p}. Move or rename before re-exporting (IMP-04)."
             )
 
+    eff_max_drift = int(max_per_stratum if max_drift is None else max_drift)
+    eff_max_ambig = int(max_per_stratum if max_ambiguous is None else max_ambiguous)
+    eff_max_pos = int(max_positives)
+
     rng = np.random.default_rng(seed)
     picked_parts: list[pd.DataFrame] = []
-    for target_lbl in (config.POSITIVE_LABEL, "benign_drift", AMBIGUOUS_LABEL):
+    for target_lbl, cap in (
+        (config.POSITIVE_LABEL, eff_max_pos),
+        ("benign_drift", eff_max_drift),
+        (AMBIGUOUS_LABEL, eff_max_ambig),
+    ):
         sub = df[df[config.LABEL_COL] == target_lbl]
-        if len(sub) == 0:
+        if len(sub) == 0 or cap <= 0:
             continue
-        n_pick = len(sub) if target_lbl == config.POSITIVE_LABEL else min(len(sub), int(max_per_stratum))
-        chosen = np.sort(rng.choice(sub.index.to_numpy(), size=n_pick, replace=False))
+        if target_lbl == config.POSITIVE_LABEL:
+            chosen = _stratified_positive_indices(sub, max_positives=cap, rng=rng)
+        else:
+            n_pick = min(len(sub), cap)
+            chosen = np.sort(rng.choice(sub.index.to_numpy(), size=n_pick, replace=False))
         picked_parts.append(sub.loc[chosen])
 
     if not picked_parts:
@@ -103,13 +227,7 @@ def export_blinded_review_sample(
         blinded[rc] = ""
 
     # Stratified 20% overlap draw across original labels (sealed for inter-rater kappa)
-    ov_indices: list[int] = []
-    for target_lbl in full_pick[config.LABEL_COL].unique():
-        idxs = np.flatnonzero(full_pick[config.LABEL_COL].to_numpy() == target_lbl)
-        n_ov = max(1, int(math.ceil(float(overlap_frac) * len(idxs))))
-        ov_pick = rng.choice(idxs, size=min(len(idxs), n_ov), replace=False)
-        ov_indices.extend(int(i) for i in ov_pick)
-    ov_indices = sorted(set(ov_indices))
+    ov_indices = _proportional_overlap_indices(full_pick[config.LABEL_COL].to_numpy(), overlap_frac=overlap_frac, rng=rng)
     overlap_blinded = blinded.iloc[ov_indices].reset_index(drop=True)
 
     for p in (primary_out_csv, overlap_out_csv, sealed_key_json):
@@ -129,6 +247,9 @@ def export_blinded_review_sample(
     write_json({
         "seed": int(seed),
         "overlap_frac": float(overlap_frac),
+        "max_positives": eff_max_pos,
+        "max_drift": eff_max_drift,
+        "max_ambiguous": eff_max_ambig,
         "n_primary": int(len(blinded)),
         "n_overlap": int(len(overlap_blinded)),
         "overlap_review_ids": overlap_blinded["review_id"].tolist(),

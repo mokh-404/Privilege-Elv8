@@ -1,20 +1,21 @@
-"""Stage A Pilot Orchestrator & Pre-Scoring `OD-V2-20` / Statistical-Power Evaluator (`OD-V2-05`, `OD-V2-07`, `OD-V2-20`).
+"""Stage A Pilot & Collection Orchestrator (`OD-V2-05`, `OD-V2-07`, `OD-V2-20`).
 
-Automates and evaluates the Stage A Pilot batch (`~3` clean control boots + `6-8` non-test pilot families
-x paired `dormant` + `executed` runs per `sample_sha256` / `pair_group_id`):
-1. Enforces hard Gate 0 (`OD-V2-07`) and paired-stratum staging validation via `src.v2.pilot_staging.validate_stage_run_spec`.
-2. Labels `dormant` and `executed` runs against the multi-control baseline via `src.v2.labeler_v2`.
-3. Evaluates the **pre-scoring `OD-V2-20` 50% persistence/execution static-link go/no-go gate** (`task`,
-   `service`, `run_key`, `wmi_subscription`, `prefetch`) **before** any model training or scoring.
-4. Verifies `check_template_quantization` on pilot benign files (`IMP-06`).
-5. Computes nested family-grouped dev CV, per-family LOFO PR-AUC, Cross-Stratum Execution Delta (`OD-V2-15`),
-   and the **empirical between-family paired-difference standard deviation `sigma_delta_family`** +
-   80%-power Minimum Detectable Effect (`MDE`) table for `FINAL_EVAL_PLAN_v2_SKELETON.md` §6.
-6. Writes `docs/v2/STAGE_A_PILOT_REPORT.md`.
+Safety & execution invariants:
+- Enforces strict Gate 0 (`05_quarantine_vault_setup.sh preflight` + `GATE0_SIGNED_OFF`),
+  ransomware/wiper/worm exclusion (`validate_stage_run_spec`), and `--canary` supervised
+  smoke-test stamp (`CANARY_PASSED`) before any unattended malware batch runs.
+- Arms a crash-surviving detached host watchdog (`arm-watchdog`) BEFORE `virsh start win11`
+  covering BOTH `win11` and `inetsim-vm`.
+- Runs per-run `virbr1` firewall position & packet-counter egress audit (`check-egress`) and
+  fast immutability verification (`verify-base-fast` inside `try ... finally:`) every run,
+  plus full `win11_base.qcow2` `sha256sum -c` (`verify-base`) at batch start/end/abort and every 25 runs.
+- Supports safe 1-lane pipelining (`--pipelined`) by renaming closed Run i overlay to
+  `win11_overlay_<run_id>.qcow2` before Run i+1 creates a fresh `win11_overlay.qcow2`.
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import math
 import os
@@ -42,6 +43,7 @@ from src.v2.offline_extractor import summarize_extraction_and_refgraph
 from src.v2.pilot_staging import (
     PilotStagingError,
     StageRunSpec,
+    build_dormant_batch_bundle,
     build_stage_bundle,
     validate_stage_run_spec,
 )
@@ -124,6 +126,136 @@ def _invoke_cmd(
     return int(subprocess.run(cmd, env=merged_env, check=False).returncode)
 
 
+def _invoke_cmd_capture(
+    run_cmd: Callable[..., int] | None,
+    cmd_output_fn: Callable[[list[str], Mapping[str, str] | None], tuple[int, str]] | None,
+    cmd: list[str],
+    env_overrides: Mapping[str, str] | None = None,
+    dry_run: bool = False,
+) -> tuple[int, str]:
+    if dry_run:
+        return 0, ""
+    if cmd_output_fn is not None:
+        rc, out = cmd_output_fn(cmd, env_overrides)
+        return int(rc), str(out or "")
+    if run_cmd is not None:
+        return _invoke_cmd(run_cmd, cmd, env_overrides=env_overrides, dry_run=False), ""
+    merged_env = dict(os.environ)
+    if env_overrides:
+        merged_env.update({str(k): str(v) for k, v in env_overrides.items()})
+    cp = subprocess.run(cmd, env=merged_env, check=False, capture_output=True, text=True)
+    return int(cp.returncode), (cp.stdout or "")
+
+
+def evaluate_egress_delta(
+    before: Mapping[str, Any] | None,
+    after: Mapping[str, Any] | None,
+    max_in_drop_burst: int = 2000,
+) -> dict[str, Any]:
+    """Compare pre/post-run `virbr1` snapshots and flag invalid rules or cross-interface egress."""
+    if not before or not after:
+        return {"passed": True, "mock_skipped": True}
+    b_ok = bool(before.get("firewall_rules_valid", False))
+    a_ok = bool(after.get("firewall_rules_valid", False))
+    fwd_pkts_delta = int(after.get("fwd_drop_pkts", 0)) - int(before.get("fwd_drop_pkts", 0))
+    fwd_bytes_delta = int(after.get("fwd_drop_bytes", 0)) - int(before.get("fwd_drop_bytes", 0))
+    in_drop_delta = int(after.get("in_drop_pkts", 0)) - int(before.get("in_drop_pkts", 0))
+    errors: list[str] = []
+    if not b_ok or not a_ok:
+        errors.append(f"invalid_virbr1_firewall_position(before={b_ok}, after={a_ok})")
+    if fwd_pkts_delta > 0 or fwd_bytes_delta > 0:
+        errors.append(f"cross_interface_forward_egress_detected(pkts={fwd_pkts_delta}, bytes={fwd_bytes_delta})")
+    if in_drop_delta > int(max_in_drop_burst):
+        errors.append(f"anomalous_in_drop_burst(pkts={in_drop_delta} > {max_in_drop_burst})")
+    return {
+        "passed": len(errors) == 0,
+        "firewall_rules_valid_before": b_ok,
+        "firewall_rules_valid_after": a_ok,
+        "fwd_drop_pkts_delta": fwd_pkts_delta,
+        "fwd_drop_bytes_delta": fwd_bytes_delta,
+        "in_drop_pkts_delta": in_drop_delta,
+        "errors": errors,
+    }
+
+
+def _parse_json_snapshot(raw_stdout: str) -> dict[str, Any] | None:
+    txt = str(raw_stdout or "").strip()
+    if not txt:
+        return None
+    for line in reversed(txt.splitlines()):
+        s = line.strip()
+        if s.startswith("{") and s.endswith("}"):
+            return dict(json.loads(s))
+    return None
+
+
+def verify_canary_run_outputs(
+    results_log: Sequence[Mapping[str, Any]],
+    runs_out_dir: str | Path,
+    stamp_path: str | Path,
+) -> dict[str, Any]:
+    """Validate `--canary` outputs (control+dormant+executed, container manifests, Sysmon EVTX) & write stamp."""
+    out_root = Path(runs_out_dir)
+    strata_seen = {str(r.get("stratum") or "") for r in results_log}
+    missing_strata = [s for s in ("control", "dormant", "executed") if s not in strata_seen]
+    if missing_strata:
+        raise PilotStagingError(
+            f"CANARY FAILED: --canary requires control, dormant, and executed runs; missing={missing_strata}"
+        )
+
+    exec_sysmon_total = 0
+    for rec in results_log:
+        rdir = Path(rec["out_dir"])
+        man_path = rdir / "extraction_manifest.json"
+        if not man_path.is_file():
+            raise PilotStagingError(f"CANARY FAILED: Missing extraction_manifest.json for run {rec['run_id']!r}")
+        man = json.loads(man_path.read_text(encoding="utf-8"))
+        if int(man.get("total_records") or 0) <= 0:
+            raise PilotStagingError(f"CANARY FAILED: Zero extracted records for run {rec['run_id']!r}")
+        if rec.get("stratum") == "executed":
+            if not man.get("sysmon_evtx_present") or int(man.get("sysmon_events_count") or 0) <= 0:
+                raise PilotStagingError(
+                    f"CANARY FAILED: Executed canary run {rec['run_id']!r} yielded 0 Sysmon EVTX events"
+                )
+            exec_sysmon_total += int(man.get("sysmon_events_count") or 0)
+
+    stamp_payload = {
+        "status": "PASS",
+        "verified_at_utc": utc_now_iso(),
+        "runs_out_dir": str(out_root),
+        "n_canary_runs": len(results_log),
+        "run_ids": [r["run_id"] for r in results_log],
+        "executed_sysmon_events_total": exec_sysmon_total,
+    }
+    sp = Path(stamp_path)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(json.dumps(stamp_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return stamp_payload
+
+
+def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(dict(row), sort_keys=True) + "\n")
+
+
+def _load_completed_run_ids(checkpoint_path: Path) -> set[str]:
+    done: set[str] = set()
+    if not checkpoint_path.is_file():
+        return done
+    for line in checkpoint_path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+            if rec.get("run_id"):
+                done.add(str(rec["run_id"]))
+        except json.JSONDecodeError:
+            continue
+    return done
+
+
 def execute_stage_a_pilot_batch(
     batch_runs: Sequence[Mapping[str, Any]],
     runs_out_dir: str | Path,
@@ -139,8 +271,17 @@ def execute_stage_a_pilot_batch(
     dry_run: bool = False,
     run_cmd: Callable[..., int] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    canary_mode: bool = False,
+    require_canary_stamp: bool = False,
+    canary_stamp_path: str | Path | None = None,
+    full_base_hash_every: int = 25,
+    enable_pipelining: bool = False,
+    resume: bool = True,
+    benign_pools_root: str | Path | None = None,
+    max_in_drop_burst: int = 2000,
+    cmd_output_fn: Callable[[list[str], Mapping[str, str] | None], tuple[int, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Execute or dry-run an unattended Stage A Pilot batch with strict Gate 0 & `inetsim-vm` lifecycle cleanup."""
+    """Execute or dry-run a Stage A/B batch with detached watchdog, egress checks, base checks & optional pipelining."""
     repo_root = Path(__file__).resolve().parent.parent.parent
     watchdog_script = repo_root / "docs" / "v2" / "hardening" / "04_watchdog_and_base_hash.sh"
     bake_script = repo_root / "docs" / "v2" / "hardening" / "00_bake_v2_base_image.sh"
@@ -150,6 +291,9 @@ def execute_stage_a_pilot_batch(
     stage_tmp_root = out_root / "_staging_iso"
     stage_tmp_root.mkdir(parents=True, exist_ok=True)
     vroot = Path(vault_root).expanduser()
+    eff_canary_stamp = Path(canary_stamp_path) if canary_stamp_path is not None else (out_root / "CANARY_PASSED")
+    checkpoint_path = out_root / "completed_runs.jsonl"
+    egress_audit_path = out_root / "egress_audit.jsonl"
 
     parsed_entries: list[tuple[StageRunSpec, Mapping[str, Any]]] = []
     has_malware_run = False
@@ -157,9 +301,16 @@ def execute_stage_a_pilot_batch(
         raw_spec = entry["spec"]
         spec = raw_spec if isinstance(raw_spec, StageRunSpec) else StageRunSpec(**dict(raw_spec))
         validate_stage_run_spec(spec)
-        if spec.stratum in ("dormant", "executed"):
+        if spec.stratum in ("dormant", "executed", "dormant_batch"):
             has_malware_run = True
         parsed_entries.append((spec, entry))
+
+    if canary_mode:
+        canary_strata = {spec.stratum for spec, _ in parsed_entries}
+        if not {"control", "dormant", "executed"}.issubset(canary_strata):
+            raise PilotStagingError(
+                f"canary_mode requires at least 1 control, 1 dormant, and 1 executed run (got {sorted(canary_strata)})"
+            )
 
     if has_malware_run and not dry_run:
         if not (vroot / "GATE0_SIGNED_OFF").is_file():
@@ -169,94 +320,211 @@ def execute_stage_a_pilot_batch(
         rc_pre = _invoke_cmd(run_cmd, ["bash", str(vault_script), "preflight"], {"VAULT_ROOT": str(vroot)})
         if rc_pre != 0:
             raise PilotStagingError(f"Vault preflight failed with exit code {rc_pre}")
+        if require_canary_stamp and not canary_mode:
+            if not eff_canary_stamp.is_file():
+                raise PilotStagingError(
+                    f"BLOCKED (--canary gate): Required canary stamp missing at {eff_canary_stamp}. "
+                    "Run with --canary first before unattended malware execution."
+                )
+            try:
+                stamp_data = json.loads(eff_canary_stamp.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise PilotStagingError(f"BLOCKED (--canary gate): Invalid canary stamp {eff_canary_stamp}: {exc}") from exc
+            if stamp_data.get("status") != "PASS":
+                raise PilotStagingError(
+                    f"BLOCKED (--canary gate): Canary stamp status is {stamp_data.get('status')!r}, expected 'PASS'."
+                )
+
+    completed_ids = _load_completed_run_ids(checkpoint_path) if (resume and not canary_mode and not dry_run) else set()
+    pending_entries = [(spec, entry) for spec, entry in parsed_entries if spec.run_id not in completed_ids]
 
     inetsim_cmds = build_inetsim_lifecycle_commands(domain=inetsim_domain, libvirt_uri=libvirt_uri)
-    verify_cmd = ["bash", str(watchdog_script), "verify-base"]
+    verify_full_cmd = ["bash", str(watchdog_script), "verify-base"]
+    verify_fast_cmd = ["bash", str(watchdog_script), "verify-base-fast"]
     prep_cmd = ["bash", str(bake_script), "prepare-overlay", str(base_qcow2), str(overlay_qcow2)]
+    egress_snap_cmd = ["bash", str(watchdog_script), "check-egress", "snapshot"]
+
+    if pending_entries and not dry_run:
+        rc_start = _invoke_cmd(run_cmd, verify_full_cmd, dry_run=dry_run)
+        if rc_start != 0:
+            raise RuntimeError(f"Initial full base-image SHA-256 check failed (rc={rc_start})")
 
     results_log: list[dict[str, Any]] = []
-    for spec, entry in parsed_entries:
-        run_dir = out_root / spec.run_id
-        stage_dir = stage_tmp_root / spec.run_id
-        iso_path = stage_dir / f"run_stage_{spec.run_id}.iso"
-        inetsim_started = False
+    pool_exec = ThreadPoolExecutor(max_workers=1) if enable_pipelining else None
+    pending_future: Future[dict[str, Any]] | None = None
 
-        rc_v1 = _invoke_cmd(run_cmd, verify_cmd, dry_run=dry_run)
-        if rc_v1 != 0:
-            raise RuntimeError(f"Base verification failed before run {spec.run_id!r} (rc={rc_v1})")
-
-        rc_prep = _invoke_cmd(run_cmd, prep_cmd, dry_run=dry_run)
-        if rc_prep != 0:
-            raise RuntimeError(f"prepare-overlay failed for run {spec.run_id!r} (rc={rc_prep})")
-
-        vault_file = entry.get("vault_file")
-        if not dry_run or spec.stratum == "control" or (vault_file is not None and Path(vault_file).exists()):
-            build_stage_bundle(
-                spec=spec,
-                out_dir=stage_dir,
-                sample_vault_file=vault_file,
-                benign_script_text=str(entry.get("benign_script_text") or "# Benign workload placeholder\n"),
-                archive_password=entry.get("archive_password", "infected"),
-            )
-
-        attach_cmd = [
-            "sudo", "virsh", "-c", libvirt_uri, "attach-disk",
-            win_domain, str(iso_path), "sdc", "--type", "cdrom", "--mode", "readonly", "--config",
-        ]
-        if _invoke_cmd(run_cmd, attach_cmd, dry_run=dry_run) != 0:
-            raise RuntimeError(f"Failed to attach DFIR_STAGE ISO for run {spec.run_id!r}")
-
-        try:
-            if spec.stratum == "executed":
-                rc_inet = _invoke_cmd(run_cmd, inetsim_cmds["start"], dry_run=dry_run)
-                if rc_inet != 0:
-                    raise RuntimeError(f"Failed to start {inetsim_domain} for executed run {spec.run_id!r}")
-                inetsim_started = True
-                if not dry_run and inetsim_wait_seconds > 0:
-                    sleep_fn(float(inetsim_wait_seconds))
-
-            start_win = ["sudo", "virsh", "-c", libvirt_uri, "start", win_domain]
-            if _invoke_cmd(run_cmd, start_win, dry_run=dry_run) != 0:
-                raise RuntimeError(f"Failed to start {win_domain} for run {spec.run_id!r}")
-
-            wd_cmd = ["bash", str(watchdog_script), "watchdog", str(int(spec.dwell_seconds) + int(watchdog_grace_seconds))]
-            rc_wd = _invoke_cmd(run_cmd, wd_cmd, dry_run=dry_run)
-            if rc_wd not in (0, 124):
-                raise RuntimeError(f"Watchdog aborted run {spec.run_id!r} unexpectedly (rc={rc_wd})")
-        finally:
-            _invoke_cmd(run_cmd, ["sudo", "virsh", "-c", libvirt_uri, "destroy", win_domain], dry_run=dry_run)
-            if inetsim_started:
-                _invoke_cmd(run_cmd, inetsim_cmds["destroy"], dry_run=dry_run)
-            _invoke_cmd(
-                run_cmd,
-                ["sudo", "virsh", "-c", libvirt_uri, "detach-disk", win_domain, "sdc", "--config"],
-                dry_run=dry_run,
-            )
-            shutil.rmtree(stage_dir, ignore_errors=True)
-
+    def _run_extract_and_cleanup(target_overlay: Path, rdir: Path, spec_obj: StageRunSpec, inet_booted: bool) -> dict[str, Any]:
         ext_cmd, ext_env = build_container_extraction_command(
-            overlay_qcow2=overlay_qcow2,
-            run_out_dir=run_dir,
-            run_id=spec.run_id,
+            overlay_qcow2=target_overlay,
+            run_out_dir=rdir,
+            run_id=spec_obj.run_id,
             base_cache_path=base_cache_path,
         )
         rc_ext = _invoke_cmd(run_cmd, ext_cmd, env_overrides=ext_env, dry_run=dry_run)
         if rc_ext != 0:
-            raise RuntimeError(f"Offline container extraction failed for run {spec.run_id!r} (rc={rc_ext})")
-
-        _invoke_cmd(run_cmd, ["sudo", "rm", "-f", str(overlay_qcow2)], dry_run=dry_run)
-        if _invoke_cmd(run_cmd, verify_cmd, dry_run=dry_run) != 0:
-            raise RuntimeError(f"Base hash verification failed after run {spec.run_id!r}")
-
-        results_log.append({
-            "run_id": spec.run_id,
-            "stratum": spec.stratum,
-            "sample_family": spec.sample_family,
-            "pair_group_id": spec.pair_group_id,
-            "inetsim_booted": bool(inetsim_started),
-            "out_dir": str(run_dir),
+            raise RuntimeError(f"Offline container extraction failed for run {spec_obj.run_id!r} (rc={rc_ext})")
+        _invoke_cmd(run_cmd, ["sudo", "rm", "-f", str(target_overlay)], dry_run=dry_run)
+        rec_out = {
+            "run_id": spec_obj.run_id,
+            "stratum": spec_obj.stratum,
+            "sample_family": spec_obj.sample_family,
+            "pair_group_id": spec_obj.pair_group_id,
+            "inetsim_booted": bool(inet_booted),
+            "out_dir": str(rdir),
             "dry_run": bool(dry_run),
-        })
+            "completed_at_utc": utc_now_iso(),
+        }
+        if not dry_run:
+            _append_jsonl(checkpoint_path, rec_out)
+        return rec_out
+
+    try:
+        for run_idx, (spec, entry) in enumerate(pending_entries, start=1):
+            run_dir = out_root / spec.run_id
+            stage_dir = stage_tmp_root / spec.run_id
+            iso_path = stage_dir / f"run_stage_{spec.run_id}.iso"
+            lease_file = stage_tmp_root / f"wd_{spec.run_id}.lease"
+            inetsim_started = False
+            run_failed = False
+
+            rc_eg_pre, out_eg_pre = _invoke_cmd_capture(run_cmd, cmd_output_fn, egress_snap_cmd, dry_run=dry_run)
+            if rc_eg_pre != 0:
+                raise RuntimeError(f"Pre-run virbr1 egress firewall check failed before {spec.run_id!r} (rc={rc_eg_pre})")
+            eg_before = _parse_json_snapshot(out_eg_pre)
+
+            rc_prep = _invoke_cmd(run_cmd, prep_cmd, dry_run=dry_run)
+            if rc_prep != 0:
+                raise RuntimeError(f"prepare-overlay failed for run {spec.run_id!r} (rc={rc_prep})")
+
+            vault_file = entry.get("vault_file")
+            vault_files = entry.get("vault_files")
+            raw_ben_script = entry.get("benign_script_text")
+            if spec.stratum == "dormant_batch":
+                if not dry_run or vault_files is not None:
+                    build_dormant_batch_bundle(
+                        spec=spec,
+                        out_dir=stage_dir,
+                        sample_vault_files=vault_files or (),
+                        benign_script_text=raw_ben_script,
+                        archive_password=entry.get("archive_password", "infected"),
+                        benign_pools_root=benign_pools_root,
+                    )
+            elif not dry_run or spec.stratum == "control" or (vault_file is not None and Path(vault_file).exists()):
+                build_stage_bundle(
+                    spec=spec,
+                    out_dir=stage_dir,
+                    sample_vault_file=vault_file,
+                    benign_script_text=raw_ben_script,
+                    archive_password=entry.get("archive_password", "infected"),
+                    benign_pools_root=benign_pools_root,
+                )
+
+            attach_cmd = [
+                "sudo", "virsh", "-c", libvirt_uri, "attach-disk",
+                win_domain, str(iso_path), "sdc", "--type", "cdrom", "--mode", "readonly", "--config",
+            ]
+            if _invoke_cmd(run_cmd, attach_cmd, dry_run=dry_run) != 0:
+                raise RuntimeError(f"Failed to attach DFIR_STAGE ISO for run {spec.run_id!r}")
+
+            arm_sec = int(spec.dwell_seconds) + int(watchdog_grace_seconds) + 30
+            arm_cmd = [
+                "bash", str(watchdog_script), "arm-watchdog",
+                str(arm_sec), str(lease_file), win_domain, inetsim_domain,
+            ]
+            if _invoke_cmd(run_cmd, arm_cmd, dry_run=dry_run) != 0:
+                raise RuntimeError(f"Failed to arm detached host watchdog before starting {spec.run_id!r}")
+
+            base_err_msg: str | None = None
+            egress_err_msg: str | None = None
+            try:
+                if spec.stratum == "executed":
+                    rc_inet = _invoke_cmd(run_cmd, inetsim_cmds["start"], dry_run=dry_run)
+                    if rc_inet != 0:
+                        raise RuntimeError(f"Failed to start {inetsim_domain} for executed run {spec.run_id!r}")
+                    inetsim_started = True
+                    if not dry_run and inetsim_wait_seconds > 0:
+                        sleep_fn(float(inetsim_wait_seconds))
+
+                start_win = ["sudo", "virsh", "-c", libvirt_uri, "start", win_domain]
+                if _invoke_cmd(run_cmd, start_win, dry_run=dry_run) != 0:
+                    raise RuntimeError(f"Failed to start {win_domain} for run {spec.run_id!r}")
+
+                wd_cmd = ["bash", str(watchdog_script), "watchdog", str(int(spec.dwell_seconds) + int(watchdog_grace_seconds))]
+                rc_wd = _invoke_cmd(run_cmd, wd_cmd, dry_run=dry_run)
+                if rc_wd not in (0, 124):
+                    raise RuntimeError(f"Watchdog aborted run {spec.run_id!r} unexpectedly (rc={rc_wd})")
+            except Exception:
+                run_failed = True
+                raise
+            finally:
+                _invoke_cmd(run_cmd, ["sudo", "virsh", "-c", libvirt_uri, "destroy", win_domain], dry_run=dry_run)
+                if inetsim_started:
+                    _invoke_cmd(run_cmd, inetsim_cmds["destroy"], dry_run=dry_run)
+                _invoke_cmd(run_cmd, ["bash", str(watchdog_script), "disarm-watchdog", str(lease_file)], dry_run=dry_run)
+                _invoke_cmd(
+                    run_cmd,
+                    ["sudo", "virsh", "-c", libvirt_uri, "detach-disk", win_domain, "sdc", "--config"],
+                    dry_run=dry_run,
+                )
+                shutil.rmtree(stage_dir, ignore_errors=True)
+
+                rc_eg_post, out_eg_post = _invoke_cmd_capture(run_cmd, cmd_output_fn, egress_snap_cmd, dry_run=dry_run)
+                eg_after = _parse_json_snapshot(out_eg_post)
+                eg_delta = evaluate_egress_delta(eg_before, eg_after, max_in_drop_burst=max_in_drop_burst)
+                if rc_eg_post != 0:
+                    egress_err_msg = f"Post-run virbr1 egress firewall check failed after {spec.run_id!r} (rc={rc_eg_post})"
+                elif not eg_delta["passed"]:
+                    egress_err_msg = f"Unauthorized virbr1 egress/rule drift after {spec.run_id!r}: {eg_delta['errors']}"
+                if not dry_run:
+                    _append_jsonl(egress_audit_path, {
+                        "run_id": spec.run_id,
+                        "checked_at_utc": utc_now_iso(),
+                        "rc_before": rc_eg_pre,
+                        "rc_after": rc_eg_post,
+                        **eg_delta,
+                    })
+
+                do_full_hash = run_failed or (int(full_base_hash_every) > 0 and (run_idx % int(full_base_hash_every) == 0))
+                b_cmd = verify_full_cmd if do_full_hash else verify_fast_cmd
+                rc_base = _invoke_cmd(run_cmd, b_cmd, dry_run=dry_run)
+                if rc_base != 0:
+                    base_err_msg = f"Base immutability/hash check ({b_cmd[1]}) failed after run {spec.run_id!r} (rc={rc_base})"
+
+                if not run_failed:
+                    if egress_err_msg:
+                        raise RuntimeError(egress_err_msg)
+                    if base_err_msg:
+                        raise RuntimeError(base_err_msg)
+
+            if enable_pipelining and pool_exec is not None:
+                if pending_future is not None:
+                    results_log.append(pending_future.result())
+                    pending_future = None
+                overlay_p = Path(overlay_qcow2)
+                renamed_overlay = overlay_p.with_name(f"win11_overlay_{spec.run_id}.qcow2")
+                if _invoke_cmd(run_cmd, ["sudo", "mv", "-f", str(overlay_p), str(renamed_overlay)], dry_run=dry_run) != 0:
+                    raise RuntimeError(f"Failed to rename overlay for pipelined extraction: {overlay_p} -> {renamed_overlay}")
+                pending_future = pool_exec.submit(_run_extract_and_cleanup, renamed_overlay, run_dir, spec, inetsim_started)
+            else:
+                results_log.append(_run_extract_and_cleanup(Path(overlay_qcow2), run_dir, spec, inetsim_started))
+
+        if pending_future is not None:
+            results_log.append(pending_future.result())
+            pending_future = None
+    finally:
+        try:
+            if pending_future is not None:
+                results_log.append(pending_future.result())
+        finally:
+            if pool_exec is not None:
+                pool_exec.shutdown(wait=True)
+            if pending_entries and not dry_run:
+                rc_end = _invoke_cmd(run_cmd, verify_full_cmd, dry_run=dry_run)
+                if rc_end != 0:
+                    raise RuntimeError(f"Final full base-image SHA-256 verification failed (rc={rc_end})")
+
+    if canary_mode and not dry_run:
+        verify_canary_run_outputs(results_log, out_root, eff_canary_stamp)
 
     return results_log
 
@@ -286,7 +554,7 @@ def compute_empirical_family_power_table(
     lofo_df: pd.DataFrame,
     arm_a: str = "xgb",
     arm_b: str = "rf",
-    f_test_candidates: Sequence[int] = (10, 12, 15),
+    f_test_candidates: Sequence[int] = (10, 15, 22, 25),
 ) -> dict[str, Any]:
     """Compute empirical between-family paired PR-AUC difference SD `sigma_delta_family` and 80%-power MDE."""
     piv = lofo_df.pivot(index="family", columns="model", values="pr_auc")
@@ -305,18 +573,17 @@ def compute_empirical_family_power_table(
 
     diffs = (piv[arm_a] - piv[arm_b]).dropna().to_numpy(dtype=float)
     sigma_f = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
-    # Step-1 Holm-Bonferroni over m=9 fixed comparisons at two-sided alpha=0.05 -> alpha/18 = 0.002778 -> z=2.773
-    # z_{0.80} = 0.8416 -> z_sum = 3.615
-    z_step1 = 3.615
-    # Step-9 Holm-Bonferroni (unadjusted alpha=0.05 -> z_{0.975} + z_{0.80} = 1.96 + 0.8416 = 2.802)
-    z_step9 = 2.802
+    # Step-1 Holm-Bonferroni over m=10 fixed contrasts at two-sided alpha=0.05 -> alpha'=0.005 -> z=2.807
+    # z_{0.80} = 0.8416 -> z_sum = 3.649
+    z_step1 = 3.649
+    z_step10 = 2.802
 
     mde_map: dict[int, dict[str, float]] = {}
     for f_test in f_test_candidates:
         ft = int(f_test)
         mde_map[ft] = {
             "mde_80pct_holm_step1": round(float(z_step1 * sigma_f / math.sqrt(ft)), 4),
-            "mde_80pct_holm_step9": round(float(z_step9 * sigma_f / math.sqrt(ft)), 4),
+            "mde_80pct_holm_step10": round(float(z_step10 * sigma_f / math.sqrt(ft)), 4),
         }
 
     return {
@@ -350,13 +617,7 @@ def evaluate_stage_a_pilot_runs(
     n_trials: int = 2,
     seed: int = config.SEED,
 ) -> dict[str, Any]:
-    """Run the full Stage A Pilot evaluation pipeline over control boots + paired dormant/executed runs.
-
-    Each item in `pilot_runs` is a dict containing:
-    - `spec`: a `StageRunSpec` (validated via `validate_stage_run_spec` enforcing Gate 0)
-    - `df`: extracted raw/feature DataFrame for that run
-    - `sysmon_events`: list of Sysmon event dicts (for `executed` runs)
-    """
+    """Run the full Stage A Pilot evaluation pipeline over control boots + paired dormant/executed runs."""
     if len(control_runs) < 1:
         raise ValueError("Stage A pilot requires >= 1 clean control run to build multi-control baseline")
 
@@ -375,6 +636,7 @@ def evaluate_stage_a_pilot_runs(
         spec: StageRunSpec = item["spec"] if isinstance(item["spec"], StageRunSpec) else StageRunSpec(**dict(item["spec"]))
         raw_df = item["df"].copy()
         sysmon_evs = list(item.get("sysmon_events") or [])
+        ben_man = item.get("benign_manifest")
         sample_meta = {
             "sample_sha256": spec.sample_sha256,
             "sample_family": spec.sample_family,
@@ -391,6 +653,7 @@ def evaluate_stage_a_pilot_runs(
                 staged_manifest=[{"staged_path": spec.staging_target_path, "sample_sha256": spec.sample_sha256}],
                 run_id=spec.run_id,
                 sysmon_events=sysmon_evs,
+                benign_manifest=ben_man,
                 sample_meta=sample_meta,
             )
         elif spec.stratum == "executed":
@@ -402,6 +665,7 @@ def evaluate_stage_a_pilot_runs(
                 malware_root_hashes=[spec.sample_sha256] if spec.sample_sha256 else (),
                 malware_root_guids=list(item.get("malware_root_guids") or ()),
                 benign_scheduler_guids=list(item.get("benign_scheduler_guids") or ()),
+                benign_manifest=ben_man,
                 sample_meta=sample_meta,
             )
         else:
@@ -429,10 +693,8 @@ def evaluate_stage_a_pilot_runs(
 
     full_pilot_df = pd.concat(labeled_dfs, ignore_index=True)
 
-    # 1. Pre-Scoring OD-V2-20 Go/No-Go Gate (computed BEFORE any model training or scoring!)
     od_v2_20_gate = compute_od_v2_20_pilot_gate(full_pilot_df, threshold_pct=50.0)
 
-    # 2. Check benign template quantization gate
     ben_files = full_pilot_df[
         (full_pilot_df[config.LABEL_COL].isin(["benign_drift", "baseline", "benign_baseline"]))
         & (full_pilot_df["artifact_type"] == "file")
@@ -443,7 +705,6 @@ def evaluate_stage_a_pilot_runs(
         else {"passed": True, "note": "insufficient_benign_files_in_fixture"}
     )
 
-    # 3. Filter out ambiguous_unattributed rows before model scoring (per V2_PLAN §8)
     eval_df = full_pilot_df[full_pilot_df[config.LABEL_COL] != AMBIGUOUS_LABEL].reset_index(drop=True)
     y_eval = (eval_df[config.LABEL_COL].astype(str) == config.POSITIVE_LABEL).astype(int).to_numpy()
     cat_cols, num_cols, bin_cols = split_feature_types(config.FEATURES)
@@ -508,11 +769,11 @@ def write_stage_a_pilot_report(summary: Mapping[str, Any], out_md: str | Path) -
         f"**Control Boots:** `{summary['n_control_boots']}` | **Paired Pilot Runs:** `{summary['n_pilot_runs']}` | "
         f"**Total Labeled Rows:** `{summary['n_total_labeled_rows']}`",
         "",
-        "## 1. Pre-Scoring `OD-V2-20` Referential-Graph Go/No-Go Gate",
+        "## 1. Pre-Scoring `OD-V2-20` Exploratory Diagnostic",
         f"- **Computed Before Model Scoring:** `{gate['computed_before_model_scoring']}`",
         f"- **Persistence/Execution Artifacts (`task`, `service`, `run_key`, `wmi_subscription`, `prefetch`):** "
         f"`{gate['persistence_exec_resolved_rows']} / {gate['persistence_exec_rows']}` (**`{gate['persistence_exec_resolved_pct']:.2f}%`** vs `{gate['threshold_pct']:.1f}%` threshold)",
-        f"- **Gate Decision:** **`{gate['v2_refgraph_status']}`** (`gate_passed = {gate['gate_passed']}`)",
+        f"- **Diagnostic Status:** **`{gate['v2_refgraph_status']}`** (`gate_passed = {gate['gate_passed']}`)",
         "",
         "## 2. Empirical Yield & Quarantine Summary",
         f"- **Executed Detonation Success Rate:** `{summary['executed_detonation_success_rate_pct']:.2f}%`",
@@ -535,9 +796,41 @@ def write_stage_a_pilot_report(summary: Mapping[str, Any], out_md: str | Path) -
     return out_p
 
 
+def _select_canary_subset(runs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Slice a batch deterministically to `[first_control, first_executed, paired_or_first_dormant]` for `--canary`."""
+    items = [dict(r) for r in runs]
+
+    def _stratum(item: Mapping[str, Any]) -> str:
+        spec = item.get("spec")
+        if isinstance(spec, Mapping):
+            return str(spec.get("stratum") or "").strip().lower()
+        return str(getattr(spec, "stratum", "") or "").strip().lower()
+
+    def _pair(item: Mapping[str, Any]) -> str:
+        spec = item.get("spec")
+        if isinstance(spec, Mapping):
+            return str(spec.get("pair_group_id") or "").strip()
+        return str(getattr(spec, "pair_group_id", "") or "").strip()
+
+    first_ctrl = next((r for r in items if _stratum(r) == "control"), None)
+    first_exec = next((r for r in items if _stratum(r) == "executed"), None)
+    exec_pair = _pair(first_exec) if first_exec is not None else ""
+    paired_dorm = next(
+        (r for r in items if _stratum(r) == "dormant" and exec_pair and _pair(r) == exec_pair),
+        None,
+    )
+    first_dorm = paired_dorm or next((r for r in items if _stratum(r) == "dormant"), None)
+    chosen = [r for r in (first_ctrl, first_exec, first_dorm) if r is not None]
+    if len(chosen) < 3:
+        raise PilotStagingError(
+            f"--canary requires at least 1 control, 1 executed, and 1 dormant run in batch (got {[_stratum(r) for r in chosen]})"
+        )
+    return chosen
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Unattended Stage A Pilot VM & offline extraction orchestrator.")
-    parser.add_argument("--batch-json", type=Path, required=True, help="Path to stage_a_pilot_batch.json")
+    parser = argparse.ArgumentParser(description="Unattended Stage A Pilot & collection orchestrator.")
+    parser.add_argument("--batch-json", type=Path, required=True, help="Path to batch JSON (e.g., stage_a_pilot_batch.json)")
     parser.add_argument("--runs-out-dir", type=Path, required=True, help="Output directory for per-run extracted JSONL")
     parser.add_argument("--base-qcow2", type=Path, default=Path("/var/lib/libvirt/images/win11_base.qcow2"))
     parser.add_argument("--overlay-qcow2", type=Path, default=Path("/var/lib/libvirt/images/win11_overlay.qcow2"))
@@ -547,12 +840,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz"),
     )
     parser.add_argument("--vault-root", type=Path, default=Path("~/.quarantine_vault_dfir_v2"))
+    parser.add_argument("--benign-pools-root", type=Path, default=Path("/var/lib/dfir-quarantine-vault/benign_pools"))
+    parser.add_argument("--canary-stamp-path", type=Path, default=None)
     parser.add_argument("--inetsim-wait-seconds", type=int, default=8)
+    parser.add_argument("--full-base-hash-every", type=int, default=25)
+    parser.add_argument("--canary", action="store_true", help="Run supervised 3-boot canary check and write CANARY_PASSED stamp")
+    parser.add_argument("--pipelined", action="store_true", help="Enable safe 1-lane pipelined container extraction")
+    parser.add_argument("--no-resume", action="store_true", help="Do not skip runs already listed in completed_runs.jsonl")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     payload = json.loads(args.batch_json.read_text(encoding="utf-8"))
     runs = list(payload["runs"]) if isinstance(payload, dict) and "runs" in payload else list(payload)
+    if args.canary:
+        runs = _select_canary_subset(runs)
     executed = execute_stage_a_pilot_batch(
         batch_runs=runs,
         runs_out_dir=args.runs_out_dir,
@@ -562,6 +863,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         vault_root=args.vault_root,
         inetsim_wait_seconds=args.inetsim_wait_seconds,
         dry_run=args.dry_run,
+        canary_mode=args.canary,
+        require_canary_stamp=(not args.canary and not args.dry_run),
+        canary_stamp_path=args.canary_stamp_path,
+        full_base_hash_every=args.full_base_hash_every,
+        enable_pipelining=args.pipelined,
+        resume=not args.no_resume,
+        benign_pools_root=args.benign_pools_root,
     )
     print(json.dumps({"completed_runs": len(executed), "runs": executed}, indent=2))
     return 0

@@ -202,6 +202,68 @@ def trace_sysmon_process_tree(
     }
 
 
+def _build_benign_manifest_index(benign_manifest: Mapping[str, Any] | None) -> dict[str, set[str]]:
+    """Index staged benign file paths, service keys/names, task names, run keys, and registry keys."""
+    idx: dict[str, set[str]] = {
+        "paths": set(),
+        "services": set(),
+        "tasks": set(),
+        "run_keys": set(),
+        "registry": set(),
+    }
+    if not benign_manifest:
+        return idx
+    for f in benign_manifest.get("files") or ():
+        p = _norm_s(f.get("path"))
+        if p:
+            idx["paths"].add(p)
+    for s in benign_manifest.get("services") or ():
+        rk = _norm_s(s.get("registry_key"))
+        sn = _norm_s(s.get("service_name"))
+        if rk:
+            idx["services"].add(rk)
+        if sn:
+            idx["services"].add(sn)
+    for t in benign_manifest.get("tasks") or ():
+        tn = _norm_s(t.get("task_name"))
+        nm = _norm_s(t.get("name"))
+        if tn:
+            idx["tasks"].add(tn)
+        if nm:
+            idx["tasks"].add(nm)
+    for r in benign_manifest.get("run_keys") or ():
+        rk = _norm_s(r.get("registry_key"))
+        nm = _norm_s(r.get("name"))
+        if rk and nm:
+            idx["run_keys"].add(f"{rk}|{nm}")
+    for reg in benign_manifest.get("registry_entries") or ():
+        rk = _norm_s(reg.get("registry_key"))
+        nm = _norm_s(reg.get("name"))
+        if rk and nm:
+            idx["registry"].add(f"{rk}|{nm}")
+    return idx
+
+
+def _row_matches_benign_manifest(row: Mapping[str, Any], b_idx: Mapping[str, set[str]]) -> bool:
+    if not any(b_idx.values()):
+        return False
+    at = _norm_s(row.get("artifact_type"))
+    rpath = _norm_s(row.get("path"))
+    regk = _norm_s(row.get("registry_key"))
+    nm = _norm_s(row.get("name"))
+    if at == "file" and rpath in b_idx["paths"]:
+        return True
+    if at == "service" and (regk in b_idx["services"] or _norm_s(row.get("service_name")) in b_idx["services"] or nm in b_idx["services"]):
+        return True
+    if at == "task" and (_norm_s(row.get("task_name")) in b_idx["tasks"] or nm in b_idx["tasks"]):
+        return True
+    if at == "run_key" and f"{regk}|{nm}" in b_idx["run_keys"]:
+        return True
+    if at == "registry" and f"{regk}|{nm}" in b_idx["registry"]:
+        return True
+    return False
+
+
 def _attach_v2_provenance(
     df: pd.DataFrame,
     run_id: str,
@@ -243,6 +305,7 @@ def label_executed_run(
     benign_scheduler_guids: Sequence[str] = (),
     benign_scheduler_pids: Sequence[int] = (),
     benign_idle_keys: frozenset[str] | set[str] = frozenset(),
+    benign_manifest: Mapping[str, Any] | None = None,
     sample_meta: Mapping[str, Any] | None = None,
     runner_log_path: Any = None,
     sanitization_report: Any = None,
@@ -255,6 +318,7 @@ def label_executed_run(
     sanitize.assert_clean(df, report_path=sanitization_report)
 
     hash_idx = baseline_index["hash_index"] if "hash_index" in baseline_index else baseline_index
+    b_man_idx = _build_benign_manifest_index(benign_manifest)
     mal_tree = trace_sysmon_process_tree(
         sysmon_events, root_guids=malware_root_guids, root_pids=malware_root_pids, root_hashes=malware_root_hashes
     )
@@ -297,7 +361,7 @@ def label_executed_run(
             launchers.append("attack")
             continue
 
-        # 2. Benign scheduler tree OR known multi-control clean idle catalog
+        # 2. Benign scheduler tree OR benign workload staging manifest OR known multi-control clean idle catalog
         matched_ben_root = (
             ben_tree["target_to_root"].get(akey)
             or ben_tree["target_to_root"].get(rpath)
@@ -309,6 +373,15 @@ def label_executed_run(
             methods.append("benign_scheduler_tree")
             confs.append("high")
             rguids.append(matched_ben_root)
+            launchers.append("benign")
+            continue
+
+        if _row_matches_benign_manifest(row, b_man_idx):
+            labels.append("benign_drift")
+            reasons.append("benign_staging_manifest_match")
+            methods.append("benign_staging_manifest")
+            confs.append("high")
+            rguids.append(None)
             launchers.append("benign")
             continue
 
@@ -345,6 +418,7 @@ def label_dormant_run(
     run_id: str,
     sysmon_events: Sequence[Mapping[str, Any]] = (),
     benign_idle_keys: frozenset[str] | set[str] = frozenset(),
+    benign_manifest: Mapping[str, Any] | None = None,
     sample_meta: Mapping[str, Any] | None = None,
     runner_log_path: Any = None,
     sanitization_report: Any = None,
@@ -357,6 +431,7 @@ def label_dormant_run(
     sanitize.assert_clean(df, report_path=sanitization_report)
 
     hash_idx = baseline_index["hash_index"] if "hash_index" in baseline_index else baseline_index
+    b_man_idx = _build_benign_manifest_index(benign_manifest)
     staged_map = {
         (_norm_s(m["staged_path"]), _norm_s(m["sample_sha256"])): dict(m)
         for m in staged_manifest
@@ -407,6 +482,15 @@ def label_dormant_run(
                 launchers.append("attack_dormant")
             continue
 
+        if _row_matches_benign_manifest(row, b_man_idx):
+            labels.append("benign_drift")
+            reasons.append("benign_staging_manifest_match")
+            methods.append("benign_staging_manifest")
+            confs.append("high")
+            rguids.append(None)
+            launchers.append("benign")
+            continue
+
         if akey in ben_idle_low:
             labels.append("benign_drift")
             reasons.append("verified_clean_idle_drift")
@@ -430,6 +514,175 @@ def label_dormant_run(
         df, run_id=run_id, sample_meta=sample_meta, execution_state="dormant",
         attribution_methods=methods, attribution_confs=confs, root_guids=rguids,
     )
+
+
+def label_dormant_batch_run(
+    run_df: pd.DataFrame,
+    baseline_index: Mapping[str, Any],
+    batch_manifest: Sequence[Mapping[str, Any]],
+    run_id: str,
+    sysmon_events: Sequence[Mapping[str, Any]] = (),
+    benign_manifest: Mapping[str, Any] | None = None,
+    benign_idle_keys: frozenset[str] | set[str] = frozenset(),
+    split_pool: str = "dev",
+    runner_log_path: Any = None,
+    sanitization_report: Any = None,
+) -> pd.DataFrame:
+    """Label a dev-only batched dormant overlay (`<= 20` non-colliding samples) with per-sample provenance."""
+    if str(split_pool).strip().lower() != "dev":
+        raise ValueError(
+            f"label_dormant_batch_run is strictly dev-only (got split_pool={split_pool!r}); "
+            "blind_test dormant runs must stay 1 sample per boot."
+        )
+    if len(run_df) == 0:
+        return run_df.copy()
+
+    df, _ = drop_v2_harness_footprint(run_df.copy(), log_path=runner_log_path)
+    sanitize.assert_clean(df, report_path=sanitization_report)
+
+    hash_idx = baseline_index["hash_index"] if "hash_index" in baseline_index else baseline_index
+    b_man_idx = _build_benign_manifest_index(benign_manifest)
+    staged_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for m in batch_manifest:
+        spath = _norm_s(m.get("staging_target_path") or m.get("staged_path"))
+        ssha = _norm_s(m.get("sample_sha256"))
+        if spath and ssha:
+            staged_map[(spath, ssha)] = dict(m)
+
+    staged_shas = {sha for _, sha in staged_map}
+    staged_paths = {sp for sp, _ in staged_map}
+    executed_viol_shas: set[str] = set()
+    executed_viol_paths: set[str] = set()
+    for ev in sysmon_events:
+        if int(ev.get("event_id") or 0) == 1:
+            eh = _norm_s(ev.get("hashes") or ev.get("file_sha256"))
+            ep = _norm_s(ev.get("image") or ev.get("target_path"))
+            for s in staged_shas:
+                if s in eh:
+                    executed_viol_shas.add(s)
+            if ep in staged_paths:
+                executed_viol_paths.add(ep)
+
+    ben_idle_low = {str(k).lower() for k in benign_idle_keys}
+    labels, reasons, methods, confs, launchers = [], [], [], [], []
+    shas, fams, cats, pairs, packers = [], [], [], [], []
+    for _, row in df.iterrows():
+        akey = _norm_s(row.get("artifact_key"))
+        rpath = _norm_s(row.get("path"))
+        rsha = _norm_s(row.get("file_sha256"))
+        chash = stable_content_hash(row)
+
+        if akey in hash_idx and chash in hash_idx[akey]:
+            labels.append("baseline")
+            reasons.append("multi_control_baseline_unchanged")
+            methods.append("baseline_hash_match")
+            confs.append("high")
+            launchers.append("baseline")
+            shas.append(None); fams.append(None); cats.append(None); pairs.append(None); packers.append(None)
+            continue
+
+        matched = staged_map.get((rpath, rsha))
+        if matched is not None:
+            if rsha in executed_viol_shas or rpath in executed_viol_paths:
+                labels.append(AMBIGUOUS_LABEL)
+                reasons.append("dormant_batch_had_unexpected_execution_trace")
+                methods.append("dormant_integrity_violation")
+                confs.append("low")
+                launchers.append("unattributed")
+                shas.append(None); fams.append(None); cats.append(None); pairs.append(None); packers.append(None)
+            else:
+                labels.append(config.POSITIVE_LABEL)
+                reasons.append("dormant_batch_manifest_match")
+                methods.append("dormant_staging_manifest")
+                confs.append("high")
+                launchers.append("attack_dormant")
+                shas.append(matched.get("sample_sha256"))
+                fams.append(matched.get("sample_family"))
+                cats.append(matched.get("sample_category"))
+                pairs.append(matched.get("pair_group_id") or matched.get("sample_sha256"))
+                packers.append(matched.get("packer_cluster"))
+            continue
+
+        if _row_matches_benign_manifest(row, b_man_idx):
+            labels.append("benign_drift")
+            reasons.append("benign_staging_manifest_match")
+            methods.append("benign_staging_manifest")
+            confs.append("high")
+            launchers.append("benign")
+            shas.append(None); fams.append(None); cats.append(None); pairs.append(None); packers.append(None)
+            continue
+
+        if akey in ben_idle_low:
+            labels.append("benign_drift")
+            reasons.append("verified_clean_idle_drift")
+            methods.append("clean_idle_catalog")
+            confs.append("medium")
+            launchers.append("os_drift")
+            shas.append(None); fams.append(None); cats.append(None); pairs.append(None); packers.append(None)
+            continue
+
+        labels.append(AMBIGUOUS_LABEL)
+        reasons.append("unattributed_dormant_diff_quarantined")
+        methods.append("unattributed")
+        confs.append("low")
+        launchers.append("unattributed")
+        shas.append(None); fams.append(None); cats.append(None); pairs.append(None); packers.append(None)
+
+    out = df.copy()
+    out[config.LABEL_COL] = labels
+    out["label_reason"] = reasons
+    out["launcher"] = launchers
+    out["run_id"] = str(run_id)
+    out["schema_version"] = "v2"
+    out["sample_sha256"] = shas
+    out["sample_family"] = fams
+    out["sample_category"] = cats
+    out["sample_source"] = None
+    out["execution_state"] = "dormant"
+    out["run_duration_s"] = None
+    out["detonation_exit_status"] = "dormant_batch"
+    out["process_tree_root_guid"] = None
+    out["attribution_method"] = methods
+    out["attribution_confidence"] = confs
+    out["packer_cluster"] = packers
+    out["label_review_status"] = "pending"
+    out["stratum"] = "dormant"
+    out["pair_group_id"] = pairs
+    out["split_pool"] = "dev"
+    return out
+
+
+def deduplicate_dev_os_baseline(df: pd.DataFrame) -> pd.DataFrame:
+    """Train-time cross-run OS-baseline deduplication strictly restricted to `split_pool == 'dev'`.
+
+    Collapses identical untouched `baseline` rows matching `(artifact_key, stable_content_hash)` across
+    dev runs while retaining 100% of `attacker_induced`, `benign_drift`, and other non-baseline rows.
+    """
+    if "split_pool" not in df.columns:
+        raise ValueError("deduplicate_dev_os_baseline requires explicit 'split_pool' column proving dev-only scope")
+    pools = {str(x).strip().lower() for x in df["split_pool"].dropna().unique()}
+    if pools - {"dev"}:
+        raise ValueError(
+            f"FORBIDDEN cross-run deduplication outside dev pool (found split_pool={sorted(pools)}). "
+            "Blind test must NEVER be deduplicated across runs."
+        )
+    if len(df) == 0:
+        return df.copy()
+
+    seen_baseline: set[tuple[str, str]] = set()
+    keep_mask: list[bool] = []
+    for _, row in df.iterrows():
+        lbl = str(row.get(config.LABEL_COL, "")).strip().lower()
+        if lbl != "baseline":
+            keep_mask.append(True)
+            continue
+        key = (_norm_s(row.get("artifact_key")), stable_content_hash(row))
+        if key in seen_baseline:
+            keep_mask.append(False)
+        else:
+            seen_baseline.add(key)
+            keep_mask.append(True)
+    return df[keep_mask].reset_index(drop=True)
 
 
 def assign_v2_splits(

@@ -5,10 +5,10 @@ import numpy as np
 
 
 V2_FINAL_SEEDS: list[int] = [42, 43, 44, 45, 46]
-V2_N_SEARCH_TRIALS: int = 30
+V2_N_SEARCH_TRIALS: int = 20
 V2_N_SEARCH_TRIALS_FALLBACK: int = 20
 V2_OUTER_FOLDS: int = 5
-V2_INNER_FOLDS: int = 4
+V2_INNER_FOLDS: int = 3
 
 V2_UNSUP_SELECTION_MODES: tuple[str, ...] = ("label_free", "label_selected")
 V2_REFIT_POLICIES: tuple[str, ...] = ("full_dev_median_epoch", "fold_ensemble")
@@ -59,7 +59,7 @@ V2_DEFAULT_PARAMS: dict[str, dict] = {
     },
 }
 
-# Each tuned arm has >= 30 unique combinations so every arm can run an equal N_trials = 30 budget.
+# Each tuned arm has >= 20 unique combinations so every arm receives an equal N_trials = 20 budget.
 V2_SEARCH_SPACES: dict[str, dict[str, list]] = {
     "rf": {
         "n_estimators": [200, 300, 400, 500],

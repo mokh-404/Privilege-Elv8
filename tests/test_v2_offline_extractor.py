@@ -23,8 +23,10 @@ from src.v2.offline_extractor import (
     extract_from_fixture,
     load_base_image_cache,
     make_base_file_cache_key,
+    normalize_sysmon_evtx_record,
     normalize_volume_prefix,
     open_qcow2_target_readonly,
+    patch_stale_large_pe_cache,
     save_base_image_cache,
     validate_extracted_record,
     verify_offline_signature,
@@ -400,3 +402,137 @@ def test_isolated_net_preamble_and_aes256_vault_in_memory(tmp_path):
         capture_output=True,
     )
     assert (verify_dir / "payload.bin").read_bytes() == payload_bytes
+
+
+def test_patch_stale_large_pe_cache_and_sysmon_evtx_export(tmp_path, monkeypatch):
+    import hashlib
+    from src.v2 import offline_extractor as oe
+
+    cache_path = tmp_path / "win11_base_cache.json.gz"
+    stale_path = r"C:\Program Files\LargeVendor\OneDriveSetup.exe"
+    small_path = r"C:\Users\Public\small_unsigned.exe"
+    verified_large_path = r"C:\Program Files\SignedVendor\signed_large.exe"
+
+    stale_key = make_base_file_cache_key(120, 99, 70 * MIB, 1772840911079985100)
+    small_key = make_base_file_cache_key(121, 99, 16384, 1772840911079985100)
+    signed_key = make_base_file_cache_key(122, 99, 90 * MIB, 1772840911079985100)
+
+    save_base_image_cache(
+        cache_path,
+        base_image_sha256="b" * 64,
+        catroot_digests={"cat123"},
+        file_entries={
+            stale_key: {
+                "path": stale_path,
+                "file_size": 70 * MIB,
+                "signature_status": "NotSigned",
+                "file_sha256": None,
+                "file_head_histogram": [1] * 256,
+                "wof_compressed": False,
+            },
+            small_key: {
+                "path": small_path,
+                "file_size": 16384,
+                "signature_status": "NotSigned",
+                "file_sha256": "c" * 64,
+                "file_head_histogram": [0] * 256,
+                "wof_compressed": False,
+            },
+            signed_key: {
+                "path": verified_large_path,
+                "file_size": 90 * MIB,
+                "signature_status": "SignedEmbedded",
+                "file_sha256": "d" * 64,
+                "file_head_histogram": [0] * 256,
+                "wof_compressed": False,
+            },
+        },
+    )
+
+    fake_large_bytes = b"MZ\x90\x00PATCHED_LARGE_PE_CONTENT_" * 4096
+
+    class _FakeStat:
+        def __init__(self, sz: int) -> None:
+            self.st_size = sz
+
+    class _FakePathObj:
+        def __init__(self, norm: str) -> None:
+            self._match = norm.lower() == stale_path.lower()
+
+        def exists(self) -> bool:
+            return self._match
+
+        def is_dir(self) -> bool:
+            return False
+
+        def stat(self) -> _FakeStat:
+            return _FakeStat(len(fake_large_bytes))
+
+        def open(self, _mode: str):
+            import io
+
+            return io.BytesIO(fake_large_bytes)
+
+    class _FakeFS:
+        mounts: dict[str, object] = {}
+
+        def path(self, norm: str) -> _FakePathObj:
+            return _FakePathObj(norm)
+
+    class _FakeTarget:
+        fs = _FakeFS()
+
+    monkeypatch.setattr(oe, "open_qcow2_target_readonly", lambda _p: _FakeTarget())
+    monkeypatch.setattr(oe, "close_target_safely", lambda _t: None)
+    monkeypatch.setattr(
+        oe,
+        "verify_offline_signature",
+        lambda path, _b, _sz, _cats: "SignedCatalog" if "onedrivesetup.exe" in path.lower() else "NotSigned",
+    )
+
+    res = patch_stale_large_pe_cache(tmp_path / "base.qcow2", cache_path, expected_base_sha256="b" * 64)
+    assert res["stale_candidates"] == 1
+    assert res["patched_entries"] == 1
+
+    reloaded = load_base_image_cache(cache_path, expected_base_sha256="b" * 64)
+    assert reloaded["file_entries"][stale_key]["signature_status"] == "SignedCatalog"
+    assert reloaded["file_entries"][stale_key]["file_sha256"] == hashlib.sha256(fake_large_bytes).hexdigest()
+    assert reloaded["file_entries"][small_key]["signature_status"] == "NotSigned"
+    assert reloaded["file_entries"][signed_key]["signature_status"] == "SignedEmbedded"
+
+    # Second run sees 0 stale candidates
+    res2 = patch_stale_large_pe_cache(tmp_path / "base.qcow2", cache_path, expected_base_sha256="b" * 64)
+    assert res2["stale_candidates"] == 0 and res2["patched_entries"] == 0
+
+    # Sysmon normalization & sysmon_events.jsonl export
+    ev_proc = normalize_sysmon_evtx_record({
+        "Provider_Name": "Microsoft-Windows-Sysmon",
+        "EventID": 1,
+        "UtcTime": "2026-11-25 01:02:03.000",
+        "ProcessGuid": "{mal-root}",
+        "ParentProcessGuid": "{exp}",
+        "ProcessId": "412",
+        "ParentProcessId": "100",
+        "Image": r"C:\Users\Public\sample.exe",
+        "Hashes": "SHA256=" + "e" * 64,
+    })
+    assert ev_proc is not None and ev_proc["event_id"] == 1 and ev_proc["pid"] == 412
+    assert normalize_sysmon_evtx_record({"Provider_Name": "Microsoft-Windows-Sysmon", "EventID": 999}) is None
+    assert normalize_sysmon_evtx_record({"Provider_Name": "Microsoft-Windows-Kernel-General", "EventID": 1}) is None
+
+    paths = write_outputs(
+        [{
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\sample.exe|sample.exe",
+            "name": "sample.exe",
+            "path": r"C:\Users\Public\sample.exe",
+            "file_size": 1000,
+        }],
+        {"sysmon_evtx_present": True, "sysmon_events_count": 1, "sysmon_events": [ev_proc], "total_records": 1},
+        tmp_path / "evtx_out",
+    )
+    assert "sysmon_jsonl" in paths and paths["sysmon_jsonl"].exists()
+    ev_lines = [json.loads(ln) for ln in paths["sysmon_jsonl"].read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(ev_lines) == 1 and ev_lines[0]["process_guid"] == "{mal-root}"
+    man = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    assert "sysmon_events" not in man  # Full event list stays in sysmon_events.jsonl, not bloated inside manifest

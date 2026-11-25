@@ -105,14 +105,16 @@ def _make_v2_synthetic_df(n_families: int = 8, n_benign_sessions: int = 12, seed
     return pd.DataFrame(rows)
 
 
-def test_v2_search_spaces_support_30_equal_trials():
+def test_v2_search_spaces_support_20_equal_trials():
     assert config_v2.V2_FINAL_SEEDS == [42, 43, 44, 45, 46]
-    assert config_v2.V2_N_SEARCH_TRIALS == 30
+    assert config_v2.V2_OUTER_FOLDS == 5
+    assert config_v2.V2_INNER_FOLDS == 3
+    assert config_v2.V2_N_SEARCH_TRIALS == 20
     assert config_v2.V2_N_SEARCH_TRIALS_FALLBACK == 20
     for arm in ("rf", "xgb", "iforest", "mlp", "ae", "lr"):
         trials = sample_param_trials(arm, n_trials=config_v2.V2_N_SEARCH_TRIALS, seed=42)
-        assert len(trials) == 30
-        assert len({tuple(sorted(d.items())) for d in trials}) == 30
+        assert len(trials) == 20
+        assert len({tuple(sorted(d.items())) for d in trials}) == 20
 
 
 def test_fit_arm_v2_signature_forbids_outer_va_df():

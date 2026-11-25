@@ -195,11 +195,20 @@ def save_base_image_cache(
         "file_entries": dict(file_entries),
     }
     raw_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if cpath.name.endswith(".gz"):
-        with gzip.open(cpath, "wb", compresslevel=6) as gfh:
-            gfh.write(raw_bytes)
-    else:
-        cpath.write_bytes(raw_bytes)
+    tmp_path = cpath.with_name(f".{cpath.name}.tmp.{os.getpid()}")
+    try:
+        if cpath.name.endswith(".gz"):
+            with gzip.open(tmp_path, "wb", compresslevel=6) as gfh:
+                gfh.write(raw_bytes)
+        else:
+            tmp_path.write_bytes(raw_bytes)
+        os.replace(tmp_path, cpath)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return cpath
 
 
@@ -953,6 +962,213 @@ def close_target_safely(target: Any) -> None:
             except Exception:
                 pass
             cur = nxt_qcow2
+
+
+_SYSMON_SUPPORTED_EIDS: frozenset[int] = frozenset({1, 3, 7, 8, 11, 12, 13, 14, 15, 19, 20, 21, 22, 25})
+
+
+def _unwrap_bxml_value(val: Any) -> Any:
+    if val is None:
+        return None
+    getter = getattr(val, "get", None)
+    if callable(getter):
+        try:
+            val = getter()
+        except Exception:
+            pass
+    if isinstance(val, (bytes, bytearray)):
+        return val.decode("utf-8", errors="replace")
+    return val
+
+
+def _parse_int_maybe(val: Any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s, 0)
+    except ValueError:
+        return None
+
+
+def normalize_sysmon_evtx_record(raw_ev: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Normalize a raw `dissect.eventlog.evtx` record into the v2 Sysmon labeler dict schema."""
+    flat: dict[str, Any] = {}
+    for raw_k, raw_v in raw_ev.items():
+        v = _unwrap_bxml_value(raw_v)
+        k_str = str(raw_k).strip()
+        flat[k_str.lower()] = v
+        if "_" in k_str:
+            _, tail = k_str.split("_", 1)
+            flat.setdefault(tail.lower(), v)
+        if "." in k_str:
+            _, tail = k_str.rsplit(".", 1)
+            flat.setdefault(tail.lower(), v)
+
+    provider = str(flat.get("provider_name") or "").strip().lower()
+    if provider and "sysmon" not in provider:
+        return None
+
+    eid = _parse_int_maybe(flat.get("eventid") or flat.get("event_id"))
+    if eid is None or eid not in _SYSMON_SUPPORTED_EIDS:
+        return None
+
+    def _opt_str(key: str) -> str | None:
+        v = flat.get(key)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return None if (not s or s == "-") else s
+
+    utc_raw = flat.get("utctime") or flat.get("utc_time") or flat.get("timecreated_systemtime")
+    utc_str = utc_raw.isoformat() if hasattr(utc_raw, "isoformat") else (_opt_str("utctime") or _opt_str("utc_time") or _opt_str("timecreated_systemtime"))
+
+    rec: dict[str, Any] = {
+        "event_id": int(eid),
+        "utc_time": utc_str,
+        "process_guid": _opt_str("processguid") or _opt_str("process_guid"),
+        "parent_process_guid": _opt_str("parentprocessguid") or _opt_str("parent_process_guid"),
+        "pid": _parse_int_maybe(flat.get("processid") or flat.get("pid")),
+        "ppid": _parse_int_maybe(flat.get("parentprocessid") or flat.get("ppid")),
+        "image": _opt_str("image"),
+        "command_line": _opt_str("commandline") or _opt_str("command_line"),
+        "hashes": _opt_str("hashes"),
+        "target_filename": _opt_str("targetfilename") or _opt_str("target_filename"),
+        "target_object": _opt_str("targetobject") or _opt_str("target_object"),
+        "source_process_guid": _opt_str("sourceprocessguid") or _opt_str("source_process_guid"),
+        "target_process_guid": _opt_str("targetprocessguid") or _opt_str("target_process_guid"),
+        "target_image": _opt_str("targetimage") or _opt_str("target_image"),
+        "query_name": _opt_str("queryname") or _opt_str("query_name"),
+    }
+    return {k: v for k, v in rec.items() if v is not None}
+
+
+def _extract_sysmon_evtx_events(t: Any) -> tuple[bool, list[dict[str, Any]], dict[str, int]]:
+    """Read Microsoft-Windows-Sysmon%4Operational.evtx strictly in user space for offline causal labeling."""
+    evtx_path = t.fs.path(r"c:\Windows\System32\winevt\Logs\Microsoft-Windows-Sysmon%4Operational.evtx")
+    if not evtx_path.exists():
+        return False, [], {}
+    events: list[dict[str, Any]] = []
+    eid_counts: Counter[str] = Counter()
+    try:
+        from dissect.eventlog.evtx import Evtx  # type: ignore
+
+        with evtx_path.open("rb") as fh:
+            for raw_ev in Evtx(fh):
+                norm = normalize_sysmon_evtx_record(raw_ev)
+                if norm is not None:
+                    events.append(norm)
+                    eid_counts[str(norm["event_id"])] += 1
+    except Exception:
+        return True, events, dict(eid_counts)
+    return True, events, dict(sorted(eid_counts.items()))
+
+
+def patch_stale_large_pe_cache(
+    qcow2_path: str | Path,
+    base_cache_path: str | Path,
+    expected_base_sha256: str = GOLDEN_BASE_IMAGE_SHA256,
+) -> dict[str, Any]:
+    """Incrementally re-verify > 64 MiB `NotSigned` entries in an existing `win11_base_cache.json.gz`."""
+    cpath = Path(base_cache_path)
+    qpath = Path(qcow2_path)
+    loaded = load_base_image_cache(cpath, expected_base_sha256=expected_base_sha256)
+    file_entries: dict[str, dict[str, Any]] = {
+        str(k): dict(v) for k, v in (loaded.get("file_entries") or {}).items()
+    }
+    cat_digests = {str(d).lower() for d in (loaded.get("catroot_digests") or []) if d}
+
+    stale_keys = [
+        k for k, v in file_entries.items()
+        if int(v.get("file_size") or 0) > 64 * MIB and str(v.get("signature_status") or "") == "NotSigned"
+    ]
+    if not stale_keys:
+        return {
+            "cache_path": str(cpath),
+            "base_image_sha256": loaded.get("base_image_sha256"),
+            "stale_candidates": 0,
+            "patched_entries": 0,
+            "updated_paths": [],
+        }
+
+    t = open_qcow2_target_readonly(qpath)
+    patched: list[dict[str, Any]] = []
+    try:
+        c_fs = t.fs.mounts.get("c:")
+        ntfs = getattr(c_fs, "ntfs", None) if c_fs is not None else None
+        for ckey in stale_keys:
+            entry = file_entries[ckey]
+            norm = normalize_volume_prefix(str(entry.get("path") or ""))
+            if not norm:
+                continue
+            old_sig = entry.get("signature_status")
+            fbytes: bytes | None = None
+            full_sz = int(entry.get("file_size") or 0)
+            wof_flag = bool(entry.get("wof_compressed", False))
+
+            mft_rec = None
+            if ntfs is not None and norm.lower().startswith("c:\\"):
+                rel = norm[3:].lstrip("\\")
+                try:
+                    mft_rec = ntfs.mft.get(rel)
+                except Exception:
+                    mft_rec = None
+                if mft_rec is None:
+                    try:
+                        seg_id = int(ckey.split(":", 1)[0])
+                        mft_rec = ntfs.mft.get(seg_id)
+                    except Exception:
+                        mft_rec = None
+
+            if mft_rec is not None:
+                fbytes, full_sz, is_wof = _read_mft_file_bytes(mft_rec, max_bytes=MAX_PE_SIGNIFY_BYTES)
+                wof_flag = bool(is_wof or wof_flag)
+            else:
+                tp = t.fs.path(norm)
+                if not tp.exists() or tp.is_dir():
+                    continue
+                full_sz = int(tp.stat().st_size)
+                with tp.open("rb") as fh:
+                    fbytes = fh.read(min(full_sz, MAX_PE_SIGNIFY_BYTES))
+
+            if fbytes is None:
+                continue
+            new_sig = verify_offline_signature(norm, fbytes, full_sz, cat_digests)
+            entry["file_size"] = int(full_sz)
+            entry["file_head_histogram"] = compute_head_histogram(fbytes[:MIB])
+            entry["file_sha256"] = hashlib.sha256(fbytes).hexdigest() if full_sz <= MAX_PE_SIGNIFY_BYTES else None
+            entry["signature_status"] = new_sig
+            entry["wof_compressed"] = wof_flag
+            file_entries[ckey] = entry
+            patched.append({
+                "cache_key": ckey,
+                "path": norm,
+                "file_size": int(full_sz),
+                "old_signature_status": old_sig,
+                "new_signature_status": new_sig,
+            })
+    finally:
+        close_target_safely(t)
+
+    save_base_image_cache(
+        cpath,
+        base_image_sha256=str(loaded.get("base_image_sha256") or expected_base_sha256),
+        catroot_digests=cat_digests,
+        file_entries=file_entries,
+    )
+    return {
+        "cache_path": str(cpath),
+        "base_image_sha256": loaded.get("base_image_sha256"),
+        "stale_candidates": len(stale_keys),
+        "patched_entries": len(patched),
+        "updated_paths": patched,
+    }
 
 
 def extract_from_qcow2(
@@ -2017,6 +2233,8 @@ def extract_from_qcow2(
                 kept_records.append(rec)
         records = kept_records
 
+        sysmon_present, sysmon_events, sysmon_eid_counts = _extract_sysmon_evtx_events(t)
+
         elapsed = round(time.monotonic() - t0, 3)
         df = pd.DataFrame(records)
         summary = summarize_extraction_and_refgraph(df, disk_id=run_id)
@@ -2032,6 +2250,10 @@ def extract_from_qcow2(
             "base_cache_misses": int(base_cache_misses),
             "v2_harness_footprint_dropped_count": len(dropped_harness),
             "v2_harness_footprint_dropped": dropped_harness,
+            "sysmon_evtx_present": bool(sysmon_present),
+            "sysmon_events_count": len(sysmon_events),
+            "sysmon_event_id_counts": sysmon_eid_counts,
+            "sysmon_events": sysmon_events,
         })
         return records, summary
     finally:
@@ -2130,7 +2352,7 @@ def summarize_extraction_and_refgraph(df: pd.DataFrame, disk_id: str = "offline_
 
 
 def write_outputs(records: Sequence[Mapping[str, Any]], summary: Mapping[str, Any], out_dir: str | Path) -> dict[str, Path]:
-    """Write schema-validated JSONL, Parquet (complex nested cols JSON-encoded), and manifest JSON."""
+    """Write schema-validated JSONL, Parquet (complex nested cols JSON-encoded), optional Sysmon EVTX JSONL, and manifest JSON."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = out_dir / "artifacts.jsonl"
@@ -2150,31 +2372,57 @@ def write_outputs(records: Sequence[Mapping[str, Any]], summary: Mapping[str, An
     pq_path = out_dir / "artifacts.parquet"
     pd.DataFrame(pq_rows).to_parquet(pq_path, index=False)
 
+    clean_summary = dict(summary)
+    sysmon_events = list(clean_summary.pop("sysmon_events", None) or [])
+    out_paths: dict[str, Path] = {}
+    if clean_summary.get("sysmon_evtx_present") or sysmon_events:
+        sysmon_jsonl = out_dir / "sysmon_events.jsonl"
+        with sysmon_jsonl.open("w", encoding="utf-8") as sfh:
+            for sev in sysmon_events:
+                sfh.write(json.dumps(sev, separators=(",", ":"), default=str) + "\n")
+        out_paths["sysmon_jsonl"] = sysmon_jsonl
+
     manifest = {
         "generated_at_utc": utc_now_iso(),
-        **summary,
+        **clean_summary,
     }
     man_path = write_json(manifest, out_dir / "extraction_manifest.json")
-    dropped_rows = list(summary.get("v2_harness_footprint_dropped") or [])
+    dropped_rows = list(clean_summary.get("v2_harness_footprint_dropped") or [])
     dropped_csv = out_dir / "v2_runner_footprint_dropped.csv"
     pd.DataFrame(
         dropped_rows,
         columns=["run_id", "artifact_type", "artifact_key", "name", "path", "drop_reason"],
     ).to_csv(dropped_csv, index=False)
-    return {"jsonl": jsonl_path, "parquet": pq_path, "manifest": man_path, "dropped_csv": dropped_csv}
+    out_paths.update({"jsonl": jsonl_path, "parquet": pq_path, "manifest": man_path, "dropped_csv": dropped_csv})
+    return out_paths
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pure user-space offline QCOW2 artifact extractor (Step F).")
     parser.add_argument("--qcow2", type=Path, required=True, help="Closed QCOW2 image path (opened read-only)")
-    parser.add_argument("--out-dir", type=Path, required=True, help="Output directory for JSONL/Parquet/manifest")
+    parser.add_argument("--out-dir", type=Path, default=None, help="Output directory for JSONL/Parquet/manifest")
     parser.add_argument("--run-id", default="offline_run")
     parser.add_argument("--max-scanned-files", type=int, default=1500)
     parser.add_argument("--skip-catroot", action="store_true")
     parser.add_argument("--base-cache-path", type=Path, default=None, help="Path to immutable base-image digest/signature cache")
     parser.add_argument("--build-base-cache", action="store_true", help="Build and write base-image cache to --base-cache-path")
+    parser.add_argument("--patch-stale-large-pe-cache", action="store_true", help="Incrementally patch > 64 MiB NotSigned entries in --base-cache-path")
     parser.add_argument("--expected-base-sha256", default=GOLDEN_BASE_IMAGE_SHA256)
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.patch_stale_large_pe_cache:
+        if args.base_cache_path is None:
+            parser.error("--patch-stale-large-pe-cache requires --base-cache-path")
+        patch_report = patch_stale_large_pe_cache(
+            qcow2_path=args.qcow2,
+            base_cache_path=args.base_cache_path,
+            expected_base_sha256=args.expected_base_sha256,
+        )
+        print(json.dumps(patch_report, indent=2))
+        return 0
+
+    if args.out_dir is None:
+        parser.error("--out-dir is required unless --patch-stale-large-pe-cache is used")
 
     records, summary = extract_from_qcow2(
         args.qcow2,
@@ -2186,7 +2434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_base_sha256=args.expected_base_sha256,
     )
     paths = write_outputs(records, summary, args.out_dir)
-    print(json.dumps({"summary": summary, "outputs": {k: str(v) for k, v in paths.items()}}, indent=2))
+    print(json.dumps({"summary": {k: v for k, v in summary.items() if k != "sysmon_events"}, "outputs": {k: str(v) for k, v in paths.items()}}, indent=2))
     return 0
 
 

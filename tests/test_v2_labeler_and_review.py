@@ -9,6 +9,8 @@ from src.v2.labeler_v2 import (
     AMBIGUOUS_LABEL,
     assign_v2_splits,
     build_multi_control_baseline,
+    deduplicate_dev_os_baseline,
+    label_dormant_batch_run,
     label_dormant_run,
     label_executed_run,
     trace_sysmon_process_tree,
@@ -175,3 +177,137 @@ def test_blinded_two_reviewer_workflow_and_non_overwrite_guard(tmp_path):
 
     merged = merge_label_corrections(df, prim)
     assert (merged["label_review_status"] == "human_reviewed").all()
+
+
+def test_review_v2_caps_large_dataset_to_400_and_80_overlap_stratified(tmp_path):
+    import json
+
+    rows = []
+    fams = ["redline", "asyncrat", "smokeloader", "xmrig"]
+    for i in range(5600):
+        st = "executed" if i < 2800 else "dormant"
+        fam = fams[i % len(fams)]
+        rows.append({
+            "run_id": f"r_{i // 10}",
+            "stratum": st,
+            "execution_state": st,
+            "artifact_type": "file",
+            "artifact_key": f"file|c:\\u\\{fam}_{i}.exe|{fam}_{i}.exe",
+            "name": f"{fam}_{i}.exe",
+            "path": f"C:\\u\\{fam}_{i}.exe",
+            "command_line": "",
+            "registry_key": "",
+            "signature_status": "NotSigned",
+            "file_size": 10000 + i,
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "label_reason": "sysmon_process_tree_attribution",
+            "launcher": "attack",
+            "sample_family": fam,
+            "pair_group_id": f"pair_{i}",
+        })
+    for i in range(300):
+        rows.append({
+            "run_id": f"b_{i // 5}",
+            "stratum": "benign",
+            "execution_state": "benign",
+            "artifact_type": "file",
+            "artifact_key": f"file|c:\\ben\\b_{i}.ps1|b_{i}.ps1",
+            "name": f"b_{i}.ps1",
+            "path": f"C:\\ben\\b_{i}.ps1",
+            "command_line": "",
+            "registry_key": "",
+            "signature_status": "NotSigned",
+            "file_size": 500 + i,
+            config.LABEL_COL: "benign_drift",
+            "label_reason": "benign_staging_manifest_match",
+            "launcher": "benign",
+            "sample_family": None,
+            "pair_group_id": None,
+        })
+    for i in range(300):
+        rows.append({
+            "run_id": f"a_{i // 5}",
+            "stratum": "executed",
+            "execution_state": "executed",
+            "artifact_type": "file",
+            "artifact_key": f"file|c:\\tmp\\u_{i}.dat|u_{i}.dat",
+            "name": f"u_{i}.dat",
+            "path": f"C:\\tmp\\u_{i}.dat",
+            "command_line": "",
+            "registry_key": "",
+            "signature_status": "NotSigned",
+            "file_size": 700 + i,
+            config.LABEL_COL: AMBIGUOUS_LABEL,
+            "label_reason": "unattributed_diff_quarantined",
+            "launcher": "unattributed",
+            "sample_family": None,
+            "pair_group_id": None,
+        })
+
+    big_df = pd.DataFrame(rows)
+    p_csv = tmp_path / "primary_400.csv"
+    o_csv = tmp_path / "overlap_80.csv"
+    k_json = tmp_path / "key_400.json"
+    info = export_blinded_review_sample(big_df, p_csv, o_csv, k_json, overlap_frac=0.20, seed=42)
+    assert info["n_primary"] == 400
+    assert info["n_overlap"] == 80
+
+    key_data = json.loads(k_json.read_text(encoding="utf-8"))
+    labels = [v["auto_label"] for v in key_data["keys"].values()]
+    assert labels.count(config.POSITIVE_LABEL) == 200
+    assert labels.count("benign_drift") == 100
+    assert labels.count(AMBIGUOUS_LABEL) == 100
+    pos_fams = {v["sample_family"] for v in key_data["keys"].values() if v["auto_label"] == config.POSITIVE_LABEL}
+    assert pos_fams == set(fams)
+
+
+def test_label_dormant_batch_run_dev_only_and_deduplicate_dev_os_baseline():
+    base = build_multi_control_baseline([_baseline_df("ctrl_01")])
+    batch_manifest = [
+        {"staging_target_path": r"C:\Users\Public\s0.exe", "sample_sha256": "aa" * 32, "sample_family": "redline", "pair_group_id": "p0"},
+        {"staging_target_path": r"C:\Users\Public\s1.exe", "sample_sha256": "bb" * 32, "sample_family": "asyncrat", "pair_group_id": "p1"},
+    ]
+    run_df = pd.DataFrame([
+        {"artifact_type": "file", "artifact_key": "file|c:\\windows\\notepad.exe|notepad.exe",
+         "name": "notepad.exe", "path": "C:\\Windows\\notepad.exe", "file_sha256": "aaa111"},
+        {"artifact_type": "file", "artifact_key": r"file|c:\users\public\s0.exe|s0.exe",
+         "name": "s0.exe", "path": r"C:\Users\Public\s0.exe", "file_sha256": "aa" * 32},
+        {"artifact_type": "file", "artifact_key": r"file|c:\users\public\s1.exe|s1.exe",
+         "name": "s1.exe", "path": r"C:\Users\Public\s1.exe", "file_sha256": "bb" * 32},
+        {"artifact_type": "file", "artifact_key": r"file|c:\programdata\ben_tool.ps1|ben_tool.ps1",
+         "name": "ben_tool.ps1", "path": r"C:\ProgramData\ben_tool.ps1", "file_sha256": "cc" * 32},
+    ])
+
+    with pytest.raises(ValueError, match="strictly dev-only"):
+        label_dormant_batch_run(run_df, base, batch_manifest, run_id="db_bad", split_pool="blind_test")
+
+    # Mark s1 as unexpectedly executed via Sysmon EID 1 to verify quarantine guard
+    labeled = label_dormant_batch_run(
+        run_df,
+        base,
+        batch_manifest,
+        run_id="db_dev_01",
+        sysmon_events=[{"event_id": 1, "image": r"C:\Users\Public\s1.exe", "hashes": f"SHA256={'bb' * 32}"}],
+        benign_manifest={"files": [{"path": r"C:\ProgramData\ben_tool.ps1", "file_sha256": "cc" * 32}]},
+        split_pool="dev",
+    )
+    by_name = dict(zip(labeled["name"], labeled[config.LABEL_COL]))
+    assert by_name["notepad.exe"] == "baseline"
+    assert by_name["s0.exe"] == config.POSITIVE_LABEL
+    assert by_name["s1.exe"] == AMBIGUOUS_LABEL
+    assert by_name["ben_tool.ps1"] == "benign_drift"
+
+    # Cross-run OS-baseline deduplication works on dev and blocks test
+    dup_dev = pd.DataFrame([
+        {"run_id": "r1", "split_pool": "dev", "artifact_type": "file", "artifact_key": "k_os", "name": "n.exe", "path": "C:\\Windows\\n.exe", "file_sha256": "111", config.LABEL_COL: "baseline"},
+        {"run_id": "r2", "split_pool": "dev", "artifact_type": "file", "artifact_key": "k_os", "name": "n.exe", "path": "C:\\Windows\\n.exe", "file_sha256": "111", config.LABEL_COL: "baseline"},
+        {"run_id": "r1", "split_pool": "dev", "artifact_type": "file", "artifact_key": "k_dr1", "name": "d1.ps1", "path": "C:\\tmp\\d1.ps1", "file_sha256": "222", config.LABEL_COL: "benign_drift"},
+        {"run_id": "r2", "split_pool": "dev", "artifact_type": "file", "artifact_key": "k_dr2", "name": "d1.ps1", "path": "C:\\tmp\\d1.ps1", "file_sha256": "222", config.LABEL_COL: "benign_drift"},
+    ])
+    ded = deduplicate_dev_os_baseline(dup_dev)
+    assert len(ded) == 3  # 1 baseline + 2 benign_drift retained
+
+    bad_test = dup_dev.copy()
+    bad_test.loc[0, "split_pool"] = "test"
+    with pytest.raises(ValueError, match="Blind test must NEVER be deduplicated"):
+        deduplicate_dev_os_baseline(bad_test)

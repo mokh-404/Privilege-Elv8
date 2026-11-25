@@ -182,3 +182,270 @@ def test_inetsim_doc_uses_valid_inetsim_conf_directives():
     assert "start_service           http" in doc
     assert "systemd-networkd-wait-online.service" in doc
     assert "service_run_services" not in doc
+
+
+def _write_valid_gate0_marker(path: Path, mode: int = 0o400, override: str | None = None) -> None:
+    if path.exists():
+        path.chmod(0o600)
+    text = override if override is not None else (
+        "SIGNED_BY=Mokh\n"
+        "DATE=2026-11-25\n"
+        "SUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\n"
+        "DEDICATED_USER_VERIFIED=true\n"
+    )
+    path.write_text(text, encoding="utf-8")
+    path.chmod(mode)
+
+
+def test_vault_gate0_strict_0400_fields_and_manifest_completeness(tmp_path):
+    import os
+
+    setup_sh = HARDENING_DIR / "05_quarantine_vault_setup.sh"
+    vault = tmp_path / "vault"
+    env = dict(os.environ, VAULT_ROOT=str(vault))
+    subprocess.run(["bash", str(setup_sh), "init"], env=env, check=True, capture_output=True, text=True)
+
+    # 1. Missing marker blocks preflight
+    r_missing = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_missing.returncode != 0
+
+    marker = vault / "GATE0_SIGNED_OFF"
+    # 2. Empty marker even with 0400 blocks preflight
+    _write_valid_gate0_marker(marker, mode=0o400, override="")
+    r_empty = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_empty.returncode != 0
+
+    # 3. Wrong permissions (0644) blocks preflight
+    _write_valid_gate0_marker(marker, mode=0o644)
+    r_mode = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_mode.returncode != 0 and "0400" in r_mode.stderr
+
+    # 4. Placeholder / falsy required fields block preflight
+    _write_valid_gate0_marker(
+        marker,
+        mode=0o400,
+        override=(
+            "SIGNED_BY=Mokh\n"
+            "DATE=2026-11-25\n"
+            "SUPERVISOR_APPROVAL=TBD\n"
+            "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\n"
+            "DEDICATED_USER_VERIFIED=true\n"
+        ),
+    )
+    r_tbd = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_tbd.returncode != 0
+
+    _write_valid_gate0_marker(
+        marker,
+        mode=0o400,
+        override=(
+            "SIGNED_BY=Mokh\n"
+            "DATE=2026-11-25\n"
+            "SUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+            "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\n"
+            "DEDICATED_USER_VERIFIED=false\n"
+        ),
+    )
+    r_false = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_false.returncode != 0
+
+    # 5. Valid 0400 marker passes empty vault preflight
+    _write_valid_gate0_marker(marker, mode=0o400)
+    r_ok = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_ok.returncode == 0
+
+    # 6. Unmanifested 0400 archive in archives/ MUST fail preflight
+    rogue_zip = vault / "archives" / ("a" * 64 + ".zip")
+    rogue_zip.write_bytes(b"PK\x03\x04rogue_unmanifested")
+    rogue_zip.chmod(0o400)
+    r_unman = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_unman.returncode != 0
+
+    # 7. Seal archive properly -> preflight passes again
+    r_seal = subprocess.run(
+        ["bash", str(setup_sh), "seal-archive", str(rogue_zip)], env=env, capture_output=True, text=True
+    )
+    assert r_seal.returncode == 0
+    r_ok2 = subprocess.run(["bash", str(setup_sh), "preflight"], env=env, capture_output=True, text=True)
+    assert r_ok2.returncode == 0
+
+
+def test_watchdog_fast_verify_detached_timeout_and_egress_delta(tmp_path):
+    import json
+    import os
+    import time
+
+    wd_sh = HARDENING_DIR / "04_watchdog_and_base_hash.sh"
+    base_img = tmp_path / "win11_base.qcow2"
+    nvram = tmp_path / "win11_VARS.fd.base"
+    inet_base = tmp_path / "inetsim_base.qcow2"
+    hash_file = tmp_path / "v2_base_hashes.sha256"
+    fast_meta = tmp_path / "v2_base_fast_meta.env"
+    base_img.write_bytes(b"QCOW2_STUB_BASE_BYTES")
+    nvram.write_bytes(b"NVRAM_STUB_BYTES")
+    inet_base.write_bytes(b"INETSIM_STUB_BYTES")
+    base_img.chmod(0o444)
+
+    virsh_log = tmp_path / "virsh_calls.log"
+    mock_virsh = tmp_path / "mock_virsh.sh"
+    mock_virsh.write_text(
+        f"""#!/usr/bin/env bash
+echo "$*" >> {str(virsh_log)!r}
+exit 0
+""",
+        encoding="utf-8",
+    )
+    mock_virsh.chmod(0o755)
+
+    fw_mode_file = tmp_path / "fw_mode.txt"
+    fw_mode_file.write_text("clean_0", encoding="utf-8")
+    mock_ipt = tmp_path / "mock_ipt.sh"
+    mock_ipt.write_text(
+        f"""#!/usr/bin/env bash
+mode="$(cat {str(fw_mode_file)!r})"
+if [[ "$1" == "-S" && "$2" == "INPUT" ]]; then
+  if [[ "$mode" == "bad_pos" ]]; then
+    echo "-A INPUT -i eth0 -j ACCEPT"
+  else
+    echo "-A INPUT -i virbr1 -j V2_VIRBR1_IN"
+  fi
+elif [[ "$1" == "-S" && "$2" == "FORWARD" ]]; then
+  echo "-A FORWARD -i virbr1 -j V2_VIRBR1_FWD"
+  echo "-A FORWARD -o virbr1 -j V2_VIRBR1_FWD"
+elif [[ "$1" == "-L" && "$2" == "V2_VIRBR1_FWD" ]]; then
+  if [[ "$mode" == "egress_leak" ]]; then
+    echo "    4 400 ACCEPT all -- * * virbr1 virbr1 0.0.0.0/0 0.0.0.0/0"
+    echo "    3 180 DROP all -- * * virbr1 !virbr1 0.0.0.0/0 0.0.0.0/0"
+  else
+    echo "    4 400 ACCEPT all -- * * virbr1 virbr1 0.0.0.0/0 0.0.0.0/0"
+    echo "    0 0 DROP all -- * * virbr1 !virbr1 0.0.0.0/0 0.0.0.0/0"
+  fi
+elif [[ "$1" == "-L" && "$2" == "V2_VIRBR1_IN" ]]; then
+  echo "    2 120 ACCEPT all -- * * virbr1 * 0.0.0.0/0 0.0.0.0/0"
+  echo "    1 60 DROP all -- * * virbr1 * 0.0.0.0/0 0.0.0.0/0"
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    mock_ipt.chmod(0o755)
+
+    env = dict(
+        os.environ,
+        BASE_IMG=str(base_img),
+        NVRAM_BASE=str(nvram),
+        INETSIM_BASE=str(inet_base),
+        HASH_FILE=str(hash_file),
+        FAST_META_FILE=str(fast_meta),
+        SKIP_LSATTR_CHECK="1",
+        VIRSH_BIN=str(mock_virsh),
+        IPTABLES_BIN=str(mock_ipt),
+        WATCHDOG_BACKEND="setsid",
+    )
+
+    subprocess.run(["bash", str(wd_sh), "record-base"], env=env, check=True, capture_output=True, text=True)
+    assert subprocess.run(["bash", str(wd_sh), "verify-base-fast"], env=env, capture_output=True).returncode == 0
+
+    # Tampering NVRAM fails fast verify
+    nvram.write_bytes(b"NVRAM_CORRUPTED")
+    assert subprocess.run(["bash", str(wd_sh), "verify-base-fast"], env=env, capture_output=True).returncode != 0
+    nvram.write_bytes(b"NVRAM_STUB_BYTES")
+
+    # Arm + immediate disarm cancels detached watchdog cleanly
+    lease1 = tmp_path / "lease_cancel.env"
+    subprocess.run(["bash", str(wd_sh), "arm-watchdog", "20", str(lease1), "win11", "inetsim-vm"], env=env, check=True)
+    subprocess.run(["bash", str(wd_sh), "disarm-watchdog", str(lease1)], env=env, check=True)
+    time.sleep(0.3)
+    assert not (tmp_path / "lease_cancel.env.status").exists()
+    assert not virsh_log.exists()
+
+    # Arm with 1s deadline triggers TIMEOUT_KILLED over BOTH win11 and inetsim-vm
+    lease2 = tmp_path / "lease_timeout.env"
+    subprocess.run(["bash", str(wd_sh), "arm-watchdog", "1", str(lease2), "win11", "inetsim-vm"], env=env, check=True)
+    deadline = time.time() + 4.5
+    while time.time() < deadline and not (tmp_path / "lease_timeout.env.status").exists():
+        time.sleep(0.15)
+    assert (tmp_path / "lease_timeout.env.status").read_text(encoding="utf-8").strip() == "TIMEOUT_KILLED"
+    calls = virsh_log.read_text(encoding="utf-8")
+    assert "destroy win11" in calls and "destroy inetsim-vm" in calls
+
+    # Egress snapshot + verify (clean vs leak vs bad rule position)
+    snap_before = tmp_path / "eg_before.json"
+    snap_after_ok = tmp_path / "eg_after_ok.json"
+    snap_after_leak = tmp_path / "eg_after_leak.json"
+    snap_after_badpos = tmp_path / "eg_after_badpos.json"
+
+    r_b = subprocess.run(["bash", str(wd_sh), "check-egress", "snapshot"], env=env, capture_output=True, text=True, check=True)
+    snap_before.write_text(r_b.stdout, encoding="utf-8")
+    assert json.loads(r_b.stdout)["firewall_rules_valid"] is True
+
+    r_ok = subprocess.run(["bash", str(wd_sh), "check-egress", "snapshot"], env=env, capture_output=True, text=True, check=True)
+    snap_after_ok.write_text(r_ok.stdout, encoding="utf-8")
+    assert subprocess.run(["bash", str(wd_sh), "check-egress", "verify", str(snap_before), str(snap_after_ok)], env=env).returncode == 0
+
+    fw_mode_file.write_text("egress_leak", encoding="utf-8")
+    r_leak = subprocess.run(["bash", str(wd_sh), "check-egress", "snapshot"], env=env, capture_output=True, text=True, check=True)
+    snap_after_leak.write_text(r_leak.stdout, encoding="utf-8")
+    assert subprocess.run(["bash", str(wd_sh), "check-egress", "verify", str(snap_before), str(snap_after_leak)], env=env).returncode != 0
+
+    fw_mode_file.write_text("bad_pos", encoding="utf-8")
+    r_bad = subprocess.run(["bash", str(wd_sh), "check-egress", "snapshot"], env=env, capture_output=True, text=True)
+    assert r_bad.returncode != 0
+    snap_after_badpos.write_text(r_bad.stdout, encoding="utf-8")
+    assert subprocess.run(["bash", str(wd_sh), "check-egress", "verify", str(snap_before), str(snap_after_badpos)], env=env).returncode != 0
+
+
+def test_container_runner_allows_pipelined_other_overlay_and_blocks_attached(tmp_path):
+    import os
+    import shutil
+
+    runner = HARDENING_DIR / "06_unprivileged_container_runner.sh"
+    qemu_img = shutil.which("qemu-img")
+    assert qemu_img is not None
+
+    base_img = tmp_path / "win11_base.qcow2"
+    ov_done = tmp_path / "win11_overlay_run_01.qcow2"
+    ov_active = tmp_path / "win11_overlay_run_02.qcow2"
+    subprocess.run([qemu_img, "create", "-f", "qcow2", str(base_img), "64K"], check=True, capture_output=True)
+    subprocess.run([qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base_img), str(ov_done)], check=True, capture_output=True)
+    subprocess.run([qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base_img), str(ov_active)], check=True, capture_output=True)
+
+    cache_file = tmp_path / "win11_base_cache.json.gz"
+    cache_file.write_bytes(b"stub_cache")
+    fake_rt = tmp_path / "fake_docker.sh"
+    fake_rt.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_rt.chmod(0o755)
+
+    mock_virsh = tmp_path / "mock_virsh_blk.sh"
+    mock_virsh.write_text(
+        f"""#!/usr/bin/env bash
+if [[ "$*" == *"domstate win11"* ]]; then
+  echo "running"
+elif [[ "$*" == *"domblklist win11"* ]]; then
+  echo " Type  Device  Target  Source"
+  echo " file  disk    vda     {str(ov_active.resolve())}"
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    mock_virsh.chmod(0o755)
+
+    env = dict(os.environ, CONTAINER_RT=str(fake_rt), VIRSH_BIN=str(mock_virsh), FORCE_VM_CHECK="1")
+    r_pipe_ok = subprocess.run(
+        ["bash", str(runner), str(ov_done), str(tmp_path / "out_1"), "run_01", str(cache_file)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r_pipe_ok.returncode == 0
+
+    r_attached_blocked = subprocess.run(
+        ["bash", str(runner), str(ov_active), str(tmp_path / "out_2"), "run_02", str(cache_file)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r_attached_blocked.returncode != 0
+    assert "is still attached" in r_attached_blocked.stderr
