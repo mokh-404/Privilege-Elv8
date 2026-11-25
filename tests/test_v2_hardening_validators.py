@@ -449,3 +449,73 @@ exit 0
     )
     assert r_attached_blocked.returncode != 0
     assert "is still attached" in r_attached_blocked.stderr
+
+
+def test_container_runner_fast_code_refresh_and_full_build_override(tmp_path):
+    import json
+    import os
+
+    runner = HARDENING_DIR / "06_unprivileged_container_runner.sh"
+    req_file = HARDENING_DIR / "requirements_extractor.txt"
+    dockerfile = HARDENING_DIR / "offline_extractor.Dockerfile"
+    calls_log = tmp_path / "docker_calls.jsonl"
+    tags_seen_file = tmp_path / "tags_seen.txt"
+    tags_seen_file.write_text("", encoding="utf-8")
+
+    fake_docker = tmp_path / "fake_docker_refresh.sh"
+    fake_docker.write_text(
+        f"""#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+with Path({str(calls_log)!r}).open("a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\\n")
+
+tags_p = Path({str(tags_seen_file)!r})
+known_tags = set(tags_p.read_text(encoding="utf-8").splitlines())
+
+if len(args) >= 2 and args[0] == "image" and args[1] == "inspect":
+    tgt = args[-1]
+    if tgt == "dfir-v2-offline-extractor:latest":
+        print("sha256:existing_local_image")
+        sys.exit(0)
+    if tgt in known_tags:
+        print(tgt)
+        sys.exit(0)
+    sys.exit(1)
+
+if args and args[0] == "tag":
+    known_tags.add(args[2])
+    tags_p.write_text("\\n".join(sorted(known_tags)) + "\\n", encoding="utf-8")
+    sys.exit(0)
+
+if args and args[0] == "run" and "/app/requirements_extractor.txt" in args:
+    sys.stdout.write(Path({str(req_file)!r}).read_text(encoding="utf-8"))
+    sys.exit(0)
+
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    env = dict(os.environ, CONTAINER_RT=str(fake_docker))
+
+    # 1. Default --build with unchanged requirements_extractor.txt uses fast offline code-only refresh
+    cp_fast = subprocess.run(["bash", str(runner), "--build"], env=env, capture_output=True, text=True, check=True)
+    assert cp_fast.returncode == 0
+    calls = [json.loads(ln) for ln in calls_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert any(c[0] == "tag" and c[2].startswith("dfir-v2-offline-extractor-deps:") for c in calls)
+    build_fast = next(c for c in calls if c[0] == "build")
+    assert "--pull=false" in build_fast
+    assert str(dockerfile) not in build_fast
+
+    # 2. --build --full bypasses fast refresh and builds directly from offline_extractor.Dockerfile
+    calls_log.unlink()
+    cp_full = subprocess.run(["bash", str(runner), "--build", "--full"], env=env, capture_output=True, text=True, check=True)
+    assert cp_full.returncode == 0
+    full_calls = [json.loads(ln) for ln in calls_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(full_calls) == 1
+    assert full_calls[0][0] == "build"
+    assert str(dockerfile) in full_calls[0]
+    assert "--pull=false" not in full_calls[0]

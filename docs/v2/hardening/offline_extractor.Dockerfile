@@ -6,13 +6,12 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOME=/tmp \
-    PIP_NO_CACHE_DIR=1
+    HOME=/tmp
 
 # Pure-Python pip installation only (no FUSE, no libguestfs, no mount binaries installed)
 WORKDIR /app
 COPY docs/v2/hardening/requirements_extractor.txt /app/requirements_extractor.txt
-RUN pip install --no-cache-dir -r /app/requirements_extractor.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install --timeout=120 --retries=5 -r /app/requirements_extractor.txt
 
 # Copy only read-only application extractor code (never malware samples or host secrets)
 COPY src/__init__.py /app/src/__init__.py

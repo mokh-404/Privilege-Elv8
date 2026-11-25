@@ -13,22 +13,80 @@ DEFAULT_BASE_CACHE="/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz"
 usage() {
     cat <<EOF >&2
 Usage:
-  $0 --build
+  $0 --build [--full]
+  $0 --refresh-code
   $0 <overlay_qcow2_path> <host_structured_output_dir> [run_id] [base_cache_path|none]
 
 Environment overrides:
   IMAGE_NAME       Container image tag (default: dfir-v2-offline-extractor:latest)
   CONTAINER_RT     Container runtime binary (default: docker)
+  FORCE_FULL_BUILD Set to 1 to force a full Dockerfile rebuild instead of code-only refresh
   BASE_QCOW2       Optional explicit backing QCOW2 path if auto-detection cannot resolve it
   BASE_CACHE_PATH  Base-image cache .json.gz path (default: $DEFAULT_BASE_CACHE if present)
 EOF
 }
 
-if [[ "${1:-}" == "--build" ]]; then
+if [[ "${1:-}" == "--build" || "${1:-}" == "--refresh-code" ]]; then
+    BUILD_CMD="${1}"
+    BUILD_OPT="${2:-}"
     if ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
         echo "ERROR: Container runtime $CONTAINER_RT not found (note: podman is not installed on this host)." >&2
         exit 1
     fi
+
+    REQ_HOST_FILE="${REPO_ROOT}/docs/v2/hardening/requirements_extractor.txt"
+    REQ_HOST_SHA="$(sha256sum "$REQ_HOST_FILE" | awk '{print $1}')"
+    FULL_BUILD=0
+    if [[ "$BUILD_CMD" == "--build" && ( "$BUILD_OPT" == "--full" || "${FORCE_FULL_BUILD:-0}" == "1" ) ]]; then
+        FULL_BUILD=1
+    fi
+
+    if [[ "$FULL_BUILD" -eq 0 ]]; then
+        IMG_ID="$("$CONTAINER_RT" image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null || true)"
+        REQ_IMG_SHA=""
+        if [[ -n "$IMG_ID" ]]; then
+            if REQ_IMG_TXT="$("$CONTAINER_RT" run --rm --network=none --entrypoint cat "$IMAGE_NAME" /app/requirements_extractor.txt 2>/dev/null)" && [[ -n "$REQ_IMG_TXT" ]]; then
+                REQ_IMG_SHA="$(printf '%s\n' "$REQ_IMG_TXT" | sha256sum | awk '{print $1}')"
+            fi
+        fi
+
+        if [[ -n "$IMG_ID" && "$REQ_IMG_SHA" == "$REQ_HOST_SHA" ]]; then
+            DEPS_TAG="dfir-v2-offline-extractor-deps:${REQ_HOST_SHA:0:12}"
+            if ! "$CONTAINER_RT" image inspect "$DEPS_TAG" >/dev/null 2>&1; then
+                "$CONTAINER_RT" tag "$IMAGE_NAME" "$DEPS_TAG"
+            fi
+            TMP_DF="$(mktemp /tmp/dfir_refresh_dockerfile.XXXXXX)"
+            trap 'rm -f "$TMP_DF"' EXIT
+            cat > "$TMP_DF" <<EOF
+FROM ${DEPS_TAG}
+USER 0:0
+WORKDIR /app
+COPY src/__init__.py /app/src/__init__.py
+COPY src/config.py /app/src/config.py
+COPY src/utils/__init__.py /app/src/utils/__init__.py
+COPY src/utils/repro.py /app/src/utils/repro.py
+COPY src/data/__init__.py /app/src/data/__init__.py
+COPY src/data/sanitize.py /app/src/data/sanitize.py
+COPY src/data/features.py /app/src/data/features.py
+COPY src/models/__init__.py /app/src/models/__init__.py
+COPY src/models/preprocess.py /app/src/models/preprocess.py
+COPY src/v2/__init__.py /app/src/v2/__init__.py
+COPY src/v2/refgraph.py /app/src/v2/refgraph.py
+COPY src/v2/offline_extractor.py /app/src/v2/offline_extractor.py
+USER 1000:1000
+ENTRYPOINT ["python", "-m", "src.v2.offline_extractor"]
+EOF
+            echo "[*] Fast offline code refresh of $IMAGE_NAME from cached deps ($DEPS_TAG)..."
+            "$CONTAINER_RT" build --pull=false -f "$TMP_DF" -t "$IMAGE_NAME" "$REPO_ROOT"
+            exit $?
+        fi
+
+        if [[ "$BUILD_CMD" == "--refresh-code" ]]; then
+            echo "ERROR: Cannot --refresh-code (local image missing or requirements_extractor.txt changed). Run: $0 --build --full" >&2
+            exit 1
+        fi
+    fi
+
     echo "[*] Building unprivileged offline extractor image $IMAGE_NAME from $DOCKERFILE_PATH..."
     exec "$CONTAINER_RT" build -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" "$REPO_ROOT"
 fi
