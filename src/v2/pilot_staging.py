@@ -33,6 +33,7 @@ from src.utils.repro import utc_now_iso
 from src.v2.benign_generator_v2 import generate_benign_workload_bundle
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.I)
+DORMANT_BATCH_MAX: int = 16
 SUPERVISOR_APPROVAL_REF = (
     "Supervisor Marawan (AASTMT) written approval 2026-11-23 + comparative study addendum 2026-11-25 — "
     "'Research Approval Request: Controlled Malware Analysis for DFIR Triage' "
@@ -60,6 +61,8 @@ FORBIDDEN_MALWARE_FAMILIES_AND_TAGS: frozenset[str] = frozenset({
     "slammer", "wannamine", "eternalblue", "xworm", "brontok", "vobfus", "gamarue", "andromeda",
     "jenxcus", "neshta", "parite", "expiro", "phorpiex", "dorkbot", "raspberryrobin", "blackshades",
     "lemonduck", "tofsee", "bondat",
+    # USB-spreader / ransomware-module exclusion
+    "lime", "limerat",
 })
 
 # Substring stems (excludes whole-token blocks like "stop", "play", "lynx", "chaos" so benign words like "desktop"/"display" pass).
@@ -70,8 +73,41 @@ FORBIDDEN_SUBSTRING_STEMS: tuple[str, ...] = (
     "blackbasta", "cryptolocker",
 )
 
+# Canonical alias map so closely linked names/aliases share ONE grouping unit for splits and family caps.
+FAMILY_ALIAS_TO_CANONICAL: dict[str, str] = {
+    "lumma": "lumma",
+    "lummac2": "lumma",
+    "lummastealer": "lumma",
+    "warzone": "warzone",
+    "warzonerat": "warzone",
+    "avemaria": "warzone",
+    "redline": "redline",
+    "redlinestealer": "redline",
+    "raccoon": "raccoon",
+    "raccoonstealer": "raccoon",
+    "remcos": "remcos",
+    "remcosrat": "remcos",
+    "quasar": "quasar",
+    "quasarrat": "quasar",
+    "orcus": "orcus",
+    "orcusrat": "orcus",
+    "nanocore": "nanocore",
+    "nanocorerat": "nanocore",
+    "buer": "buer",
+    "buerloader": "buer",
+    "aurora": "aurora",
+    "aurorastealer": "aurora",
+    "revenge": "revenge",
+    "revengerat": "revenge",
+    "gh0st": "gh0st",
+    "ghostrat": "gh0st",
+    "formbook": "formbook",
+    "xloader": "formbook",
+}
+
 # Reviewed positive allowlist (normalized lowercase alphanumeric slugs).
 # Note: njrat / bladabindi / qakbot / emotet / trickbot are intentionally excluded pending supervisor review.
+# lime / limerat removed (USB spreader / ransomware modules).
 ALLOWED_FAMILIES: frozenset[str] = frozenset({
     # InfoStealers
     "redline", "redlinestealer", "lummac2", "lumma", "lummastealer", "agenttesla", "vidar",
@@ -83,7 +119,7 @@ ALLOWED_FAMILIES: frozenset[str] = frozenset({
     "asyncrat", "remcos", "remcosrat", "quasar", "quasarrat", "dcrat", "venomrat",
     "nanocore", "nanocorerat", "darkcomet", "orcus", "orcusrat", "bitrat",
     "warzone", "warzonerat", "avemaria", "phantomrat", "poisonivy", "netwire",
-    "gh0st", "ghostrat", "lime", "limerat", "revenge", "revengerat", "cobaltstrike",
+    "gh0st", "ghostrat", "revenge", "revengerat", "cobaltstrike",
     # Non-worm Loaders / Droppers
     "smokeloader", "amadey", "privateloader", "guloader", "bumblebee", "systembc",
     "purecrypter", "hijackloader", "latrodectus", "dbatloader", "modiloader", "bazarloader",
@@ -100,6 +136,17 @@ class PilotStagingError(RuntimeError):
 def normalize_family_slug(raw: str | None) -> str:
     """Normalize a family/signature string to lowercase ASCII alphanumeric characters."""
     return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+
+
+def canonicalize_family_name(raw: str | None) -> str:
+    """Map normalized family/signature aliases (e.g., `lummac2`/`avemaria`/`xloader`) to ONE canonical key."""
+    slug = normalize_family_slug(raw)
+    return FAMILY_ALIAS_TO_CANONICAL.get(slug, slug)
+
+
+CANONICAL_ALLOWED_FAMILIES: frozenset[str] = frozenset(
+    canonicalize_family_name(f) for f in ALLOWED_FAMILIES
+)
 
 
 def check_forbidden_malware_policy(
@@ -234,8 +281,10 @@ def validate_stage_run_spec(spec: StageRunSpec) -> None:
         if spec.execute_payload:
             raise PilotStagingError("dormant_batch must have execute_payload=False")
         items = list(spec.batch_samples or ())
-        if not (1 <= len(items) <= 20):
-            raise PilotStagingError(f"dormant_batch requires 1..20 samples per overlay, got {len(items)}")
+        if not (1 <= len(items) <= DORMANT_BATCH_MAX):
+            raise PilotStagingError(
+                f"dormant_batch requires 1..{DORMANT_BATCH_MAX} samples per overlay, got {len(items)}"
+            )
         seen_shas: set[str] = set()
         seen_paths: set[str] = set()
         for idx, item in enumerate(items):
@@ -651,6 +700,7 @@ def build_stage_bundle(
     archive_password: str | bytes | None = "infected",
     benign_pools_root: str | Path | None = None,
     run_seed: int | None = None,
+    require_real_pools: bool = False,
 ) -> dict[str, Path]:
     """Validate `spec`, decrypt vault sample into RAM (if malware run), verify SHA-256, and build `DFIR_STAGE` ISO."""
     if str(spec.stratum).strip().lower() == "dormant_batch":
@@ -689,6 +739,7 @@ def build_stage_bundle(
             benign_profile_id=spec.benign_profile_id,
             run_seed=run_seed,
             benign_pools_root=benign_pools_root,
+            require_real_pools=require_real_pools,
         )
         eff_benign_text = ben_bundle["ps1_text"]
         for bname, bbytes in ben_bundle["extra_iso_files"].items():
@@ -738,6 +789,7 @@ def build_stage_bundle(
 
 _DORMANT_BATCH_PS1_LOOP = r"""
 # Stage dev-only dormant batch payloads (NEVER executes any staged binary; compatible with baked Invoke-StagePayload.ps1)
+$maxBatch = __DORMANT_BATCH_MAX__
 $batchVol = Get-Volume | Where-Object { $_.FileSystemLabel -eq "DFIR_STAGE" -and $_.DriveLetter } | Select-Object -First 1
 if ($batchVol) {
     $bStageRoot = "$($batchVol.DriveLetter):\"
@@ -745,7 +797,11 @@ if ($batchVol) {
     if (Test-Path -LiteralPath $bManifestPath) {
         $bMan = Get-Content -LiteralPath $bManifestPath -Raw | ConvertFrom-Json
         if ($bMan.stratum -eq "dormant_batch" -and $bMan.batch_samples) {
-            foreach ($bs in $bMan.batch_samples) {
+            $batchItems = @($bMan.batch_samples)
+            if ($batchItems.Count -gt $maxBatch) {
+                throw "dormant_batch sample count ($($batchItems.Count)) exceeds DORMANT_BATCH_MAX ($maxBatch)"
+            }
+            foreach ($bs in $batchItems) {
                 $srcRel = ([string]$bs.iso_rel_path).Replace("/", "\")
                 $srcFile = Join-Path $bStageRoot $srcRel
                 $dstFile = [string]$bs.staging_target_path
@@ -762,7 +818,7 @@ if ($batchVol) {
         }
     }
 }
-"""
+""".replace("__DORMANT_BATCH_MAX__", str(DORMANT_BATCH_MAX))
 
 
 def build_dormant_batch_bundle(
@@ -774,8 +830,9 @@ def build_dormant_batch_bundle(
     archive_password: str | bytes | None = "infected",
     benign_pools_root: str | Path | None = None,
     run_seed: int | None = None,
+    require_real_pools: bool = False,
 ) -> dict[str, Path]:
-    """Build a zero-rebake dev-only `dormant_batch` ISO staging up to 20 dormant samples inside `benign_workload.ps1`.
+    """Build a zero-rebake dev-only `dormant_batch` ISO staging up to 16 dormant samples (`DORMANT_BATCH_MAX`) inside `benign_workload.ps1`.
 
     Hard-refuses `split_pool != "dev"` so blind-test dormant runs remain strictly 1 sample per boot.
     """
@@ -827,6 +884,7 @@ def build_dormant_batch_bundle(
             benign_profile_id=spec.benign_profile_id,
             run_seed=run_seed,
             benign_pools_root=benign_pools_root,
+            require_real_pools=require_real_pools,
         )
         eff_benign_text = ben_bundle["ps1_text"]
         for bname, bbytes in ben_bundle["extra_iso_files"].items():

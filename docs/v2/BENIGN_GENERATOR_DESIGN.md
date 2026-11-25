@@ -13,16 +13,18 @@ In v1, `lab_automation/benign_noise.ps1` drew from 6 fixed string templates, col
 
 ## 2. Disjoint Real Benign Asset Pools & Target Quotas
 
-[`scripts/v2_prepare_benign_pools.py`](../../scripts/v2_prepare_benign_pools.py) manages non-repo external pools (`/var/lib/dfir-quarantine-vault/benign_pools/dev/` vs `.../blind_test/`) with hard assertions enforcing **zero SHA-256, normalized filename, and package-folder overlap**:
+Ingests real open-source Windows binaries, scripts, and installers into external non-repo pools (`/var/lib/dfir-quarantine-vault/benign_pools/dev/` vs `.../blind_test/`) with hard assertions enforcing **zero SHA-256, normalized filename, and package-folder overlap** (never harvesting from `win11_base.qcow2`, whose single OS vendor breaks vendor-disjointness):
 
 | Benign Drift Component | Target Unique Quota | Hard Floor (`dev + blind_test`) | Disjoint Assignment |
 | :--- | :---: | :---: | :--- |
-| **Legitimate Unsigned PE Binaries (`.exe`/`.dll`)** | `300–400` | `>= 200` | Disjoint open-source tool rosters (`DEV_PACKAGE_ROSTER` vs `BLIND_TEST_PACKAGE_ROSTER`) |
-| **Signed 3rd-Party PE Binaries (`.exe`/`.dll`)** | `300–400` | `>= 200` | Verified via offline `signify` + `CatRoot` (`Valid` vs `NotSigned`) |
-| **Procedurally Varied Scripts (`.ps1`/`.py`/`.bat`/`.cmd`/`.vbs`/`.js`)** | `500–700` | `>= 350` | Procedural AST/comment/command synthesis per `run_id` (`benign_generator_v2.py`) |
-| **High-Entropy Archives & Structured Data (`.zip`/`.json`/`.log`)** | `400–500` | `>= 250` | Real deflate-compressed `.zip` + structured JSON/logs |
-| **Total Unique Benign Drift Files** | **`1,500–2,000`** | **`>= 1,000`** | `~1,200–1,600` `dev` / `~300–400` `blind_test` |
+| **Legitimate Unsigned PE Binaries (`.exe`/`.dll`)** | `300–400` | `>= 200` (`>= 1` in `dev` & `blind_test`) | Disjoint open-source tool rosters (`DEV_PACKAGE_ROSTER` vs `BLIND_TEST_PACKAGE_ROSTER`) |
+| **Signed 3rd-Party PE Binaries (`.exe`/`.dll`)** | `300–400` | `>= 200` (`>= 1` in `dev` & `blind_test`) | Verified via offline `signify` + `CatRoot` (`Valid` vs `NotSigned`) |
+| **Procedurally Varied Scripts (`.ps1`/`.psm1`/`.bat`/`.cmd`/`.vbs`/`.vbe`/`.js`)** | `500–700` | `>= 350` | Procedural script/comment synthesis per `run_id` inside extractor `_USER_SCAN_TARGET_EXTS` (zero `.py`) |
+| **High-Entropy Benign Installers (`.exe`/`.msi`)** | `400–500` | `>= 250` | Real pool `.exe`/`.msi` installers staged in walked user cache roots (zero `.zip`/`.json`/`.log`; `.hta`/`.scr` avoided) |
+| **Total Unique Benign Drift Files** | **`1,500–2,000`** | **`>= 1,000`** | `~1,200–1,600` `dev` / `~300–400` `blind_test` (`--enforce-quotas` enforces hard floors + PE splits) |
 | **Benign Persistence Entries** | **`200–400`** | `>= 100` | Benign Services (`Auto`/`Manual`), varied-trigger Scheduled Tasks (`ONLOGON`/`ONSTART`/`DAILY`/`ONCE`/`ONIDLE`), `Run`/`RunOnce`, and benign `IFEO` Registry keys |
+
+- **Quota Enforcement & Real-Pool Requirement:** `scripts/v2_prepare_benign_pools.py --audit --enforce-quotas` exits non-zero if either split has `0` signed PEs, `0` unsigned PEs, or misses any hard floor. Whenever `_synth_unsigned_pe_bytes` fallback is used, `benign_manifest.json` records `synthetic_fallback: true` plus `synthetic_fallback_counts`; passing `--require-real-pools` (default ON for Stage B, OFF for Stage A) makes synthetic fallback fatal.
 
 ---
 

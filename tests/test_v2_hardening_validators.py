@@ -89,6 +89,80 @@ def test_firewall_script_cleans_ufw_user_chains_and_inserts_at_position_1():
     assert 'iptables -I FORWARD 2 -o "$BRIDGE" -j V2_VIRBR1_FWD' in fw_txt
 
 
+def test_virbr1_systemd_service_unit_and_ipv6_firewall_chains(tmp_path):
+    import configparser
+    import os
+
+    unit_path = HARDENING_DIR / "v2-virbr1-firewall.service"
+    assert unit_path.is_file()
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_string(unit_path.read_text(encoding="utf-8"))
+
+    assert cp["Unit"]["After"] == "docker.service ufw.service libvirtd.service"
+    assert cp["Service"]["Type"] == "oneshot"
+    assert cp["Service"]["RemainAfterExit"].lower() == "yes"
+    assert "01_firewall_win11_isolated.sh --apply" in cp["Service"]["ExecStart"]
+    assert "04_watchdog_and_base_hash.sh check-egress snapshot" in cp["Service"]["ExecStartPost"]
+    assert cp["Install"]["WantedBy"] == "multi-user.target"
+
+    fw_script = HARDENING_DIR / "01_firewall_win11_isolated.sh"
+    fw_txt = fw_script.read_text(encoding="utf-8")
+    for uch6 in ("ufw6-user-input", "ufw6-user-output", "ufw6-user-forward"):
+        assert uch6 in fw_txt
+    assert 'ip6tables -I INPUT 1 -i "$BRIDGE" -j V2_VIRBR1_IN6' in fw_txt
+    assert 'ip6tables -I FORWARD 1 -i "$BRIDGE" -j V2_VIRBR1_FWD6' in fw_txt
+    assert 'ip6tables -I FORWARD 2 -o "$BRIDGE" -j V2_VIRBR1_FWD6' in fw_txt
+
+    # Dry execution with mocked iptables & ip6tables in PATH (never touches host firewall)
+    bin_dir = tmp_path / "mock_bin"
+    bin_dir.mkdir()
+    ipt_log = tmp_path / "ipt4.log"
+    ip6t_log = tmp_path / "ipt6.log"
+    for tool_name, log_p in (("iptables", ipt_log), ("ip6tables", ip6t_log)):
+        tool_p = bin_dir / tool_name
+        tool_p.write_text(
+            f"""#!/usr/bin/env bash
+echo "$*" >> {str(log_p)!r}
+if [[ "${{1:-}}" == "-C" ]]; then
+  exit 1
+fi
+if [[ "${{1:-}}" == "-L" && ( "${{2:-}}" == "ufw-user-input" || "${{2:-}}" == "ufw6-user-input" ) ]]; then
+  exit 0
+fi
+if [[ "${{1:-}}" == "-S" ]]; then
+  if [[ "{tool_name}" == "ip6tables" ]]; then
+    echo "-A INPUT -i virbr1 -j V2_VIRBR1_IN6"
+  else
+    echo "-A INPUT -i virbr1 -j V2_VIRBR1_IN"
+  fi
+  exit 0
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        tool_p.chmod(0o755)
+
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", SKIP_ROOT_CHECK="1")
+    r_apply = subprocess.run(["bash", str(fw_script), "--apply"], env=env, capture_output=True, text=True)
+    assert r_apply.returncode == 0, r_apply.stderr
+
+    log4 = ipt_log.read_text(encoding="utf-8")
+    log6 = ip6t_log.read_text(encoding="utf-8")
+    assert "-N V2_VIRBR1_IN" in log4 and "-I INPUT 1 -i virbr1 -j V2_VIRBR1_IN" in log4
+    assert "-N V2_VIRBR1_IN6" in log6 and "-N V2_VIRBR1_FWD6" in log6
+    assert "-I INPUT 1 -i virbr1 -j V2_VIRBR1_IN6" in log6
+    assert "-I FORWARD 1 -i virbr1 -j V2_VIRBR1_FWD6" in log6
+    assert "-I FORWARD 2 -o virbr1 -j V2_VIRBR1_FWD6" in log6
+    assert "-A V2_VIRBR1_IN6 -j DROP" in log6
+    assert "-A V2_VIRBR1_FWD6 -i virbr1 -o virbr1 -j ACCEPT" in log6
+    assert "-A V2_VIRBR1_FWD6 -j DROP" in log6
+
+    r_status = subprocess.run(["bash", str(fw_script), "--status"], env=env, capture_output=True, text=True)
+    assert r_status.returncode == 0
+    assert "V2_VIRBR1_IN" in r_status.stdout and "V2_VIRBR1_IN6" in r_status.stdout and "ip6tables" in r_status.stdout
+
+
 def test_unprivileged_container_runner_mounts_overlay_backing_cache_and_build(tmp_path):
     import json
     import os

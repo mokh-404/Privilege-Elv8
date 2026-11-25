@@ -31,10 +31,12 @@ if str(_REPO_ROOT) not in sys.path:
 from src.utils.repro import utc_now_iso, write_json
 from src.v2.pilot_staging import (
     ALLOWED_FAMILIES,
+    CANONICAL_ALLOWED_FAMILIES,
     FORBIDDEN_MALWARE_FAMILIES_AND_TAGS,
     PilotStagingError,
     StageRunSpec,
     assert_allowed_malware_policy,
+    canonicalize_family_name,
     check_forbidden_malware_policy,
     normalize_family_slug,
     read_vault_payload_in_memory,
@@ -178,7 +180,7 @@ def canonical_family_slug(raw_signature: str | None, tags: Sequence[str] | None 
     for raw in candidates:
         slug = re.sub(r"[^a-z0-9]+", "", raw.lower())
         if len(slug) >= 3:
-            return slug
+            return canonicalize_family_name(slug)
     return "unknown_family"
 
 
@@ -309,8 +311,8 @@ def select_pilot_families(
                 continue
             if not _is_windows_pe_candidate(raw):
                 continue
-            fam = normalize_family_slug(canonical_family_slug(raw.get("signature"), raw.get("tags")))
-            if not fam or fam == "unknownfamily" or fam not in ALLOWED_FAMILIES:
+            fam = canonicalize_family_name(canonical_family_slug(raw.get("signature"), raw.get("tags")))
+            if not fam or fam == "unknownfamily" or fam not in CANONICAL_ALLOWED_FAMILIES:
                 continue
             if check_forbidden_malware_policy(
                 sample_family=fam,

@@ -311,3 +311,72 @@ def test_label_dormant_batch_run_dev_only_and_deduplicate_dev_os_baseline():
     bad_test.loc[0, "split_pool"] = "test"
     with pytest.raises(ValueError, match="Blind test must NEVER be deduplicated"):
         deduplicate_dev_os_baseline(bad_test)
+
+
+def test_assign_v2_splits_and_training_groups_keep_canonical_aliases_together():
+    from src.v2.training import build_family_cluster_groups
+
+    df = pd.DataFrame([
+        {
+            "run_id": "r_lumma_1",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\l1.exe|l1.exe",
+            "name": "l1.exe",
+            "path": r"C:\Users\Public\l1.exe",
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "sample_sha256": "11" * 32,
+            "sample_family": "Lumma",
+            "packer_cluster": "p_1",
+            "pair_group_id": "pg_1",
+            "stratum": "executed",
+        },
+        {
+            "run_id": "r_lumma_2",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\l2.exe|l2.exe",
+            "name": "l2.exe",
+            "path": r"C:\Users\Public\l2.exe",
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "sample_sha256": "22" * 32,
+            "sample_family": "LummaC2",
+            "packer_cluster": "p_2",
+            "pair_group_id": "pg_2",
+            "stratum": "executed",
+        },
+        {
+            "run_id": "r_warzone_1",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\w1.exe|w1.exe",
+            "name": "w1.exe",
+            "path": r"C:\Users\Public\w1.exe",
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "sample_sha256": "33" * 32,
+            "sample_family": "AveMaria",
+            "packer_cluster": "p_3",
+            "pair_group_id": "pg_3",
+            "stratum": "dormant",
+        },
+        {
+            "run_id": "r_warzone_2",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\w2.exe|w2.exe",
+            "name": "w2.exe",
+            "path": r"C:\Users\Public\w2.exe",
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "sample_sha256": "44" * 32,
+            "sample_family": "WarzoneRAT",
+            "packer_cluster": "p_4",
+            "pair_group_id": "pg_4",
+            "stratum": "dormant",
+        },
+    ])
+
+    split_df = assign_v2_splits(df, blind_test_families=["LummaStealer"])
+    assert set(split_df.loc[[0, 1], "split_pool"]) == {"test"}
+    assert set(split_df.loc[[2, 3], "split_pool"]) == {"dev"}
+
+    # Canonical aliases share ONE CV cluster group even with distinct hashes/clusters
+    groups = build_family_cluster_groups(df)
+    assert groups[0] == groups[1]
+    assert groups[2] == groups[3]
+    assert groups[0] != groups[2]

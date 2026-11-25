@@ -1,29 +1,87 @@
 """Real procedural v2 benign workload generator with disjoint `dev` / `blind_test` host profiles (`IMP-06`, `OD-V2-12`).
 
 Generates per-run PowerShell workloads (`benign_workload.ps1`), real pool asset slices from
-`/var/lib/dfir-quarantine-vault/benign_pools/<split_pool>/`, procedurally varied non-template scripts,
-high-entropy benign archives/data, and realistic Windows benign persistence (`service`, `task`,
-`run_key`, `registry`) — guaranteeing zero `dev`/`blind_test` overlap and zero template quantization.
+`/var/lib/dfir-quarantine-vault/benign_pools/<split_pool>/`, procedurally varied non-template scripts
+using strictly collected extractor extensions, real pool high-entropy benign installers (`.exe`/`.msi`),
+and realistic Windows benign persistence (`service`, `task`, `run_key`, `registry`) — guaranteeing zero
+`dev`/`blind_test` overlap, 100% extractor path/extension coverage, and zero template quantization.
 """
 from __future__ import annotations
 
 import hashlib
-import io
-import json
 import os
 from pathlib import Path
 import random
 import struct
 from typing import Any, Mapping, Sequence
-import zipfile
 
 import numpy as np
 
-from src.data.features import row_features
+from src.data.features import file_head_entropy
+from src.v2.offline_extractor import _SKIP_DIR_FRAGS, _USER_SCAN_TARGET_EXTS
 
 
 MIB = 1 << 20
 DEFAULT_BENIGN_POOLS_ROOT = Path("/var/lib/dfir-quarantine-vault/benign_pools")
+
+# Avoid risky benign extensions (.hta/.scr) while staying strictly inside _USER_SCAN_TARGET_EXTS.
+BENIGN_AVOIDED_EXTS: frozenset[str] = frozenset({".hta", ".scr"})
+BENIGN_SAFE_COLLECTED_EXTS: frozenset[str] = frozenset(_USER_SCAN_TARGET_EXTS) - BENIGN_AVOIDED_EXTS
+BENIGN_SCRIPT_EXTS: tuple[str, ...] = ("ps1", "psm1", "bat", "cmd", "vbs", "vbe", "js")
+BENIGN_INSTALLER_EXTS: frozenset[str] = frozenset({".exe", ".msi"})
+HIGH_ENTROPY_INSTALLER_THRESHOLD = 6.5
+
+# Mirror walk_fs(root, max_depth) from src/v2/offline_extractor.py verbatim (lines 2134-2150).
+EXTRACTOR_STATIC_SCAN_ROOTS: tuple[tuple[tuple[str, ...], int], ...] = (
+    (("windows", "temp"), 4),
+    (("users", "public"), 5),
+    (("programdata",), 4),
+)
+EXTRACTOR_USER_SCAN_SUBROOTS: tuple[tuple[tuple[str, ...], int], ...] = (
+    (("appdata", "local", "temp"), 4),
+    (("appdata", "roaming"), 4),
+    (("appdata", "local"), 3),
+)
+
+_INSTALLER_ENTROPY_CACHE: dict[tuple[str, int, int], float] = {}
+
+
+class RealBenignPoolRequiredError(RuntimeError):
+    """Raised when `require_real_pools=True` and the benign pool lacks required real PE/installer assets."""
+
+
+def path_matches_extractor_scan_roots(win_path: str) -> bool:
+    """Return True iff `win_path` is walked by `offline_extractor.py` scan_roots within depth & skip rules."""
+    p = str(win_path or "").strip().replace("/", "\\")
+    pl = p.lower()
+    if not pl.startswith("c:\\"):
+        return False
+    parts = [seg for seg in p[3:].split("\\") if seg]
+    if len(parts) < 2:
+        return False
+    dir_parts = tuple(seg.lower() for seg in parts[:-1])
+    dir_str_norm = "c:\\" + "\\".join(dir_parts) + "\\"
+    if any(frag in dir_str_norm for frag in _SKIP_DIR_FRAGS):
+        return False
+
+    roots: list[tuple[tuple[str, ...], int]] = list(EXTRACTOR_STATIC_SCAN_ROOTS)
+    if len(dir_parts) >= 2 and dir_parts[0] == "users":
+        user_seg = dir_parts[1]
+        for sub_parts, depth_lim in EXTRACTOR_USER_SCAN_SUBROOTS:
+            roots.append((("users", user_seg) + sub_parts, depth_lim))
+
+    for root_parts, max_depth in roots:
+        if dir_parts[: len(root_parts)] == root_parts:
+            rel_depth = len(dir_parts) - len(root_parts)
+            if 0 <= rel_depth <= max_depth:
+                return True
+    return False
+
+
+def path_passes_extractor_file_predicate(win_path: str) -> bool:
+    """Return True iff `win_path` matches BOTH `_USER_SCAN_TARGET_EXTS` and real `scan_roots`/depth rules."""
+    ext = Path(str(win_path or "").replace("\\", "/")).suffix.lower()
+    return (ext in _USER_SCAN_TARGET_EXTS) and path_matches_extractor_scan_roots(win_path)
 
 WORKLOAD_PROFILES: dict[str, dict[str, Any]] = {
     "dev": {
@@ -96,7 +154,7 @@ def _synth_varied_script(rng: random.Random, ext: str, tag: str, user: str) -> b
     alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-=/:.;,"
 
     lines: list[str] = []
-    if ext == "ps1":
+    if ext in ("ps1", "psm1"):
         lines.extend([
             f"# Host admin routine {tag} operator={user}",
             "$ErrorActionPreference = 'SilentlyContinue'",
@@ -113,16 +171,8 @@ def _synth_varied_script(rng: random.Random, ext: str, tag: str, user: str) -> b
             for _ in range(rng.randint(1, 5)):
                 lines.append("    " + rng.choice(stmts))
             lines.append("}")
-        comment_prefix = "# "
-    elif ext == "py":
-        lines.extend([
-            f"# Diagnostic utility {tag} owner={user}",
-            "import json, os, platform, sys",
-            f"META = {{'tag': '{tag}', 'build': {rng.randint(100, 99999)}}}",
-        ])
-        for b in range(n_blocks):
-            lines.append(f"def step_{b}_{rng.randint(10,999)}():")
-            lines.append(f"    return len(os.getcwd()) + {rng.randint(1, 500)}")
+        if ext == "psm1":
+            lines.append("Export-ModuleMember -Function Invoke-BenignTask*")
         comment_prefix = "# "
     elif ext in ("bat", "cmd"):
         lines.extend([
@@ -133,7 +183,7 @@ def _synth_varied_script(rng: random.Random, ext: str, tag: str, user: str) -> b
         for b in range(n_blocks):
             lines.append(f"echo step_{b}_%BENIGN_TAG% > nul")
         comment_prefix = "REM "
-    elif ext == "vbs":
+    elif ext in ("vbs", "vbe"):
         lines.extend([
             f"' Host inventory helper {tag} owner={user}",
             f"Dim tagVal : tagVal = \"{tag}_{rng.randint(10, 9999)}\"",
@@ -141,7 +191,7 @@ def _synth_varied_script(rng: random.Random, ext: str, tag: str, user: str) -> b
         for b in range(n_blocks):
             lines.append(f"Dim v{b} : v{b} = Len(tagVal) + {rng.randint(1, 200)}")
         comment_prefix = "' "
-    else:  # .js
+    elif ext == "js":
         lines.extend([
             f"// Endpoint telemetry helper {tag} owner={user}",
             f"var runTag = \"{tag}_{rng.randint(10, 9999)}\";",
@@ -149,6 +199,10 @@ def _synth_varied_script(rng: random.Random, ext: str, tag: str, user: str) -> b
         for b in range(n_blocks):
             lines.append(f"function chk_{b}() {{ return runTag.length + {rng.randint(1, 99)}; }}")
         comment_prefix = "// "
+    else:
+        raise ValueError(
+            f"Unsupported benign script extension {ext!r}; must be in {BENIGN_SCRIPT_EXTS}"
+        )
 
     # Add non-uniform variable comment payload so lengths and byte distributions vary smoothly
     pos = 0
@@ -161,41 +215,12 @@ def _synth_varied_script(rng: random.Random, ext: str, tag: str, user: str) -> b
     return ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
 
-def _synth_high_entropy_zip(rng: random.Random, tag: str) -> bytes:
-    """Create a real deflate-compressed ZIP archive with high byte entropy."""
-    buf = io.BytesIO()
-    n_bytes = rng.randint(4096, 65536)
-    seed_bytes = rng.randbytes(n_bytes)
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        zf.writestr(f"{tag}_metrics.bin", seed_bytes)
-        zf.writestr(f"{tag}_manifest.json", json.dumps({"tag": tag, "bytes": n_bytes}).encode("utf-8"))
-    return buf.getvalue()
-
-
-def _synth_json_or_log(rng: random.Random, ext: str, tag: str) -> bytes:
-    n_recs = rng.randint(12, 120)
-    if ext == "json":
-        payload = {
-            "tag": tag,
-            "events": [
-                {
-                    "seq": i,
-                    "metric": rng.randint(10, 10000),
-                    "token": "".join(rng.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=rng.randint(12, 36))),
-                }
-                for i in range(n_recs)
-            ],
-        }
-        return json.dumps(payload, indent=2).encode("utf-8")
-    lines = [
-        f"2026-11-25T00:{i % 60:02d}:00Z INFO {tag} chk={rng.randint(1000,99999)} tok="
-        + "".join(rng.choices("abcdef0123456789", k=rng.randint(16, 48)))
-        for i in range(n_recs)
-    ]
-    return ("\n".join(lines) + "\n").encode("utf-8")
-
-
-def _synth_unsigned_pe_bytes(seed: int, size_bytes: int, is_dll: bool = False) -> bytes:
+def _synth_unsigned_pe_bytes(
+    seed: int,
+    size_bytes: int,
+    is_dll: bool = False,
+    high_entropy: bool = False,
+) -> bytes:
     """Synthesize a valid-header unsigned PE32+ executable/DLL byte buffer (fallback when pool empty)."""
     size_bytes = max(16384, int(size_bytes))
     np_rng = np.random.default_rng(seed)
@@ -224,30 +249,75 @@ def _synth_unsigned_pe_bytes(seed: int, size_bytes: int, is_dll: bool = False) -
     struct.pack_into("<IIII", buf, sec_off + 8, raw_sz, 0x1000, raw_sz, 0x400)
     struct.pack_into("<I", buf, sec_off + 36, 0x60000020)
 
-    # Realistic non-uniform .text/.rdata byte body
-    n_code = int(raw_sz * 0.55)
-    n_str = int(raw_sz * 0.25)
-    n_pad = raw_sz - n_code - n_str
     ascii_pool = np.frombuffer(
         b"kernel32.dll\x00advapi32.dll\x00GetSystemTimeAsFileTime\x00RegQueryValueExW\x00BenignCliTool\x00",
         dtype=np.uint8,
     )
-    body = (
-        np_rng.integers(0, 256, size=n_code, dtype=np.uint8).tobytes()
-        + np_rng.choice(ascii_pool, size=n_str, replace=True).tobytes()
-        + b"\x00" * n_pad
-    )
+    if high_entropy:
+        # Packed/compressed benign installer fallback: dense random section (~7.6-7.95 entropy)
+        n_code = int(raw_sz * 0.92)
+        n_str = raw_sz - n_code
+        body = (
+            np_rng.integers(0, 256, size=n_code, dtype=np.uint8).tobytes()
+            + np_rng.choice(ascii_pool, size=n_str, replace=True).tobytes()
+        )
+    else:
+        n_code = int(raw_sz * 0.55)
+        n_str = int(raw_sz * 0.25)
+        n_pad = raw_sz - n_code - n_str
+        body = (
+            np_rng.integers(0, 256, size=n_code, dtype=np.uint8).tobytes()
+            + np_rng.choice(ascii_pool, size=n_str, replace=True).tobytes()
+            + b"\x00" * n_pad
+        )
     buf[0x400:] = body
     return bytes(buf)
 
 
+def _cached_file_head_entropy(path: Path) -> float:
+    st = path.stat()
+    ckey = (str(path), int(st.st_size), int(st.st_mtime_ns))
+    ent = _INSTALLER_ENTROPY_CACHE.get(ckey)
+    if ent is None:
+        raw = path.read_bytes()
+        ent = float(file_head_entropy(raw)) if raw else 0.0
+        _INSTALLER_ENTROPY_CACHE[ckey] = ent
+    return ent
+
+
 def _load_pool_asset_candidates(benign_pools_root: Path | None, split_pool: str) -> list[Path]:
+    """Return ONLY pool assets whose suffix lies in `BENIGN_SAFE_COLLECTED_EXTS`."""
     if benign_pools_root is None:
         return []
     sdir = Path(benign_pools_root) / split_pool
     if not sdir.is_dir():
         return []
-    return sorted(p for p in sdir.rglob("*") if p.is_file() and not p.is_symlink())
+    return sorted(
+        p
+        for p in sdir.rglob("*")
+        if p.is_file() and not p.is_symlink() and p.suffix.lower() in BENIGN_SAFE_COLLECTED_EXTS
+    )
+
+
+def _select_high_entropy_installer_candidates(pool_files: Sequence[Path]) -> list[Path]:
+    """Return real pool `.exe`/`.msi` installer assets, prioritizing `.msi` and high-entropy `.exe`."""
+    msis: list[Path] = []
+    high_exes: list[Path] = []
+    other_exes: list[Path] = []
+    for p in pool_files:
+        ext = p.suffix.lower()
+        if ext not in BENIGN_INSTALLER_EXTS:
+            continue
+        if ext == ".msi":
+            msis.append(p)
+        else:
+            ent = _cached_file_head_entropy(p)
+            if ent >= HIGH_ENTROPY_INSTALLER_THRESHOLD:
+                high_exes.append(p)
+            else:
+                other_exes.append(p)
+    prioritized = msis + high_exes
+    return prioritized if prioritized else other_exes
 
 
 def generate_benign_workload_bundle(
@@ -260,6 +330,7 @@ def generate_benign_workload_bundle(
     n_archives: int = 3,
     n_pool_assets: int = 3,
     create_persistence: bool = True,
+    require_real_pools: bool = False,
 ) -> dict[str, Any]:
     """Generate a non-quantized per-run PowerShell benign workload, ISO assets, and benign attribution manifest."""
     sp = str(split_pool).strip().lower()
@@ -277,6 +348,7 @@ def generate_benign_workload_bundle(
 
     extra_iso_files: dict[str, bytes] = {}
     staged_files: list[dict[str, Any]] = []
+    synthetic_fallback_counts: dict[str, int] = {"unsigned_pe": 0, "high_entropy_pe": 0}
     ps_lines: list[str] = [
         f"# Procedural v2 Benign Workload ({sp} / {prof_id} / {run_id})",
         f'param([string]$ProfileId = "{prof_id}")',
@@ -289,6 +361,7 @@ def generate_benign_workload_bundle(
     pool_root_path = Path(benign_pools_root) if benign_pools_root is not None else DEFAULT_BENIGN_POOLS_ROOT
     pool_files = _load_pool_asset_candidates(pool_root_path, sp)
     staged_exe_for_pers: str | None = None
+    picked_section1: set[Path] = set()
 
     if pool_files:
         # Rotate cleanly across the pool using deterministic offset + stride
@@ -296,7 +369,9 @@ def generate_benign_workload_bundle(
         start_idx = seed % len(pool_files)
         picked: list[Path] = []
         for idx in range(min(n_pool_assets, len(pool_files))):
-            picked.append(pool_files[(start_idx + idx * stride) % len(pool_files)])
+            cand = pool_files[(start_idx + idx * stride) % len(pool_files)]
+            picked.append(cand)
+            picked_section1.add(cand)
         for idx, pfile in enumerate(picked):
             raw_bytes = pfile.read_bytes()
             iso_rel = f"benign_assets/{sp}_{idx:02d}_{pfile.name}"
@@ -308,7 +383,7 @@ def generate_benign_workload_bundle(
                 staged_exe_for_pers = dst_path
             sha = hashlib.sha256(raw_bytes).hexdigest().lower()
             sig_stat = "NotSigned"
-            if pfile.suffix.lower() in (".exe", ".dll", ".ps1"):
+            if pfile.suffix.lower() in (".exe", ".dll", ".msi", ".ps1", ".psm1", ".vbs", ".vbe", ".js"):
                 try:
                     from src.v2.offline_extractor import verify_offline_signature
                     sig_stat = verify_offline_signature(str(pfile), raw_bytes, len(raw_bytes))
@@ -329,6 +404,11 @@ def generate_benign_workload_bundle(
                 f'if (Test-Path -LiteralPath $srcAsset{idx}) {{ Copy-Item -LiteralPath $srcAsset{idx} -Destination "{dst_path}" -Force }}',
             ])
     else:
+        if require_real_pools:
+            raise RealBenignPoolRequiredError(
+                f"Real benign pool required (`require_real_pools=True`), but no eligible collected assets "
+                f"found for split_pool={sp!r} under {pool_root_path / sp}"
+            )
         # Realistic unsigned benign developer CLI PEs (1 .exe + 1 .dll) when external pool is empty
         for pe_idx, is_dll in enumerate((False, True)):
             ext = "dll" if is_dll else "exe"
@@ -337,6 +417,7 @@ def generate_benign_workload_bundle(
             dst_path = f"{dst_dir}\\{pe_name}"
             pe_sz = rng.randint(48_000, 760_000) + pe_idx * 1319 + (seed % 4096)
             pe_bytes = _synth_unsigned_pe_bytes(seed + 101 + pe_idx, pe_sz, is_dll=is_dll)
+            synthetic_fallback_counts["unsigned_pe"] += 1
             iso_rel = f"benign_assets/{pe_name}"
             extra_iso_files[iso_rel] = pe_bytes
             if not is_dll and staged_exe_for_pers is None:
@@ -357,9 +438,9 @@ def generate_benign_workload_bundle(
                 f'if (Test-Path -LiteralPath $srcPe{pe_idx}) {{ Copy-Item -LiteralPath $srcPe{pe_idx} -Destination "{dst_path}" -Force }}',
             ])
 
-    # 2. Procedurally varied non-template scripts (all extensions covered by offline_extractor user-scan + .py)
-    script_exts = ("ps1", "bat", "cmd", "vbs", "js", "ps1", "py")
-    staged_py_path: str | None = None
+    # 2. Procedurally varied non-template scripts (strictly inside collected safe extensions; zero .py)
+    script_exts = BENIGN_SCRIPT_EXTS
+    staged_script_for_task: str | None = None
     for s_idx in range(n_scripts):
         sext = script_exts[(seed + s_idx) % len(script_exts)]
         sname = f"{sp}_{sw.lower()}_{safe_run}_{s_idx}_{rng.randint(100,9999)}.{sext}"
@@ -368,8 +449,8 @@ def generate_benign_workload_bundle(
         s_bytes = _synth_varied_script(rng, sext, f"{sp}_{safe_run}_{s_idx}", user)
         iso_rel = f"benign_assets/{sname}"
         extra_iso_files[iso_rel] = s_bytes
-        if sext == "py" and staged_py_path is None:
-            staged_py_path = dst_path
+        if sext in ("ps1", "bat", "cmd") and staged_script_for_task is None:
+            staged_script_for_task = dst_path
         staged_files.append({
             "path": dst_path,
             "name": sname,
@@ -377,7 +458,7 @@ def generate_benign_workload_bundle(
             "file_size": len(s_bytes),
             "source": "procedural_script",
             "is_pe": False,
-            "signature_status": "NotSigned" if sext in ("ps1", "vbs", "js") else "UnknownError",
+            "signature_status": "NotSigned" if sext in ("ps1", "psm1", "vbs", "vbe", "js") else "UnknownError",
             "raw_bytes_preview": s_bytes,
         })
         ps_lines.extend([
@@ -386,35 +467,87 @@ def generate_benign_workload_bundle(
             f'if (Test-Path -LiteralPath $srcScr{s_idx}) {{ Copy-Item -LiteralPath $srcScr{s_idx} -Destination "{dst_path}" -Force }}',
         ])
 
-    # 3. High-entropy benign archives & structured data (.zip / .json / .log)
-    data_exts = ("zip", "json", "log")
-    for a_idx in range(n_archives):
-        dext = data_exts[(seed + a_idx) % len(data_exts)]
-        dname = f"{sp}_bundle_{safe_run}_{a_idx}_{rng.randint(100,9999)}.{dext}"
-        dst_dir = f"C:\\Users\\{user}\\AppData\\Roaming\\{sw}\\cache"
-        dst_path = f"{dst_dir}\\{dname}"
-        d_bytes = (
-            _synth_high_entropy_zip(rng, f"{sp}_{safe_run}_{a_idx}")
-            if dext == "zip"
-            else _synth_json_or_log(rng, dext, f"{sp}_{safe_run}_{a_idx}")
-        )
-        iso_rel = f"benign_assets/{dname}"
-        extra_iso_files[iso_rel] = d_bytes
-        staged_files.append({
-            "path": dst_path,
-            "name": dname,
-            "sha256": hashlib.sha256(d_bytes).hexdigest().lower(),
-            "file_size": len(d_bytes),
-            "source": "benign_data",
-            "is_pe": False,
-            "signature_status": "UnknownError",
-            "raw_bytes_preview": d_bytes,
-        })
-        ps_lines.extend([
-            f'if (-not (Test-Path -LiteralPath "{dst_dir}")) {{ New-Item -ItemType Directory -Path "{dst_dir}" -Force | Out-Null }}',
-            f'$srcDat{a_idx} = Join-Path $stageRoot "{iso_rel.replace("/", "\\")}"',
-            f'if (Test-Path -LiteralPath $srcDat{a_idx}) {{ Copy-Item -LiteralPath $srcDat{a_idx} -Destination "{dst_path}" -Force }}',
-        ])
+    # 3. High-entropy benign installers drawn from real pool `.exe`/`.msi` assets (fallback: high-entropy PE .exe)
+    n_installers = int(n_archives)
+    all_installer_cands = _select_high_entropy_installer_candidates(pool_files)
+    unused_installer_cands = [p for p in all_installer_cands if p not in picked_section1]
+    installer_pool = unused_installer_cands if unused_installer_cands else all_installer_cands
+
+    if installer_pool and n_installers > 0:
+        stride_i = max(1, len(installer_pool) // max(1, n_installers))
+        start_i = (seed >> 3) % len(installer_pool)
+        for a_idx in range(n_installers):
+            pfile = installer_pool[(start_i + a_idx * stride_i) % len(installer_pool)]
+            d_bytes = pfile.read_bytes()
+            dname = f"{sp}_inst_{safe_run}_{a_idx}_{pfile.name}"
+            dst_dir = f"C:\\Users\\{user}\\AppData\\Roaming\\{sw}\\cache"
+            dst_path = f"{dst_dir}\\{dname}"
+            iso_rel = f"benign_assets/{sp}_inst_{a_idx:02d}_{pfile.name}"
+            extra_iso_files[iso_rel] = d_bytes
+            sig_stat = "NotSigned"
+            try:
+                from src.v2.offline_extractor import verify_offline_signature
+                sig_stat = verify_offline_signature(str(pfile), d_bytes, len(d_bytes))
+            except Exception:
+                sig_stat = "NotSigned"
+            staged_files.append({
+                "path": dst_path,
+                "name": dname,
+                "sha256": hashlib.sha256(d_bytes).hexdigest().lower(),
+                "file_size": len(d_bytes),
+                "source": "benign_pool_installer",
+                "is_pe": pfile.suffix.lower() == ".exe",
+                "signature_status": sig_stat,
+            })
+            ps_lines.extend([
+                f'if (-not (Test-Path -LiteralPath "{dst_dir}")) {{ New-Item -ItemType Directory -Path "{dst_dir}" -Force | Out-Null }}',
+                f'$srcDat{a_idx} = Join-Path $stageRoot "{iso_rel.replace("/", "\\")}"',
+                f'if (Test-Path -LiteralPath $srcDat{a_idx}) {{ Copy-Item -LiteralPath $srcDat{a_idx} -Destination "{dst_path}" -Force }}',
+            ])
+    elif n_installers > 0:
+        if require_real_pools:
+            raise RealBenignPoolRequiredError(
+                f"Real benign pool required (`require_real_pools=True`), but no real `.exe`/`.msi` "
+                f"installer assets found for split_pool={sp!r} under {pool_root_path / sp}"
+            )
+        for a_idx in range(n_installers):
+            dname = f"{sp}_inst_{safe_run}_{a_idx}_{rng.randint(100,9999)}.exe"
+            dst_dir = f"C:\\Users\\{user}\\AppData\\Roaming\\{sw}\\cache"
+            dst_path = f"{dst_dir}\\{dname}"
+            pe_sz = rng.randint(64_000, 640_000) + a_idx * 1777 + ((seed >> 5) % 4096)
+            d_bytes = _synth_unsigned_pe_bytes(
+                seed + 501 + a_idx,
+                pe_sz,
+                is_dll=False,
+                high_entropy=True,
+            )
+            synthetic_fallback_counts["high_entropy_pe"] += 1
+            iso_rel = f"benign_assets/{dname}"
+            extra_iso_files[iso_rel] = d_bytes
+            staged_files.append({
+                "path": dst_path,
+                "name": dname,
+                "sha256": hashlib.sha256(d_bytes).hexdigest().lower(),
+                "file_size": len(d_bytes),
+                "source": "synthetic_high_entropy_pe",
+                "is_pe": True,
+                "signature_status": "NotSigned",
+                "raw_bytes_preview": d_bytes,
+            })
+            ps_lines.extend([
+                f'if (-not (Test-Path -LiteralPath "{dst_dir}")) {{ New-Item -ItemType Directory -Path "{dst_dir}" -Force | Out-Null }}',
+                f'$srcDat{a_idx} = Join-Path $stageRoot "{iso_rel.replace("/", "\\")}"',
+                f'if (Test-Path -LiteralPath $srcDat{a_idx}) {{ Copy-Item -LiteralPath $srcDat{a_idx} -Destination "{dst_path}" -Force }}',
+            ])
+
+    # Hard invariant: 100% of emitted file paths pass the real offline_extractor predicates and avoid .hta/.scr
+    for rec in staged_files:
+        rec_path = str(rec["path"])
+        rec_ext = Path(rec_path.replace("\\", "/")).suffix.lower()
+        if rec_ext in BENIGN_AVOIDED_EXTS or not path_passes_extractor_file_predicate(rec_path):
+            raise AssertionError(
+                f"Generated benign path failed real extractor predicate: {rec_path!r}"
+            )
 
     # 4. Realistic benign persistence entries (Service, varied-trigger Task, Run/RunOnce, IFEO Registry)
     services_manifest: list[dict[str, Any]] = []
@@ -444,18 +577,25 @@ def generate_benign_workload_bundle(
         t_trig_idx = seed % len(prof["triggers"])
         t_trig = prof["triggers"][t_trig_idx]
         t_trig_cls = prof["trigger_classes"][t_trig_idx]
-        t_target = staged_py_path or (staged_files[0]["path"] if staged_files else r"C:\Windows\System32\cmd.exe")
-        t_action = (
-            f'cmd.exe /c python.exe "{t_target}"'
-            if str(t_target).lower().endswith(".py")
-            else f'cmd.exe /c echo {t_name}'
+        t_target = staged_script_for_task or staged_exe_for_pers or (
+            staged_files[0]["path"] if staged_files else r"C:\Windows\System32\cmd.exe"
         )
+        t_target_low = str(t_target).lower()
+        if t_target_low.endswith(".ps1"):
+            t_action = f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{t_target}"'
+            t_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        elif t_target_low.endswith((".bat", ".cmd")):
+            t_action = f'cmd.exe /c "{t_target}"'
+            t_exe = r"C:\Windows\System32\cmd.exe"
+        else:
+            t_action = f'cmd.exe /c echo {t_name}'
+            t_exe = r"C:\Windows\System32\cmd.exe"
         tasks_manifest.append({
             "task_name": t_full,
             "name": t_name,
             "task_triggers": t_trig_cls,
             "command_line": t_action,
-            "path": r"C:\Windows\System32\cmd.exe",
+            "path": t_exe,
         })
         if t_trig == "DAILY":
             ps_lines.append(
@@ -507,11 +647,15 @@ def generate_benign_workload_bundle(
     clean_files_manifest = [
         {k: v for k, v in rec.items() if k != "raw_bytes_preview"} for rec in staged_files
     ]
+    synth_total = int(sum(synthetic_fallback_counts.values()))
     benign_manifest = {
         "run_id": run_id,
         "split_pool": sp,
         "benign_profile_id": prof_id,
         "seed": seed,
+        "synthetic_fallback": bool(synth_total > 0),
+        "synthetic_fallback_count": synth_total,
+        "synthetic_fallback_counts": dict(synthetic_fallback_counts),
         "files": clean_files_manifest,
         "services": services_manifest,
         "tasks": tasks_manifest,
@@ -531,8 +675,9 @@ def simulate_benign_generator_rows(
     n_runs: int = 24,
     base_seed: int = 5000,
     benign_pools_root: str | Path | None = None,
+    require_real_pools: bool = False,
 ) -> tuple[list[dict[str, Any]], set[str]]:
-    """Simulate extracted cold-disk rows from `generate_benign_workload_bundle` for shortcut & disjoint audits."""
+    """Simulate extracted cold-disk rows from `generate_benign_workload_bundle` using real extractor predicates."""
     rows: list[dict[str, Any]] = []
     keys: set[str] = set()
     sp = str(split_pool).strip().lower()
@@ -547,6 +692,7 @@ def simulate_benign_generator_rows(
             benign_profile_id=pid,
             run_seed=base_seed + idx,
             benign_pools_root=benign_pools_root,
+            require_real_pools=require_real_pools,
         )
         man = bundle["benign_manifest"]
         staged_bytes_by_path = {
@@ -555,6 +701,19 @@ def simulate_benign_generator_rows(
         }
         for f in man["files"]:
             p = f["path"]
+            ext = Path(p.replace("\\", "/")).suffix.lower()
+            if ext not in _USER_SCAN_TARGET_EXTS:
+                raise AssertionError(
+                    f"Simulated benign file has non-collected extension {ext!r}: {p!r}"
+                )
+            if ext in BENIGN_AVOIDED_EXTS:
+                raise AssertionError(
+                    f"Simulated benign file uses avoided extension {ext!r}: {p!r}"
+                )
+            if not path_matches_extractor_scan_roots(p):
+                raise AssertionError(
+                    f"Simulated benign file path outside real extractor scan_roots/depth: {p!r}"
+                )
             nm = f["name"]
             ak = f"file|{p.lower()}|{nm.lower()}"
             keys.add(ak)

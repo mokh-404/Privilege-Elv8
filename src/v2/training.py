@@ -28,6 +28,7 @@ from src.eval.metrics import pr_auc
 from src.models.preprocess import SharedPreprocessor
 from src.v2 import config_v2
 from src.v2.models_v2 import make_arm_v2
+from src.v2.pilot_staging import canonicalize_family_name
 
 
 @dataclass
@@ -89,7 +90,8 @@ def build_family_cluster_groups(df: pd.DataFrame) -> np.ndarray:
         for idx in pos_indices:
             row = df.iloc[int(idx)]
             has_any = False
-            eff_family = _clean_opt_str(row.get("sample_family")) or _clean_opt_str(row.get("technique_id"))
+            raw_fam = _clean_opt_str(row.get("sample_family"))
+            eff_family = canonicalize_family_name(raw_fam) if raw_fam is not None else _clean_opt_str(row.get("technique_id"))
             if eff_family is not None:
                 has_any = True
                 buckets.setdefault(("family", eff_family.lower()), []).append(int(idx))

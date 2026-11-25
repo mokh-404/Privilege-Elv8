@@ -1,8 +1,12 @@
 """Disjoint `dev` vs. `blind_test` real benign asset pool packager & auditor (Step C.6 / Task 4).
 
 Ingests open-source Windows binaries, signed third-party utilities, scripts, and high-entropy
-benign archives/data into strictly disjoint host pools (`/var/lib/dfir-quarantine-vault/benign_pools/dev`
-vs `.../blind_test`), asserting ZERO SHA-256, normalized filename, and package-folder overlap.
+benign installers (`.exe`/`.msi`) into strictly disjoint host pools
+(`/var/lib/dfir-quarantine-vault/benign_pools/dev` vs `.../blind_test`), asserting ZERO SHA-256,
+normalized filename, and package-folder overlap.
+
+IMPORTANT: Do NOT harvest benign assets from `win11_base.qcow2` (single Microsoft/OS vendor
+violates the vendor-disjointness rule between `dev` and `blind_test` benign software pools).
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.data.features import file_head_entropy
 from src.utils.repro import utc_now_iso, write_json
-from src.v2.offline_extractor import verify_offline_signature
+from src.v2.offline_extractor import _USER_SCAN_TARGET_EXTS, verify_offline_signature
 
 
 DEFAULT_POOLS_ROOT = Path("/var/lib/dfir-quarantine-vault/benign_pools")
@@ -75,20 +79,36 @@ BLIND_TEST_PACKAGE_ROSTER: tuple[str, ...] = (
     "sysinternals_ops",
 )
 
+HARD_FLOOR_QUOTAS: dict[str, int] = {
+    "total_files": 1000,
+    "unsigned_pe": 200,
+    "signed_pe": 200,
+    "script": 350,
+    "high_entropy_installers": 250,
+    "dev_signed_pe_min": 1,
+    "dev_unsigned_pe_min": 1,
+    "blind_test_signed_pe_min": 1,
+    "blind_test_unsigned_pe_min": 1,
+}
+
 TARGET_BENIGN_QUOTAS: dict[str, Any] = {
     "total_files_target": (1500, 2000),
-    "hard_floor_files": 1000,
+    "hard_floor_files": HARD_FLOOR_QUOTAS["total_files"],
     "dev_files_target": (1200, 1600),
     "blind_test_files_target": (300, 400),
     "unsigned_pe": (300, 400),
     "signed_pe": (300, 400),
     "varied_scripts": (500, 700),
-    "high_entropy_archives_data": (400, 500),
+    "high_entropy_installers": (400, 500),
     "persistence_entries": (200, 400),
+    "hard_floors": dict(HARD_FLOOR_QUOTAS),
 }
 
-_PE_EXTS = frozenset({".exe", ".dll", ".sys", ".ocx", ".cpl", ".scr"})
-_SCRIPT_EXTS = frozenset({".ps1", ".psm1", ".psd1", ".py", ".bat", ".cmd", ".vbs", ".js"})
+HIGH_ENTROPY_INSTALLER_THRESHOLD = 6.5
+_PE_EXTS = frozenset({".exe", ".dll"})
+_INSTALLER_EXTS = frozenset({".msi"})
+_SCRIPT_EXTS = frozenset({".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".vbe", ".js"})
+_AVOIDED_BENIGN_EXTS = frozenset({".hta", ".scr"})
 _SAFE_PKG_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -106,8 +126,10 @@ def inspect_benign_asset(path: str | Path, cat_digests: set[str] | frozenset[str
         category = "signed_pe" if sig_status == "Valid" else "unsigned_pe"
     elif ext in _SCRIPT_EXTS:
         category = "script"
+    elif ext in _INSTALLER_EXTS:
+        category = "installer_msi"
     else:
-        category = "archive_data"
+        category = "other"
 
     return {
         "name": p.name,
@@ -118,6 +140,8 @@ def inspect_benign_asset(path: str | Path, cat_digests: set[str] | frozenset[str
         "file_entropy": round(ent, 6),
         "signature_status": sig_status,
         "category": category,
+        "is_collected_ext": bool(ext in _USER_SCAN_TARGET_EXTS and ext not in _AVOIDED_BENIGN_EXTS),
+        "is_high_entropy_installer": bool(ext == ".msi" or (ext == ".exe" and ent >= HIGH_ENTROPY_INSTALLER_THRESHOLD)),
     }
 
 
@@ -243,7 +267,7 @@ def index_and_validate_benign_pools(
         )
 
     def _summarize(recs: list[dict[str, Any]]) -> dict[str, Any]:
-        cats = {"unsigned_pe": 0, "signed_pe": 0, "script": 0, "archive_data": 0}
+        cats = {"unsigned_pe": 0, "signed_pe": 0, "script": 0, "installer_msi": 0, "other": 0}
         ents = [float(r["file_entropy"]) for r in recs]
         sizes = [int(r["file_size"]) for r in recs]
         for r in recs:
@@ -252,6 +276,7 @@ def index_and_validate_benign_pools(
             "total_files": len(recs),
             "unique_sha256": len({r["sha256"] for r in recs}),
             "packages_count": len({r["package_name"] for r in recs}),
+            "high_entropy_installers": sum(1 for r in recs if r.get("is_high_entropy_installer")),
             "categories": cats,
             "entropy_summary": (
                 {
@@ -288,9 +313,60 @@ def index_and_validate_benign_pools(
             "blind_test": split_records["blind_test"],
         },
     }
+    summary["quota_check"] = evaluate_pool_quotas(summary)
     if write_manifest:
         write_json(summary, root / "benign_pool_manifest.json")
     return summary
+
+
+def evaluate_pool_quotas(
+    summary: Mapping[str, Any],
+    hard_floors: Mapping[str, int] = HARD_FLOOR_QUOTAS,
+) -> dict[str, Any]:
+    """Validate dev/blind_test PE presence and hard floor quotas; returns pass flag + failure list."""
+    failures: list[str] = []
+    dev_cats = summary.get("dev", {}).get("categories", {})
+    test_cats = summary.get("blind_test", {}).get("categories", {})
+    tot = summary.get("total", {})
+    tot_cats = tot.get("categories", {})
+
+    if int(dev_cats.get("signed_pe", 0)) < int(hard_floors.get("dev_signed_pe_min", 1)):
+        failures.append(
+            f"dev signed_pe count ({dev_cats.get('signed_pe', 0)}) < required minimum ({hard_floors.get('dev_signed_pe_min', 1)})"
+        )
+    if int(dev_cats.get("unsigned_pe", 0)) < int(hard_floors.get("dev_unsigned_pe_min", 1)):
+        failures.append(
+            f"dev unsigned_pe count ({dev_cats.get('unsigned_pe', 0)}) < required minimum ({hard_floors.get('dev_unsigned_pe_min', 1)})"
+        )
+    if int(test_cats.get("signed_pe", 0)) < int(hard_floors.get("blind_test_signed_pe_min", 1)):
+        failures.append(
+            f"blind_test signed_pe count ({test_cats.get('signed_pe', 0)}) < required minimum ({hard_floors.get('blind_test_signed_pe_min', 1)})"
+        )
+    if int(test_cats.get("unsigned_pe", 0)) < int(hard_floors.get("blind_test_unsigned_pe_min", 1)):
+        failures.append(
+            f"blind_test unsigned_pe count ({test_cats.get('unsigned_pe', 0)}) < required minimum ({hard_floors.get('blind_test_unsigned_pe_min', 1)})"
+        )
+
+    tot_checks = (
+        ("total_files", int(tot.get("total_files", 0)), int(hard_floors.get("total_files", 1000))),
+        ("unsigned_pe", int(tot_cats.get("unsigned_pe", 0)), int(hard_floors.get("unsigned_pe", 200))),
+        ("signed_pe", int(tot_cats.get("signed_pe", 0)), int(hard_floors.get("signed_pe", 200))),
+        ("script", int(tot_cats.get("script", 0)), int(hard_floors.get("script", 350))),
+        (
+            "high_entropy_installers",
+            int(tot.get("high_entropy_installers", 0)),
+            int(hard_floors.get("high_entropy_installers", 250)),
+        ),
+    )
+    for label, actual, floor in tot_checks:
+        if actual < floor:
+            failures.append(f"total {label} ({actual}) < hard floor ({floor})")
+
+    return {
+        "passed": len(failures) == 0,
+        "failures": failures,
+        "hard_floors": dict(hard_floors),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -301,6 +377,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--split", choices=("dev", "blind_test"), default="dev")
     parser.add_argument("--package", default=None, help="Package directory name for --ingest-dir")
     parser.add_argument("--audit", action="store_true", help="Audit pools and write benign_pool_manifest.json")
+    parser.add_argument(
+        "--enforce-quotas",
+        action="store_true",
+        help="Exit non-zero if dev or blind_test lacks signed/unsigned PEs or misses hard floors",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     out: dict[str, Any] = {}
@@ -322,11 +403,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             package_name=args.package,
         )
 
-    if args.audit or (not args.init_dirs and args.ingest_dir is None):
+    quota_failed = False
+    if args.audit or args.enforce_quotas or (not args.init_dirs and args.ingest_dir is None):
         rep = index_and_validate_benign_pools(args.pools_root, write_manifest=True)
         out["audit"] = {k: v for k, v in rep.items() if k != "assets"}
+        if args.enforce_quotas and not rep["quota_check"]["passed"]:
+            quota_failed = True
 
     print(json.dumps(out, indent=2))
+    if quota_failed:
+        for msg in out["audit"]["quota_check"]["failures"]:
+            print(f"QUOTA ERROR: {msg}", file=sys.stderr)
+        return 2
     return 0
 
 

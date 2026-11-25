@@ -1,0 +1,17 @@
+[Unit]
+Description=DFIR-Triage ML v2 Isolated virbr1 Firewall (IPv4 + IPv6 Default-DROP)
+After=docker.service ufw.service libvirtd.service
+Wants=libvirtd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml
+Environment=BRIDGE=virbr1
+ExecStart=/usr/bin/env bash /home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/docs/v2/hardening/01_firewall_win11_isolated.sh --apply
+ExecStartPost=/usr/bin/env bash /home/fsociety/grad/implementation_phase1/docs_claude/dfir-triage-ml/docs/v2/hardening/04_watchdog_and_base_hash.sh check-egress snapshot
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

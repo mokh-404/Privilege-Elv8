@@ -41,6 +41,7 @@ from src.v2.ablations_v2 import split_feature_types
 from src.v2.labeler_v2 import (
     AMBIGUOUS_LABEL,
     build_multi_control_baseline,
+    label_dormant_batch_run,
     label_dormant_run,
     label_executed_run,
 )
@@ -482,8 +483,15 @@ def execute_stage_a_pilot_batch(
     git_state_fn: Callable[[Path], Mapping[str, Any]] | None = None,
     now_fn: Callable[[], datetime] | None = None,
     confirm_input_fn: Callable[[str], str] = input,
+    stage: str = "a",
+    require_real_pools: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Execute or dry-run a Stage A/B batch with detached watchdog, egress checks, base checks & optional pipelining."""
+    st_stage = str(stage or "a").strip().lower()
+    if st_stage not in ("a", "b"):
+        raise ValueError(f"stage must be 'a' or 'b', got {stage!r}")
+    eff_require_real_pools = (st_stage == "b") if require_real_pools is None else bool(require_real_pools)
+
     repo_root = Path(__file__).resolve().parent.parent.parent
     watchdog_script = repo_root / "docs" / "v2" / "hardening" / "04_watchdog_and_base_hash.sh"
     bake_script = repo_root / "docs" / "v2" / "hardening" / "00_bake_v2_base_image.sh"
@@ -639,6 +647,7 @@ def execute_stage_a_pilot_batch(
                         benign_script_text=raw_ben_script,
                         archive_password=entry.get("archive_password", "infected"),
                         benign_pools_root=benign_pools_root,
+                        require_real_pools=eff_require_real_pools,
                     )
             elif not dry_run or spec.stratum == "control" or (vault_file is not None and Path(vault_file).exists()):
                 build_stage_bundle(
@@ -648,6 +657,7 @@ def execute_stage_a_pilot_batch(
                     benign_script_text=raw_ben_script,
                     archive_password=entry.get("archive_password", "infected"),
                     benign_pools_root=benign_pools_root,
+                    require_real_pools=eff_require_real_pools,
                 )
 
             attach_cmd = [
@@ -897,6 +907,23 @@ def evaluate_stage_a_pilot_runs(
                 benign_manifest=ben_man,
                 sample_meta=sample_meta,
             )
+        elif spec.stratum == "dormant_batch":
+            batch_items = [
+                {
+                    **dict(bm),
+                    "packer_cluster": bm.get("packer_cluster") or f"pkr_{bm.get('sample_family')}",
+                }
+                for bm in spec.batch_samples
+            ]
+            ldf = label_dormant_batch_run(
+                run_df=raw_df,
+                baseline_index=baseline_idx,
+                batch_manifest=batch_items,
+                run_id=spec.run_id,
+                sysmon_events=sysmon_evs,
+                benign_manifest=ben_man,
+                split_pool=spec.split_pool,
+            )
         elif spec.stratum == "executed":
             ldf = label_executed_run(
                 run_df=raw_df,
@@ -910,7 +937,9 @@ def evaluate_stage_a_pilot_runs(
                 sample_meta=sample_meta,
             )
         else:
-            continue
+            raise PilotStagingError(
+                f"Unsupported stratum in evaluate_stage_a_pilot_runs for run {spec.run_id!r}: {spec.stratum!r}"
+            )
 
         ldf["split_pool"] = "dev"
         ldf = _ensure_feature_columns(ldf)
@@ -920,11 +949,21 @@ def evaluate_stage_a_pilot_runs(
         n_pos = int(vc.get(config.POSITIVE_LABEL, 0))
         n_amb = int(vc.get(AMBIGUOUS_LABEL, 0))
         n_drift = int(vc.get("benign_drift", 0))
+        eff_fam = (
+            ",".join(sorted({str(it.get("sample_family") or "") for it in spec.batch_samples if it.get("sample_family")})) or None
+            if spec.stratum == "dormant_batch"
+            else spec.sample_family
+        )
+        eff_pair = (
+            spec.pair_group_id or f"batch_{spec.run_id}"
+            if spec.stratum == "dormant_batch"
+            else spec.pair_group_id
+        )
         run_yield_rows.append({
             "run_id": spec.run_id,
             "stratum": spec.stratum,
-            "sample_family": spec.sample_family,
-            "pair_group_id": spec.pair_group_id,
+            "sample_family": eff_fam,
+            "pair_group_id": eff_pair,
             "total_rows": len(ldf),
             "attacker_induced": n_pos,
             "benign_drift": n_drift,
@@ -977,7 +1016,7 @@ def evaluate_stage_a_pilot_runs(
 
     yield_df = pd.DataFrame(run_yield_rows)
     exec_yield = yield_df[yield_df["stratum"] == "executed"]
-    dorm_yield = yield_df[yield_df["stratum"] == "dormant"]
+    dorm_yield = yield_df[yield_df["stratum"].isin(["dormant", "dormant_batch"])]
 
     return {
         "generated_at_utc": utc_now_iso(),
@@ -1085,6 +1124,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--canary-stamp-path", type=Path, default=None)
     parser.add_argument("--inetsim-wait-seconds", type=int, default=8)
     parser.add_argument("--full-base-hash-every", type=int, default=25)
+    parser.add_argument("--stage", choices=("a", "b"), default="a", help="Pipeline stage ('a' allows fallback unless --require-real-pools; 'b' enforces real pools by default)")
+    parser.add_argument(
+        "--require-real-pools",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Fail fatally if benign pool synthetic fallback would be used (default: off for Stage A, on for Stage B)",
+    )
     parser.add_argument("--canary", action="store_true", help="Run supervised 3-boot canary check and write CANARY_PASSED stamp")
     parser.add_argument("--pipelined", action="store_true", help="Enable safe 1-lane pipelined container extraction")
     parser.add_argument("--no-resume", action="store_true", help="Do not skip runs already listed in completed_runs.jsonl")
@@ -1112,6 +1158,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         resume=not args.no_resume,
         benign_pools_root=args.benign_pools_root,
         batch_json_path=args.batch_json,
+        stage=args.stage,
+        require_real_pools=args.require_real_pools,
     )
     print(json.dumps({"completed_runs": len(executed), "runs": executed}, indent=2))
     return 0

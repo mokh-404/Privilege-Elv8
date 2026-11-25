@@ -24,6 +24,9 @@ from src.v2.offline_extractor import (
 )
 from src.v2.pilot_staging import (
     ALLOWED_FAMILIES,
+    CANONICAL_ALLOWED_FAMILIES,
+    DORMANT_BATCH_MAX,
+    FAMILY_ALIAS_TO_CANONICAL,
     FORBIDDEN_MALWARE_FAMILIES_AND_TAGS,
     FORBIDDEN_SUBSTRING_STEMS,
     PilotStagingError,
@@ -31,6 +34,8 @@ from src.v2.pilot_staging import (
     assert_allowed_malware_policy,
     build_clean_parity_stage_iso,
     build_dormant_batch_bundle,
+    build_stage_bundle,
+    canonicalize_family_name,
     check_forbidden_malware_policy,
     normalize_family_slug,
     validate_stage_run_spec,
@@ -1194,3 +1199,312 @@ def test_canary_stamp_full_binding_expiry_and_detonate_prompt(tmp_path):
     # 8. Valid fresh clean matching stamp succeeds cleanly
     ok_res = execute_stage_a_pilot_batch(**common_kw)
     assert len(ok_res) == 1 and ok_res[0]["run_id"] == "cb_exec"
+
+
+def test_dormant_batch_cap_16_and_evaluate_stage_a_wires_batch_and_raises_on_unknown(tmp_path):
+    from src.v2.labeler_v2 import build_multi_control_baseline, label_dormant_batch_run
+    from src.v2.pilot_staging import _DORMANT_BATCH_PS1_LOOP
+
+    assert DORMANT_BATCH_MAX == 16
+    assert "$maxBatch = 16" in _DORMANT_BATCH_PS1_LOOP
+    assert "16" in (build_dormant_batch_bundle.__doc__ or "")
+    assert "20" not in (build_dormant_batch_bundle.__doc__ or "")
+
+    def _mk_batch_items(count: int):
+        return tuple(
+            {
+                "sample_sha256": f"{i + 1:064x}",
+                "staging_target_path": rf"C:\Users\Public\db_{i:02d}.exe",
+                "pair_group_id": f"pg_batch_{i:02d}",
+                "sample_family": "redline" if i % 2 == 0 else "asyncrat",
+            }
+            for i in range(count)
+        )
+
+    # Exactly 16 succeeds; 17 fails both validate_stage_run_spec and label_dormant_batch_run
+    spec_16 = StageRunSpec(
+        run_id="db_16",
+        stratum="dormant_batch",
+        benign_profile_id="B_dev_01",
+        split_pool="dev",
+        dwell_seconds=50,
+        execute_payload=False,
+        gate0_signed_off=True,
+        dedicated_host_user_verified=True,
+        batch_samples=_mk_batch_items(16),
+    )
+    validate_stage_run_spec(spec_16)
+
+    spec_17 = StageRunSpec(
+        run_id="db_17",
+        stratum="dormant_batch",
+        benign_profile_id="B_dev_01",
+        split_pool="dev",
+        dwell_seconds=50,
+        execute_payload=False,
+        gate0_signed_off=True,
+        dedicated_host_user_verified=True,
+        batch_samples=_mk_batch_items(17),
+    )
+    with pytest.raises(PilotStagingError, match="1\\.\\.16"):
+        validate_stage_run_spec(spec_17)
+
+    ctrl_df = pd.DataFrame([
+        {
+            "run_id": "ctrl_01",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\windows\system32\notepad.exe|notepad.exe",
+            "name": "notepad.exe",
+            "path": r"C:\Windows\System32\notepad.exe",
+            "signature_status": "Valid",
+            "file_size": 204800,
+            "file_head_histogram": [800] * 256,
+            "file_sha256": "e" * 64,
+        }
+    ])
+    base_idx = build_multi_control_baseline([ctrl_df])
+    with pytest.raises(ValueError, match="at most 16"):
+        label_dormant_batch_run(ctrl_df, base_idx, list(_mk_batch_items(17)), run_id="db_17", split_pool="dev")
+
+    # Wire dormant_batch into evaluate_stage_a_pilot_runs (MUST NOT drop batch run)
+    ctrl_rows = ctrl_df.to_dict(orient="records")
+    # Need >= 3 distinct family clusters (2 positives + benign) for 2-fold outer CV
+    exec_families = ("redline", "asyncrat", "smokeloader", "xmrig")
+    pilot_runs = []
+    batch_items = []
+    for idx, fam in enumerate(exec_families):
+        sha = hashlib.sha256(f"db_eval_{fam}".encode()).hexdigest()
+        staged_p = rf"C:\Users\Public\db_{fam}.exe"
+        pair_id = f"pair_db_{fam}"
+        if idx < 2:
+            batch_items.append({
+                "staging_target_path": staged_p,
+                "sample_sha256": sha,
+                "sample_family": fam,
+                "pair_group_id": pair_id,
+            })
+        exec_rows = [dict(r, run_id=f"ex_{fam}") for r in ctrl_rows]
+        exec_rows.append({
+            "run_id": f"ex_{fam}",
+            "artifact_type": "file",
+            "artifact_key": f"file|{staged_p.lower()}|db_{fam}.exe",
+            "name": f"db_{fam}.exe",
+            "path": staged_p,
+            "signature_status": "NotSigned",
+            "file_size": 220000 + idx * 4096,
+            "file_head_histogram": [850] * 256,
+            "file_sha256": sha,
+            "attributes": 2,
+        })
+        pilot_runs.append({
+            "spec": StageRunSpec(
+                run_id=f"ex_{fam}",
+                stratum="executed",
+                benign_profile_id="B_dev_01",
+                dwell_seconds=60,
+                staging_target_path=staged_p,
+                sample_sha256=sha,
+                sample_family=fam,
+                pair_group_id=pair_id,
+                execute_payload=True,
+                gate0_signed_off=True,
+                dedicated_host_user_verified=True,
+            ),
+            "df": pd.DataFrame(exec_rows),
+            "sysmon_events": [{"event_id": 1, "process_guid": f"{{g-{fam}}}", "pid": 3000 + idx, "image": staged_p, "hashes": f"SHA256={sha}"}],
+            "malware_root_guids": [f"{{g-{fam}}}"],
+        })
+
+    db_rows = [dict(r, run_id="db_batch_01") for r in ctrl_rows]
+    for bm in batch_items:
+        db_rows.append({
+            "run_id": "db_batch_01",
+            "artifact_type": "file",
+            "artifact_key": f"file|{bm['staging_target_path'].lower()}|{Path(bm['staging_target_path']).name}",
+            "name": Path(bm["staging_target_path"]).name,
+            "path": bm["staging_target_path"],
+            "signature_status": "NotSigned",
+            "file_size": 190000,
+            "file_head_histogram": [740] * 256,
+            "file_sha256": bm["sample_sha256"],
+            "attributes": 2,
+        })
+    pilot_runs.append({
+        "spec": StageRunSpec(
+            run_id="db_batch_01",
+            stratum="dormant_batch",
+            benign_profile_id="B_dev_02",
+            split_pool="dev",
+            dwell_seconds=60,
+            execute_payload=False,
+            gate0_signed_off=True,
+            dedicated_host_user_verified=True,
+            batch_samples=tuple(batch_items),
+        ),
+        "df": pd.DataFrame(db_rows),
+    })
+
+    summary = evaluate_stage_a_pilot_runs(
+        control_runs=[ctrl_df],
+        pilot_runs=pilot_runs,
+        arms=("rf", "iforest"),
+        n_outer=2,
+        n_inner=2,
+        n_trials=2,
+        seed=42,
+    )
+    by_rid = {row["run_id"]: row for row in summary["yield_table"]}
+    assert "db_batch_01" in by_rid
+    assert by_rid["db_batch_01"]["stratum"] == "dormant_batch"
+    assert by_rid["db_batch_01"]["attacker_induced"] == 2
+    assert summary["dormant_mean_positives_per_run"] == 2.0
+
+    # Unknown or non-malware strata inside pilot_runs MUST raise rather than silently continuing
+    with pytest.raises(PilotStagingError):
+        evaluate_stage_a_pilot_runs(
+            control_runs=[ctrl_df],
+            pilot_runs=[{"spec": {"run_id": "bogus", "stratum": "unknown_stratum", "benign_profile_id": "B_dev_01"}, "df": ctrl_df}],
+        )
+    with pytest.raises(PilotStagingError, match="Unsupported stratum"):
+        evaluate_stage_a_pilot_runs(
+            control_runs=[ctrl_df],
+            pilot_runs=[{"spec": StageRunSpec(run_id="ctrl_in_pilot", stratum="control", benign_profile_id="B_dev_01"), "df": ctrl_df}],
+        )
+
+
+def test_allowlist_removes_lime_and_canonical_aliases_enforce_split_and_caps(tmp_path):
+    from scripts.v2_curate_vault_manifest import canonical_family_slug, select_pilot_families
+
+    # lime / limerat removed from allowlist & blocked
+    assert "lime" not in ALLOWED_FAMILIES and "limerat" not in ALLOWED_FAMILIES
+    assert "lime" not in CANONICAL_ALLOWED_FAMILIES and "limerat" not in CANONICAL_ALLOWED_FAMILIES
+    for lime_name in ("lime", "limerat", "LimeRAT"):
+        with pytest.raises(PilotStagingError, match="BLOCKED"):
+            assert_allowed_malware_policy(sample_family=lime_name, sample_category="rat")
+
+    # All 13 canonical alias mappings resolve to one key per group
+    alias_groups = [
+        ("lumma", ("lumma", "lummac2", "lummastealer", "Lumma-C2")),
+        ("warzone", ("warzone", "warzonerat", "avemaria", "AveMaria")),
+        ("redline", ("redline", "redlinestealer")),
+        ("raccoon", ("raccoon", "raccoonstealer")),
+        ("remcos", ("remcos", "remcosrat")),
+        ("quasar", ("quasar", "quasarrat")),
+        ("orcus", ("orcus", "orcusrat")),
+        ("nanocore", ("nanocore", "nanocorerat")),
+        ("buer", ("buer", "buerloader")),
+        ("aurora", ("aurora", "aurorastealer")),
+        ("revenge", ("revenge", "revengerat")),
+        ("gh0st", ("gh0st", "ghostrat")),
+        ("formbook", ("formbook", "xloader")),
+    ]
+    for expected_canon, variants in alias_groups:
+        for v in variants:
+            assert canonicalize_family_name(v) == expected_canon
+            assert expected_canon in CANONICAL_ALLOWED_FAMILIES
+            assert FAMILY_ALIAS_TO_CANONICAL[normalize_family_slug(v)] == expected_canon
+
+    assert canonical_family_slug("AveMaria", ()) == "warzone"
+    assert canonical_family_slug("LummaC2", ()) == "lumma"
+    assert canonical_family_slug("XLoader", ()) == "formbook"
+
+    # Per-family caps treat alias variants as ONE canonical family
+    cands = {
+        "stealer": [
+            {"sha256_hash": "1" * 64, "signature": "Lumma", "file_name": "a.exe", "file_type": "exe", "file_size": 32768, "tags": ["lumma"]},
+            {"sha256_hash": "2" * 64, "signature": "LummaC2", "file_name": "b.exe", "file_type": "exe", "file_size": 36864, "tags": ["lummac2"]},
+            {"sha256_hash": "3" * 64, "signature": "LummaStealer", "file_name": "c.exe", "file_type": "exe", "file_size": 40960, "tags": ["lummastealer"]},
+            {"sha256_hash": "4" * 64, "signature": "Formbook", "file_name": "d.exe", "file_type": "exe", "file_size": 45056, "tags": ["formbook"]},
+            {"sha256_hash": "5" * 64, "signature": "XLoader", "file_name": "e.exe", "file_type": "exe", "file_size": 49152, "tags": ["xloader"]},
+        ],
+        "rat": [
+            {"sha256_hash": "6" * 64, "signature": "WarzoneRAT", "file_name": "f.exe", "file_type": "exe", "file_size": 32768, "tags": ["warzonerat"]},
+            {"sha256_hash": "7" * 64, "signature": "AveMaria", "file_name": "g.exe", "file_type": "exe", "file_size": 36864, "tags": ["avemaria"]},
+            {"sha256_hash": "8" * 64, "signature": "LimeRAT", "file_name": "h.exe", "file_type": "exe", "file_size": 36864, "tags": ["limerat"]},
+        ],
+    }
+    picked = select_pilot_families(cands, target_families=10, max_per_family=1, target_samples=10)
+    picked_fams = [r["_family"] for r in picked]
+    assert sorted(picked_fams) == ["formbook", "lumma", "warzone"]
+    assert len(picked) == 3  # LimeRAT excluded and aliases collapsed to 1 per canonical key
+
+
+def test_stage_b_requires_real_pools_while_stage_a_allows_synthetic_fallback(tmp_path):
+    import json
+    from src.v2.benign_generator_v2 import RealBenignPoolRequiredError
+    from src.v2.run_stage_a_pilot import main as pilot_main
+
+    empty_pools = tmp_path / "empty_pools"
+    ctrl_only = [
+        {
+            "spec": StageRunSpec(
+                run_id="pool_ctrl_01",
+                stratum="control",
+                benign_profile_id="B_dev_01",
+                dwell_seconds=30,
+            ).__dict__,
+            "vault_file": None,
+        }
+    ]
+    out_a = tmp_path / "out_stage_a"
+    execute_stage_a_pilot_batch(
+        batch_runs=ctrl_only,
+        runs_out_dir=out_a,
+        inetsim_wait_seconds=0,
+        benign_pools_root=empty_pools,
+        stage="a",
+        run_cmd=lambda _c, _e=None: 0,
+        sleep_fn=lambda _s: None,
+    )
+    # Build directly via build_stage_bundle to check manifest fields written
+    bun = build_stage_bundle(
+        StageRunSpec(run_id="chk_fb", stratum="control", benign_profile_id="B_dev_01", dwell_seconds=30),
+        tmp_path / "chk_fb_dir",
+        benign_pools_root=empty_pools,
+        require_real_pools=False,
+    )
+    man = json.loads(bun["benign_manifest"].read_text(encoding="utf-8"))
+    assert man["synthetic_fallback"] is True
+    assert man["synthetic_fallback_counts"] == {"unsigned_pe": 2, "high_entropy_pe": 3}
+
+    with pytest.raises(RealBenignPoolRequiredError):
+        execute_stage_a_pilot_batch(
+            batch_runs=ctrl_only,
+            runs_out_dir=tmp_path / "out_stage_b",
+            inetsim_wait_seconds=0,
+            benign_pools_root=empty_pools,
+            stage="b",
+            run_cmd=lambda _c, _e=None: 0,
+            sleep_fn=lambda _s: None,
+        )
+
+    with pytest.raises(RealBenignPoolRequiredError):
+        execute_stage_a_pilot_batch(
+            batch_runs=ctrl_only,
+            runs_out_dir=tmp_path / "out_stage_a_strict",
+            inetsim_wait_seconds=0,
+            benign_pools_root=empty_pools,
+            stage="a",
+            require_real_pools=True,
+            run_cmd=lambda _c, _e=None: 0,
+            sleep_fn=lambda _s: None,
+        )
+
+    batch_json = tmp_path / "cli_ctrl_batch.json"
+    batch_json.write_text(json.dumps({"runs": ctrl_only}), encoding="utf-8")
+    with pytest.raises(RealBenignPoolRequiredError):
+        pilot_main([
+            "--batch-json", str(batch_json),
+            "--runs-out-dir", str(tmp_path / "cli_stage_b"),
+            "--benign-pools-root", str(empty_pools),
+            "--stage", "b",
+            "--dry-run",
+        ])
+    assert pilot_main([
+        "--batch-json", str(batch_json),
+        "--runs-out-dir", str(tmp_path / "cli_stage_b_override"),
+        "--benign-pools-root", str(empty_pools),
+        "--stage", "b",
+        "--no-require-real-pools",
+        "--dry-run",
+    ]) == 0

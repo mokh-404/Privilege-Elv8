@@ -49,7 +49,7 @@ All `FORBIDDEN_MODEL_INPUTS` (`ORACLE_FEATURES`, `RULE_FEATURES`, `META_COLUMNS`
   - *Unsupervised (`y == 0` benign fit):* `iforest`, `ae`, `nystroem_ocsvm`, `lof_capped` (`15k` benign index cap)
   - *Deterministic / Baselines / Hybrid:* `rules_binary`, `rules_count`, `mc_random` (`10,000` perms), `rule_ml_hybrid`
 - **Equal Tuning Budget (`OD-V2-06`):** **ALL tuned models** receive an **identical `20`-trial random/Optuna budget** inside **`5`-fold outer × `3`-fold inner** family-grouped nested CV (`V2_N_SEARCH_TRIALS = 20`, `V2_OUTER_FOLDS = 5`, `V2_INNER_FOLDS = 3`), evaluated across **`K = 5` final seeds (`[42, 43, 44, 45, 46]`)**.
-- **Natural-Prevalence Calibration & Thresholds:** Probability calibrators (`Platt` / `Isotonic`) and dev-calibrated `1%` & `5%` FPR thresholds are fitted strictly on **natural-prevalence dev OOF predictions** (or exact dev-only Bayes prior-odds adjustment from `dev_dedup` to natural dev prevalence), NEVER on raw `dev_dedup` (`~7%`) prevalence.
+- **Natural-Prevalence Calibration & Thresholds:** Probability calibrators (`Platt` / `Isotonic`) and dev-calibrated `1%` & `5%` FPR thresholds are fitted strictly on **natural-prevalence dev OOF predictions, or on deduped dev rows weighted by multiplicity**, NEVER on unweighted `dev_dedup` (`~7%`) prevalence.
 
 ---
 

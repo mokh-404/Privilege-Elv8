@@ -12,6 +12,7 @@ from src import config
 from src.data import sanitize, splits
 from src.data.labeler import stable_content_hash
 from src.v2.offline_extractor import is_v2_harness_footprint_record
+from src.v2.pilot_staging import DORMANT_BATCH_MAX, canonicalize_family_name
 
 
 AMBIGUOUS_LABEL = "ambiguous_unattributed"
@@ -528,11 +529,15 @@ def label_dormant_batch_run(
     runner_log_path: Any = None,
     sanitization_report: Any = None,
 ) -> pd.DataFrame:
-    """Label a dev-only batched dormant overlay (`<= 20` non-colliding samples) with per-sample provenance."""
+    """Label a dev-only batched dormant overlay (`<= 16` / `DORMANT_BATCH_MAX` non-colliding samples) with per-sample provenance."""
     if str(split_pool).strip().lower() != "dev":
         raise ValueError(
             f"label_dormant_batch_run is strictly dev-only (got split_pool={split_pool!r}); "
             "blind_test dormant runs must stay 1 sample per boot."
+        )
+    if len(batch_manifest) > DORMANT_BATCH_MAX:
+        raise ValueError(
+            f"label_dormant_batch_run accepts at most {DORMANT_BATCH_MAX} samples per batch, got {len(batch_manifest)}"
         )
     if len(run_df) == 0:
         return run_df.copy()
@@ -685,19 +690,24 @@ def deduplicate_dev_os_baseline(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep_mask].reset_index(drop=True)
 
 
+def _canon_family(val: Any) -> str:
+    s = _norm_s(val)
+    return canonicalize_family_name(s) if s else ""
+
+
 def assign_v2_splits(
     df: pd.DataFrame,
     blind_test_families: Sequence[str] = (),
     blind_test_clusters: Sequence[str] = (),
     blind_test_benign_runs: Sequence[str] = (),
 ) -> pd.DataFrame:
-    """Assign leakage-proof `split_pool` keeping paired binaries, families & clusters together."""
+    """Assign leakage-proof `split_pool` keeping canonical family aliases, paired binaries & clusters together."""
     out = df.copy()
-    bt_fams_seed = {str(f).lower() for f in blind_test_families if f}
+    bt_fams_seed = {canonicalize_family_name(str(f)) for f in blind_test_families if f and canonicalize_family_name(str(f))}
     bt_clus_seed = {str(c).lower() for c in blind_test_clusters if c}
     bt_runs = {str(r).lower() for r in blind_test_benign_runs if r}
 
-    # Expand closure across (sample_family, packer_cluster, sample_sha256, pair_group_id)
+    # Expand closure across (canonical sample_family, packer_cluster, sample_sha256, pair_group_id)
     pos_mask = out[config.LABEL_COL] == config.POSITIVE_LABEL
     bt_shas: set[str] = set()
     bt_pairs: set[str] = set()
@@ -710,7 +720,7 @@ def assign_v2_splits(
         for _, r in out[pos_mask].iterrows():
             if _norm_s(r.get("stratum")) == "emulated":
                 continue
-            fam = _norm_s(r.get("sample_family"))
+            fam = _canon_family(r.get("sample_family"))
             clu = _norm_s(r.get("packer_cluster"))
             sha = _norm_s(r.get("sample_sha256"))
             pid = _norm_s(r.get("pair_group_id"))
@@ -731,7 +741,7 @@ def assign_v2_splits(
     for _, r in out[pos_mask].iterrows():
         if _norm_s(r.get("stratum")) == "emulated":
             continue
-        fam = _norm_s(r.get("sample_family"))
+        fam = _canon_family(r.get("sample_family"))
         clu = _norm_s(r.get("packer_cluster"))
         sha = _norm_s(r.get("sample_sha256"))
         pid = _norm_s(r.get("pair_group_id"))
@@ -751,7 +761,7 @@ def assign_v2_splits(
             pools.append("dev")
             continue
         if lbl == config.POSITIVE_LABEL:
-            fam = _norm_s(r.get("sample_family"))
+            fam = _canon_family(r.get("sample_family"))
             clu = _norm_s(r.get("packer_cluster"))
             sha = _norm_s(r.get("sample_sha256"))
             pid = _norm_s(r.get("pair_group_id"))
@@ -772,6 +782,11 @@ def assign_v2_splits(
     dev_sub = out[out["split_pool"] == "dev"]
     test_sub = out[out["split_pool"] == "test"]
     assert not any(_norm_s(s) == "emulated" for s in test_sub.get("stratum", [])), "v1 emulated row in blind test!"
+
+    if "sample_family" in out.columns:
+        d_canon = {_canon_family(v) for v in dev_sub[dev_sub[config.LABEL_COL] == config.POSITIVE_LABEL]["sample_family"] if _canon_family(v)}
+        t_canon = {_canon_family(v) for v in test_sub[test_sub[config.LABEL_COL] == config.POSITIVE_LABEL]["sample_family"] if _canon_family(v)}
+        assert d_canon.isdisjoint(t_canon), f"Split leakage across canonical sample_family: {d_canon & t_canon}"
 
     for col in ("sample_family", "packer_cluster", "sample_sha256", "pair_group_id"):
         if col in out.columns:
