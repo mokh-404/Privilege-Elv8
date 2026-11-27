@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 from typing import Any, Mapping, Protocol, Sequence
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -112,6 +113,16 @@ class SampleFeedClient(Protocol):
     def download_sample_zip(self, sha256_hash: str) -> bytes: ...
 
 
+_SOFT_QUERY_STATUSES = (
+    "tag_not_found",
+    "sig_not_found",
+    "no_results",
+    "illegal_tag",
+    "illegal_signature",
+    "error",
+)
+
+
 class MalwareBazaarClient:
     """HTTP client for MalwareBazaar v1 API using runtime `Auth-Key` from environment."""
 
@@ -137,11 +148,57 @@ class MalwareBazaarClient:
             return resp.read()
 
     def query_tag(self, tag: str, limit: int = 50) -> list[dict[str, Any]]:
-        raw = self._post({"query": "get_taginfo", "tag": str(tag), "limit": int(limit)})
-        payload = json.loads(raw.decode("utf-8"))
-        if payload.get("query_status") not in ("ok", "tag_not_found", "no_results"):
-            raise RuntimeError(f"MalwareBazaar get_taginfo failed for tag={tag!r}: {payload.get('query_status')!r}")
-        return list(payload.get("data") or [])
+        payload: dict[str, Any] | None = None
+        need_fallback = False
+        try:
+            raw = self._post({"query": "get_taginfo", "tag": str(tag), "limit": int(limit)})
+            payload = json.loads(raw.decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            print(
+                f"[WARN] MalwareBazaar get_taginfo failed for tag={tag!r} ({exc}); falling back to get_siginfo.",
+                file=sys.stderr,
+            )
+            need_fallback = True
+
+        if not need_fallback and payload is not None:
+            status = str(payload.get("query_status") or "")
+            if status == "ok":
+                return list(payload.get("data") or [])
+            if status == "error":
+                print(
+                    f"[WARN] MalwareBazaar get_taginfo returned query_status='error' for tag={tag!r}; falling back to get_siginfo.",
+                    file=sys.stderr,
+                )
+                need_fallback = True
+            elif status in _SOFT_QUERY_STATUSES:
+                print(
+                    f"[WARN] MalwareBazaar get_taginfo for tag={tag!r} returned {status!r}; returning [].",
+                    file=sys.stderr,
+                )
+                return []
+            else:
+                raise RuntimeError(f"MalwareBazaar get_taginfo failed for tag={tag!r}: {status!r}")
+
+        try:
+            raw_fb = self._post({"query": "get_siginfo", "signature": str(tag), "limit": int(limit)})
+            payload_fb = json.loads(raw_fb.decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            print(
+                f"[WARN] MalwareBazaar get_siginfo fallback failed for signature={tag!r} ({exc}); returning [].",
+                file=sys.stderr,
+            )
+            return []
+
+        status_fb = str(payload_fb.get("query_status") or "")
+        if status_fb == "ok":
+            return list(payload_fb.get("data") or [])
+        if status_fb in _SOFT_QUERY_STATUSES:
+            print(
+                f"[WARN] MalwareBazaar get_siginfo fallback for signature={tag!r} returned {status_fb!r}; returning [].",
+                file=sys.stderr,
+            )
+            return []
+        raise RuntimeError(f"MalwareBazaar get_siginfo failed for signature={tag!r}: {status_fb!r}")
 
     def download_sample_zip(self, sha256_hash: str) -> bytes:
         raw = self._post({"query": "get_file", "sha256_hash": str(sha256_hash).lower()})
@@ -291,6 +348,55 @@ def _persistence_score(entry: Mapping[str, Any], family_slug: str) -> tuple[int,
     return (hint_hits, reasonable_size)
 
 
+def _filter_and_rank_category_candidates(
+    cat: str,
+    items: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Filter eligible standalone-.exe candidates in `cat`, deduplicate by SHA-256, and sort descending."""
+    if check_forbidden_malware_policy(sample_category=cat, require_allowlist=False) is not None:
+        return []
+    best_by_sha: dict[str, dict[str, Any]] = {}
+    for raw in items:
+        sha = str(raw.get("sha256_hash") or raw.get("sha256") or "").lower().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            continue
+        if not _is_windows_pe_candidate(raw):
+            continue
+        fam = canonicalize_family_name(canonical_family_slug(raw.get("signature"), raw.get("tags")))
+        if not fam or fam == "unknownfamily" or fam not in CANONICAL_ALLOWED_FAMILIES:
+            continue
+        if check_forbidden_malware_policy(
+            sample_family=fam,
+            sample_category=cat,
+            tags=raw.get("tags") or (),
+            raw_signature=raw.get("signature"),
+            require_allowlist=True,
+        ) is not None:
+            continue
+        cluster_id = assign_near_dup_cluster(raw)
+        rec = dict(raw)
+        rec["_category"] = cat
+        rec["_sha256"] = sha
+        rec["_family"] = fam
+        rec["_cluster"] = cluster_id
+        rec["_score"] = _persistence_score(raw, fam)
+        prev = best_by_sha.get(sha)
+        if prev is None or (rec["_score"], rec["_sha256"]) > (prev["_score"], prev["_sha256"]):
+            best_by_sha[sha] = rec
+    ranked = list(best_by_sha.values())
+    ranked.sort(key=lambda r: (r["_score"], r["_sha256"]), reverse=True)
+    return ranked
+
+
+def _filter_and_rank_candidates(
+    candidates_by_category: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    ranked_by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for cat, items in candidates_by_category.items():
+        ranked_by_cat[cat] = _filter_and_rank_category_candidates(cat, items)
+    return ranked_by_cat
+
+
 def select_pilot_families(
     candidates_by_category: Mapping[str, Sequence[Mapping[str, Any]]],
     target_families: int = 7,
@@ -306,36 +412,7 @@ def select_pilot_families(
     family_counts: dict[str, int] = {}
     selected: list[dict[str, Any]] = []
 
-    ranked_by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for cat, items in candidates_by_category.items():
-        if check_forbidden_malware_policy(sample_category=cat, require_allowlist=False) is not None:
-            continue
-        for raw in items:
-            sha = str(raw.get("sha256_hash") or raw.get("sha256") or "").lower().strip()
-            if not re.fullmatch(r"[0-9a-f]{64}", sha):
-                continue
-            if not _is_windows_pe_candidate(raw):
-                continue
-            fam = canonicalize_family_name(canonical_family_slug(raw.get("signature"), raw.get("tags")))
-            if not fam or fam == "unknownfamily" or fam not in CANONICAL_ALLOWED_FAMILIES:
-                continue
-            if check_forbidden_malware_policy(
-                sample_family=fam,
-                sample_category=cat,
-                tags=raw.get("tags") or (),
-                raw_signature=raw.get("signature"),
-                require_allowlist=True,
-            ) is not None:
-                continue
-            cluster_id = assign_near_dup_cluster(raw)
-            rec = dict(raw)
-            rec["_category"] = cat
-            rec["_sha256"] = sha
-            rec["_family"] = fam
-            rec["_cluster"] = cluster_id
-            rec["_score"] = _persistence_score(raw, fam)
-            ranked_by_cat[cat].append(rec)
-        ranked_by_cat[cat].sort(key=lambda r: (r["_score"], r["_sha256"]), reverse=True)
+    ranked_by_cat = _filter_and_rank_candidates(candidates_by_category)
 
     categories = list(candidates_by_category.keys())
     progress = True
@@ -512,6 +589,42 @@ def build_pilot_batch_specs(
     return batch
 
 
+def _build_curated_record(
+    rec: Mapping[str, Any],
+    archive_path: Path,
+    pe_info: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble standardized curated vault metadata entry (shared across plan_only and download paths)."""
+    sha = rec["_sha256"]
+    fam = rec["_family"]
+    cat = rec["_category"]
+    ssdeep_val = rec.get("ssdeep")
+    tlsh_val = rec.get("tlsh")
+    imphash = rec.get("imphash")
+    if pe_info:
+        imphash = imphash or pe_info.get("imphash")
+        ssdeep_val = ssdeep_val or pe_info.get("ppdeep")
+        tlsh_val = tlsh_val or pe_info.get("tlsh")
+    return {
+        "sample_sha256": sha,
+        "sample_family": fam,
+        "raw_signature": rec.get("signature"),
+        "category": cat,
+        "file_name": rec.get("file_name"),
+        "file_type": rec.get("file_type"),
+        "file_size": rec.get("file_size"),
+        "imphash": str(imphash).lower() if imphash else None,
+        "tlsh": tlsh_val,
+        "ssdeep": ssdeep_val,
+        "near_dup_cluster_id": rec["_cluster"],
+        "tags": list(rec.get("tags") or ()),
+        "vault_archive_path": str(archive_path),
+        "archive_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest().lower() if archive_path.exists() else None,
+        "split_pool": "dev",
+        "pilot_only_exclude_from_blind_test": True,
+    }
+
+
 def curate_pilot_vault_and_batch(
     vault_root: str | Path = DEFAULT_VAULT_ROOT,
     setup_script: str | Path = DEFAULT_SETUP_SCRIPT,
@@ -544,82 +657,170 @@ def curate_pilot_vault_and_batch(
             )
         client = MalwareBazaarClient(api_key=api_key)
 
-    candidates_by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for cat, tags in CATEGORY_SEARCH_TAGS:
-        for tag in tags:
-            rows = client.query_tag(tag, limit=query_limit)
-            candidates_by_cat[cat].extend(rows)
+    eff_target_samples = int(target_samples if target_samples is not None else target_families)
+    eff_max_per_fam = max(1, int(max_per_family))
+    fast_tag_mode = (target_samples is None and eff_max_per_fam == 1)
+    fast_fam_threshold = max(3, (int(target_families) // 5) + 2)
 
-    selected = select_pilot_families(
-        candidates_by_cat,
-        target_families=target_families,
-        max_per_family=max_per_family,
-        target_samples=target_samples,
-    )
-    if len({r["_family"] for r in selected}) < int(min_families):
-        raise RuntimeError(
-            f"Expected >= {min_families} distinct non-destructive standalone-.exe families, curated only {len(selected)}."
-        )
+    remaining_tags_by_cat: dict[str, list[str]] = {cat: list(tags) for cat, tags in CATEGORY_SEARCH_TAGS}
+    candidates_by_cat: dict[str, list[dict[str, Any]]] = {cat: [] for cat, _ in CATEGORY_SEARCH_TAGS}
+
+    def _category_fast_ready(cat_name: str) -> bool:
+        ranked = _filter_and_rank_category_candidates(cat_name, candidates_by_cat[cat_name])
+        fam_shas: dict[str, set[str]] = defaultdict(set)
+        for cand in ranked:
+            fam_shas[cand["_family"]].add(cand["_sha256"])
+        return sum(1 for shas in fam_shas.values() if len(shas) >= 3) >= fast_fam_threshold
+
+    def _query_next_tag_for_cat(cat_name: str) -> bool:
+        rem = remaining_tags_by_cat.get(cat_name)
+        if not rem:
+            return False
+        tag = rem.pop(0)
+        candidates_by_cat[cat_name].extend(client.query_tag(tag, limit=query_limit))
+        return True
+
+    for cat, _ in CATEGORY_SEARCH_TAGS:
+        while remaining_tags_by_cat[cat]:
+            _query_next_tag_for_cat(cat)
+            if fast_tag_mode and _category_fast_ready(cat):
+                break
 
     curated_records: list[dict[str, Any]] = []
-    for rec in selected:
-        sha = rec["_sha256"]
-        fam = rec["_family"]
-        cat = rec["_category"]
-        assert_allowed_malware_policy(
-            sample_family=fam,
-            sample_category=cat,
-            tags=rec.get("tags") or (),
-            raw_signature=rec.get("signature"),
+    if plan_only:
+        selected = select_pilot_families(
+            candidates_by_cat,
+            target_families=target_families,
+            max_per_family=max_per_family,
+            target_samples=target_samples,
         )
-        archive_path = archives_dir / f"{sha}.zip"
-        ssdeep_val = rec.get("ssdeep")
-        tlsh_val = rec.get("tlsh")
-        imphash = rec.get("imphash")
+        if len(selected) < eff_target_samples or len({r["_family"] for r in selected}) < int(min_families):
+            for cat, _ in CATEGORY_SEARCH_TAGS:
+                while remaining_tags_by_cat[cat]:
+                    _query_next_tag_for_cat(cat)
+            selected = select_pilot_families(
+                candidates_by_cat,
+                target_families=target_families,
+                max_per_family=max_per_family,
+                target_samples=target_samples,
+            )
+        if len({r["_family"] for r in selected}) < int(min_families):
+            raise RuntimeError(
+                f"Expected >= {min_families} distinct non-destructive standalone-.exe families, curated only {len(selected)}."
+            )
+        for rec in selected:
+            assert_allowed_malware_policy(
+                sample_family=rec["_family"],
+                sample_category=rec["_category"],
+                tags=rec.get("tags") or (),
+                raw_signature=rec.get("signature"),
+            )
+            curated_records.append(_build_curated_record(rec, archives_dir / f"{rec['_sha256']}.zip"))
+    else:
+        ranked_by_cat: dict[str, list[dict[str, Any]]] = _filter_and_rank_candidates(candidates_by_cat)
+        attempted_hashes: set[str] = set()
+        committed_hashes: set[str] = set()
+        committed_clusters: set[str] = set()
+        family_counts: dict[str, int] = {}
+        skipped_reasons: list[str] = []
+        had_pilot_staging_error = False
 
-        if not plan_only:
+        def _is_eligible(rec: Mapping[str, Any]) -> bool:
+            sha = rec["_sha256"]
+            fam = rec["_family"]
+            clu = rec["_cluster"]
+            cur_count = family_counts.get(fam, 0)
+            if cur_count == 0 and len(family_counts) >= int(target_families):
+                return False
+            return not (
+                sha in attempted_hashes
+                or sha in committed_hashes
+                or clu in committed_clusters
+                or cur_count >= eff_max_per_fam
+            )
+
+        def _try_download_and_validate(rec: Mapping[str, Any]) -> dict[str, Any] | None:
+            nonlocal had_pilot_staging_error
+            sha = rec["_sha256"]
+            fam = rec["_family"]
+            cat = rec["_category"]
+            archive_path = archives_dir / f"{sha}.zip"
             tmp_zip = archives_dir / f".tmp_{sha}.zip"
-            src_to_read = archive_path if archive_path.exists() else tmp_zip
-            if not archive_path.exists():
-                zip_bytes = client.download_sample_zip(sha)
-                tmp_zip.write_bytes(zip_bytes)
             try:
+                assert_allowed_malware_policy(
+                    sample_family=fam,
+                    sample_category=cat,
+                    tags=rec.get("tags") or (),
+                    raw_signature=rec.get("signature"),
+                )
+                src_to_read = archive_path if archive_path.exists() else tmp_zip
+                if not archive_path.exists():
+                    zip_bytes = client.download_sample_zip(sha)
+                    tmp_zip.write_bytes(zip_bytes)
                 # Decrypt strictly in RAM to verify SHA-256 & standalone runnable .exe PE gate BEFORE saving to vault
                 payload_ram = read_vault_payload_in_memory(src_to_read, password=archive_password)
                 ram_sha = hashlib.sha256(payload_ram).hexdigest().lower()
                 if ram_sha != sha:
                     raise PilotStagingError(f"Downloaded payload SHA-256 mismatch for {fam}: {ram_sha} != {sha}")
                 pe_info = validate_standalone_runnable_exe_pe(payload_ram)
-            except Exception:
+            except Exception as exc:
                 if tmp_zip.exists():
                     tmp_zip.unlink()
-                raise
+                if isinstance(exc, PilotStagingError):
+                    had_pilot_staging_error = True
+                skipped_reasons.append(f"{sha[:12]} ({fam}): {exc}")
+                print(f"[WARN] Skipping candidate {sha} ({fam}): {exc}", file=sys.stderr)
+                return None
 
             if tmp_zip.exists():
                 tmp_zip.replace(archive_path)
             os.chmod(archive_path, 0o400)
-            imphash = imphash or pe_info.get("imphash")
-            ssdeep_val = ssdeep_val or pe_info.get("ppdeep")
-            tlsh_val = tlsh_val or pe_info.get("tlsh")
+            return _build_curated_record(rec, archive_path, pe_info=pe_info)
 
-        curated_records.append({
-            "sample_sha256": sha,
-            "sample_family": fam,
-            "raw_signature": rec.get("signature"),
-            "category": cat,
-            "file_name": rec.get("file_name"),
-            "file_type": rec.get("file_type"),
-            "file_size": rec.get("file_size"),
-            "imphash": str(imphash).lower() if imphash else None,
-            "tlsh": tlsh_val,
-            "ssdeep": ssdeep_val,
-            "near_dup_cluster_id": rec["_cluster"],
-            "tags": list(rec.get("tags") or ()),
-            "vault_archive_path": str(archive_path),
-            "archive_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest().lower() if archive_path.exists() else None,
-            "split_pool": "dev",
-            "pilot_only_exclude_from_blind_test": True,
-        })
+        def _pick_and_try_in_cat(cat_name: str) -> bool:
+            while True:
+                eligible = [r for r in ranked_by_cat[cat_name] if _is_eligible(r)]
+                if not eligible:
+                    if _query_next_tag_for_cat(cat_name):
+                        ranked_by_cat[cat_name] = _filter_and_rank_category_candidates(
+                            cat_name, candidates_by_cat[cat_name]
+                        )
+                        continue
+                    return False
+
+                tried_family = eligible[0]["_family"]
+                same_family_cands = [r for r in eligible if r["_family"] == tried_family]
+                for cand in same_family_cands:
+                    attempted_hashes.add(cand["_sha256"])
+                    res = _try_download_and_validate(cand)
+                    if res is not None:
+                        committed_hashes.add(cand["_sha256"])
+                        committed_clusters.add(cand["_cluster"])
+                        family_counts[tried_family] = family_counts.get(tried_family, 0) + 1
+                        curated_records.append(res)
+                        return True
+
+        categories = [cat for cat, _ in CATEGORY_SEARCH_TAGS]
+        progress = True
+        while len(curated_records) < eff_target_samples and progress:
+            progress = False
+            for cat in categories:
+                if len(curated_records) >= eff_target_samples:
+                    break
+                if _pick_and_try_in_cat(cat):
+                    progress = True
+
+        if len({r["sample_family"] for r in curated_records}) < int(min_families):
+            skip_detail = "; ".join(skipped_reasons[:5])
+            msg = (
+                f"Expected >= {min_families} distinct non-destructive standalone-.exe families, "
+                f"curated only {len(curated_records)}."
+            )
+            if skip_detail:
+                msg = f"{msg} Skipped candidates: {skip_detail}"
+            if had_pilot_staging_error and len(curated_records) == 0:
+                raise PilotStagingError(msg)
+            raise RuntimeError(msg)
 
     if not plan_only:
         _write_clean_sha256_manifest(archives_dir, vroot / "sample_manifest.sha256")

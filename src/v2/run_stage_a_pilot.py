@@ -303,7 +303,7 @@ def verify_canary_run_outputs(
             f"CANARY FAILED: --canary requires control, dormant, and executed runs; missing={missing_strata}"
         )
 
-    exec_sysmon_total = 0
+    manifests_by_run: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
     for rec in results_log:
         rdir = Path(rec["out_dir"])
         man_path = rdir / "extraction_manifest.json"
@@ -312,12 +312,31 @@ def verify_canary_run_outputs(
         man = json.loads(man_path.read_text(encoding="utf-8"))
         if int(man.get("total_records") or 0) <= 0:
             raise PilotStagingError(f"CANARY FAILED: Zero extracted records for run {rec['run_id']!r}")
+        manifests_by_run.append((rec, man))
+
+    max_control_sysmon = max(
+        (
+            int(man.get("sysmon_events_count") or 0)
+            for rec, man in manifests_by_run
+            if rec.get("stratum") == "control"
+        ),
+        default=0,
+    )
+
+    exec_sysmon_total = 0
+    for rec, man in manifests_by_run:
         if rec.get("stratum") == "executed":
-            if not man.get("sysmon_evtx_present") or int(man.get("sysmon_events_count") or 0) <= 0:
+            exec_cnt = int(man.get("sysmon_events_count") or 0)
+            if not man.get("sysmon_evtx_present") or exec_cnt <= 0:
                 raise PilotStagingError(
                     f"CANARY FAILED: Executed canary run {rec['run_id']!r} yielded 0 Sysmon EVTX events"
                 )
-            exec_sysmon_total += int(man.get("sysmon_events_count") or 0)
+            if exec_cnt <= max_control_sysmon:
+                raise PilotStagingError(
+                    f"CANARY FAILED: Executed canary run {rec['run_id']!r} Sysmon EVTX count ({exec_cnt}) "
+                    f"did not exceed control baseline ({max_control_sysmon})"
+                )
+            exec_sysmon_total += exec_cnt
 
     verified_dt = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     expires_dt = verified_dt + timedelta(seconds=int(ttl_seconds))
@@ -333,6 +352,7 @@ def verify_canary_run_outputs(
         "runs_out_dir": str(out_root),
         "n_canary_runs": len(results_log),
         "run_ids": [r["run_id"] for r in results_log],
+        "max_control_sysmon_events": max_control_sysmon,
         "executed_sysmon_events_total": exec_sysmon_total,
     }
     sp = Path(stamp_path)

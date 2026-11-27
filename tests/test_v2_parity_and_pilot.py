@@ -1697,3 +1697,283 @@ def test_warm_inetsim_reuse_and_per_stratum_dwell_defaults(tmp_path, monkeypatch
     assert cli_batch["dwell_seconds_control"] == 15
     assert cli_batch["dormant_batch_size"] == 1
     assert [r["spec"]["dwell_seconds"] for r in cli_batch["runs"]] == [15, 15, 45, 45, 45, 15, 15, 15]
+
+
+def test_resilient_query_tag_siginfo_fallback_and_soft_statuses(capsys):
+    import json
+    import urllib.error
+    from scripts.v2_curate_vault_manifest import MalwareBazaarClient
+
+    # 1. get_taginfo returns {"query_status": "error"} -> falls back once to get_siginfo and returns data
+    calls_1: list[dict[str, object]] = []
+    mb1 = MalwareBazaarClient(api_key="test_key")
+
+    def _post_1(fields):
+        calls_1.append(dict(fields))
+        if fields.get("query") == "get_taginfo":
+            return json.dumps({"query_status": "error"}).encode("utf-8")
+        assert fields == {"query": "get_siginfo", "signature": "AgentTesla", "limit": 50}
+        return json.dumps({"query_status": "ok", "data": [{"sha256_hash": "a" * 64}]}).encode("utf-8")
+
+    mb1._post = _post_1  # type: ignore[method-assign]
+    rows_1 = mb1.query_tag("AgentTesla", limit=50)
+    assert len(rows_1) == 1 and rows_1[0]["sha256_hash"] == "a" * 64
+    assert [c["query"] for c in calls_1] == ["get_taginfo", "get_siginfo"]
+
+    # 2. Transient URLError on get_taginfo -> falls back once to get_siginfo
+    calls_2: list[dict[str, object]] = []
+    mb2 = MalwareBazaarClient(api_key="test_key")
+
+    def _post_2(fields):
+        calls_2.append(dict(fields))
+        if fields.get("query") == "get_taginfo":
+            raise urllib.error.URLError("timed out")
+        return json.dumps({"query_status": "ok", "data": [{"sha256_hash": "b" * 64}]}).encode("utf-8")
+
+    mb2._post = _post_2  # type: ignore[method-assign]
+    rows_2 = mb2.query_tag("LummaC2", limit=40)
+    assert len(rows_2) == 1 and rows_2[0]["sha256_hash"] == "b" * 64
+    assert [c["query"] for c in calls_2] == ["get_taginfo", "get_siginfo"]
+
+    # 3. Both get_taginfo and get_siginfo return soft failure statuses or network errors -> warn & return []
+    mb3 = MalwareBazaarClient(api_key="test_key")
+    mb3._post = lambda _f: json.dumps({"query_status": "error"}).encode("utf-8")  # type: ignore[method-assign]
+    assert mb3.query_tag("AgentTesla") == []
+    assert "get_siginfo" in capsys.readouterr().err
+
+    mb3._post = lambda f: json.dumps(  # type: ignore[method-assign]
+        {"query_status": "error" if f.get("query") == "get_taginfo" else "sig_not_found"}
+    ).encode("utf-8")
+    assert mb3.query_tag("UnknownSig") == []
+    assert "sig_not_found" in capsys.readouterr().err
+
+    def _post_both_fail(fields):
+        raise TimeoutError("network timeout")
+
+    mb3._post = _post_both_fail  # type: ignore[method-assign]
+    assert mb3.query_tag("TimeoutSig") == []
+    assert "TimeoutSig" in capsys.readouterr().err
+
+
+def test_curator_skips_disguised_dll_curates_backup_and_uses_stage_a_fast_query(tmp_path, capsys):
+    import json
+    import os
+    from scripts.v2_curate_vault_manifest import CATEGORY_SEARCH_TAGS, curate_pilot_vault_and_batch
+
+    repo = Path(__file__).resolve().parent.parent
+    setup_script = repo / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    vault_dir = tmp_path / "vault_dll_backup"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
+    marker = vault_dir / "GATE0_SIGNED_OFF"
+    marker.write_text(
+        "SIGNED_BY=Mokh\nDATE=2026-11-27\nSUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\nDEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o400)
+
+    # Top-ranked redline candidate is a DLL disguised as .exe (higher persistence score via multiple hint tokens)
+    dll_bytes = _synth_unsigned_pe_bytes(701, 16384, is_dll=True)
+    dll_sha = hashlib.sha256(dll_bytes).hexdigest()
+    dll_zip = _make_aes256_zip(tmp_path, "redline_bad", dll_bytes).read_bytes()
+
+    exe_bytes = _synth_unsigned_pe_bytes(702, 16896, is_dll=False)
+    exe_sha = hashlib.sha256(exe_bytes).hexdigest()
+    exe_zip = _make_aes256_zip(tmp_path, "redline_good", exe_bytes).read_bytes()
+
+    class _BackupFeed:
+        def query_tag(self, tag: str, limit: int = 50):
+            if tag == "RedLine":
+                return [
+                    {
+                        "sha256_hash": dll_sha,
+                        "signature": "RedLine",
+                        "file_name": "redline_bad.exe",
+                        "file_type": "exe",
+                        "file_size": len(dll_bytes),
+                        "imphash": "1" * 32,
+                        "tags": ["redline", "persist", "startup", "run", "scheduled"],
+                    },
+                    {
+                        "sha256_hash": exe_sha,
+                        "signature": "RedLine",
+                        "file_name": "redline_good.exe",
+                        "file_type": "exe",
+                        "file_size": len(exe_bytes),
+                        "imphash": "2" * 32,
+                        "tags": ["redline"],
+                    },
+                ]
+            return []
+
+        def download_sample_zip(self, sha256_hash: str) -> bytes:
+            return {"dl": dll_zip, "ex": exe_zip}[
+                "dl" if sha256_hash.lower() == dll_sha else "ex"
+            ]
+
+    out = curate_pilot_vault_and_batch(
+        vault_root=vault_dir,
+        setup_script=setup_script,
+        target_families=1,
+        min_families=1,
+        n_control_boots=1,
+        client=_BackupFeed(),
+        plan_only=False,
+    )
+    err_txt = capsys.readouterr().err
+    assert "Skipping candidate" in err_txt and "IMAGE_FILE_DLL" in err_txt
+    assert out["families"] == ["redline"]
+    assert not (vault_dir / "archives" / f"{dll_sha}.zip").exists()
+    assert not list((vault_dir / "archives").glob(".tmp_*.zip"))
+    assert (vault_dir / "archives" / f"{exe_sha}.zip").exists()
+    manifest_obj = json.loads(Path(out["vault_manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest_obj["samples"][0]["sample_sha256"] == exe_sha
+
+    # Fast tag-query mode for Stage A: stops querying extra tags in stealer once >= 3 canonical families
+    # have >= 3 candidates each, and only queries remaining tags if downloads exhaust initial candidates.
+    vault_fast = tmp_path / "vault_fast"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_fast)), check=True)
+    m_fast = vault_fast / "GATE0_SIGNED_OFF"
+    m_fast.write_text(marker.read_text(encoding="utf-8"), encoding="utf-8")
+    os.chmod(m_fast, 0o400)
+
+    fast_zips: dict[str, bytes] = {}
+    rows_by_tag: dict[str, list[dict[str, object]]] = {}
+    for f_idx, (fam, tag_name) in enumerate((("redline", "RedLine"), ("lumma", "LummaC2"), ("vidar", "Vidar"))):
+        rows_by_tag[tag_name] = []
+        for c_idx in range(3):
+            raw_b = _synth_unsigned_pe_bytes(800 + f_idx * 10 + c_idx, 16384 + c_idx * 512, is_dll=False)
+            sha_b = hashlib.sha256(raw_b).hexdigest()
+            fast_zips[sha_b] = _make_aes256_zip(tmp_path, f"f_{fam}_{c_idx}", raw_b).read_bytes()
+            rows_by_tag[tag_name].append({
+                "sha256_hash": sha_b,
+                "signature": fam,
+                "file_name": f"{fam}_{c_idx}.exe",
+                "file_type": "exe",
+                "file_size": len(raw_b),
+                "imphash": f"{f_idx + 1}{c_idx + 1:031x}",
+                "tags": [fam],
+            })
+
+    # Also test lazy fallback when initial stealer families all fail download/validation:
+    # RedLine hits only appear on tag "Vidar" as >=3 families if AgentTesla isn't queried initially!
+    # Wait: let's add a later tag "SnakeKeylogger" that must NOT be queried when Vidar already satisfies >=3 families with >=3 cands.
+    queried_tags: list[str] = []
+
+    class _FastModeFeed:
+        def query_tag(self, tag: str, limit: int = 50):
+            queried_tags.append(tag)
+            return list(rows_by_tag.get(tag, []))
+
+        def download_sample_zip(self, sha256_hash: str) -> bytes:
+            return fast_zips[sha256_hash.lower()]
+
+    stealer_tags = dict(CATEGORY_SEARCH_TAGS)["stealer"]
+    curate_pilot_vault_and_batch(
+        vault_root=vault_fast,
+        setup_script=setup_script,
+        target_families=3,
+        min_families=3,
+        n_control_boots=1,
+        client=_FastModeFeed(),
+        plan_only=False,
+    )
+    # "RedLine" (idx 0), "LummaC2" (idx 1), "AgentTesla" (idx 3), "Vidar" (idx 4) -> 3 ready families => stopped before "Raccoon" / "SnakeKeylogger"!
+    assert "Vidar" in queried_tags
+    assert "SnakeKeylogger" not in queried_tags
+    assert "Lokibot" not in queried_tags
+    assert len(queried_tags) < sum(len(t) for _, t in CATEGORY_SEARCH_TAGS)
+
+    # When downloads exhaust initial candidates in fast mode, remaining tags in that category ARE queried lazily
+    vault_exhaust = tmp_path / "vault_exhaust"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_exhaust)), check=True)
+    m_exh = vault_exhaust / "GATE0_SIGNED_OFF"
+    m_exh.write_text(marker.read_text(encoding="utf-8"), encoding="utf-8")
+    os.chmod(m_exh, 0o400)
+
+    snake_raw = _synth_unsigned_pe_bytes(899, 16384, is_dll=False)
+    snake_sha = hashlib.sha256(snake_raw).hexdigest()
+    snake_zip = _make_aes256_zip(tmp_path, "snake_ok", snake_raw).read_bytes()
+    rows_exhaust = {
+        **rows_by_tag,
+        "SnakeKeylogger": [{
+            "sha256_hash": snake_sha,
+            "signature": "SnakeKeylogger",
+            "file_name": "snake.exe",
+            "file_type": "exe",
+            "file_size": len(snake_raw),
+            "imphash": "9" * 32,
+            "tags": ["snakekeylogger"],
+        }],
+    }
+    queried_exh: list[str] = []
+
+    class _ExhaustThenRecoverFeed:
+        def query_tag(self, tag: str, limit: int = 50):
+            queried_exh.append(tag)
+            return list(rows_exhaust.get(tag, []))
+
+        def download_sample_zip(self, sha256_hash: str) -> bytes:
+            if sha256_hash.lower() == snake_sha:
+                return snake_zip
+            raise RuntimeError("transient download failure")
+
+    out_exh = curate_pilot_vault_and_batch(
+        vault_root=vault_exhaust,
+        setup_script=setup_script,
+        target_families=1,
+        min_families=1,
+        n_control_boots=1,
+        client=_ExhaustThenRecoverFeed(),
+        plan_only=False,
+    )
+    assert "SnakeKeylogger" in queried_exh
+    assert out_exh["families"] == ["snakekeylogger"]
+
+
+def test_verify_canary_requires_positive_sysmon_delta_over_control(tmp_path):
+    import json
+    from src.v2.run_stage_a_pilot import verify_canary_run_outputs
+
+    def _mk_runs(ctrl_cnt: int, dorm_cnt: int, exec_cnt: int, tag: str):
+        base = tmp_path / tag
+        specs = [("c_ctrl", "control", ctrl_cnt, False), ("c_dorm", "dormant", dorm_cnt, False), ("c_exec", "executed", exec_cnt, True)]
+        rlog = []
+        for rid, strat, cnt, evtx_ok in specs:
+            rdir = base / rid
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "extraction_manifest.json").write_text(
+                json.dumps({
+                    "run_id": rid,
+                    "total_records": 4413,
+                    "sysmon_evtx_present": evtx_ok,
+                    "sysmon_events_count": cnt,
+                }),
+                encoding="utf-8",
+            )
+            rlog.append({"run_id": rid, "stratum": strat, "out_dir": str(rdir)})
+        return rlog, base
+
+    common = dict(
+        batch_json_sha256="a" * 64,
+        base_image_sha256="b" * 64,
+        git_head="c" * 40,
+        git_dirty=False,
+    )
+
+    # Equal to 7306 control baseline -> MUST fail
+    logs_eq, dir_eq = _mk_runs(7306, 7306, 7306, "eq")
+    with pytest.raises(PilotStagingError, match="did not exceed control baseline"):
+        verify_canary_run_outputs(logs_eq, dir_eq, dir_eq / "CANARY_PASSED", **common)
+
+    # Below 7306 control baseline -> MUST fail
+    logs_lt, dir_lt = _mk_runs(7306, 7306, 7300, "lt")
+    with pytest.raises(PilotStagingError, match="did not exceed control baseline"):
+        verify_canary_run_outputs(logs_lt, dir_lt, dir_lt / "CANARY_PASSED", **common)
+
+    # Strictly above 7306 control baseline -> PASSES
+    logs_gt, dir_gt = _mk_runs(7306, 7306, 7342, "gt")
+    stamp = verify_canary_run_outputs(logs_gt, dir_gt, dir_gt / "CANARY_PASSED", **common)
+    assert stamp["status"] == "PASS"
+    assert stamp["max_control_sysmon_events"] == 7306
+    assert stamp["executed_sysmon_events_total"] == 7342
