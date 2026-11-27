@@ -1977,3 +1977,64 @@ def test_verify_canary_requires_positive_sysmon_delta_over_control(tmp_path):
     assert stamp["status"] == "PASS"
     assert stamp["max_control_sysmon_events"] == 7306
     assert stamp["executed_sysmon_events_total"] == 7342
+
+
+def test_relative_runs_out_dir_resolves_absolute_iso_and_dac_modes(tmp_path, monkeypatch):
+    import stat
+
+    monkeypatch.chdir(tmp_path)
+    rel_runs_dir = Path("runs/stage_a_pilot")
+    expected_root = (tmp_path / rel_runs_dir).resolve()
+    ctrl_batch = [
+        {
+            "spec": StageRunSpec(
+                run_id="pilot_ctrl_01",
+                stratum="control",
+                benign_profile_id="B_dev_01",
+                dwell_seconds=15,
+            ).__dict__,
+            "vault_file": None,
+        }
+    ]
+
+    observed_attach_iso: list[str] = []
+    observed_extract_out: list[str] = []
+    observed_modes: dict[str, int] = {}
+
+    def _inspect_cmd(cmd: list[str], _env=None) -> int:
+        if len(cmd) >= 6 and cmd[:4] == ["sudo", "virsh", "-c", "qemu:///system"] and cmd[4] == "attach-disk":
+            iso_arg = cmd[6]
+            observed_attach_iso.append(iso_arg)
+            iso_file = Path(iso_arg)
+            stage_dir = iso_file.parent
+            stage_root = stage_dir.parent
+            out_dir = stage_root.parent
+            assert iso_file.is_file()
+            observed_modes["out_root"] = stat.S_IMODE(out_dir.stat().st_mode)
+            observed_modes["stage_root"] = stat.S_IMODE(stage_root.stat().st_mode)
+            observed_modes["stage_dir"] = stat.S_IMODE(stage_dir.stat().st_mode)
+            observed_modes["iso_file"] = stat.S_IMODE(iso_file.stat().st_mode)
+        elif cmd and cmd[0].endswith("06_unprivileged_container_runner.sh"):
+            observed_extract_out.append(cmd[2])
+        return 0
+
+    res = execute_stage_a_pilot_batch(
+        batch_runs=ctrl_batch,
+        runs_out_dir=rel_runs_dir,
+        inetsim_wait_seconds=0,
+        run_cmd=_inspect_cmd,
+        sleep_fn=lambda _s: None,
+    )
+    assert len(res) == 1
+    assert len(observed_attach_iso) == 1
+    assert observed_attach_iso[0].startswith("/")
+    assert observed_attach_iso[0] == str(expected_root / "_staging_iso" / "pilot_ctrl_01" / "run_stage_pilot_ctrl_01.iso")
+    assert len(observed_extract_out) == 1 and observed_extract_out[0].startswith("/")
+    assert observed_extract_out[0] == str(expected_root / "pilot_ctrl_01")
+    assert res[0]["out_dir"] == str(expected_root / "pilot_ctrl_01")
+    assert observed_modes == {
+        "out_root": 0o755,
+        "stage_root": 0o755,
+        "stage_dir": 0o755,
+        "iso_file": 0o644,
+    }

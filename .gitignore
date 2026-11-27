@@ -23,3 +23,6 @@ data/interim/*
 # Dry-run provenance and machine-local lab credentials/paths stay private.
 lab_automation/provenance/dry_runs/
 lab_automation/lab_config.yaml
+
+# Stage A/B pilot & collection run outputs (staging ISOs, manifests, parquet extracts)
+/runs/

@@ -517,12 +517,20 @@ def execute_stage_a_pilot_batch(
     watchdog_script = repo_root / "docs" / "v2" / "hardening" / "04_watchdog_and_base_hash.sh"
     bake_script = repo_root / "docs" / "v2" / "hardening" / "00_bake_v2_base_image.sh"
     vault_script = repo_root / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
-    out_root = Path(runs_out_dir)
+    out_root = Path(runs_out_dir).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    if out_root.parent != repo_root and out_root.parent.is_relative_to(repo_root):
+        os.chmod(out_root.parent, 0o755)
+    os.chmod(out_root, 0o755)
     stage_tmp_root = out_root / "_staging_iso"
     stage_tmp_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(stage_tmp_root, 0o755)
     vroot = Path(vault_root).expanduser()
-    eff_canary_stamp = Path(canary_stamp_path) if canary_stamp_path is not None else (out_root / "CANARY_PASSED")
+    eff_canary_stamp = (
+        Path(canary_stamp_path).expanduser().resolve()
+        if canary_stamp_path is not None
+        else (out_root / "CANARY_PASSED")
+    )
     checkpoint_path = out_root / "completed_runs.jsonl"
     egress_audit_path = out_root / "egress_audit.jsonl"
 
@@ -686,6 +694,9 @@ def execute_stage_a_pilot_batch(
                     benign_pools_root=benign_pools_root,
                     require_real_pools=eff_require_real_pools,
                 )
+
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(stage_dir, 0o755)
 
             attach_cmd = [
                 "sudo", "virsh", "-c", libvirt_uri, "attach-disk",

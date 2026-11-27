@@ -674,10 +674,12 @@ def build_stage_iso(iso_path: str | Path, volume_label: str, files: Mapping[str,
                             spath.unlink()
                         except Exception:
                             pass
+        os.chmod(iso_p, 0o644)
         return iso_p
 
     root_only = {k: v for k, v in clean_files.items() if "/" not in k}
     iso_p.write_bytes(_build_minimal_iso9660(volume_label, root_only))
+    os.chmod(iso_p, 0o644)
     return iso_p
 
 
