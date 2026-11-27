@@ -105,6 +105,10 @@ if [[ ! -f "$OVERLAY_QCOW2" ]]; then
     echo "ERROR: QCOW2 image not found: $OVERLAY_QCOW2" >&2
     exit 1
 fi
+if [[ ! -r "$OVERLAY_QCOW2" ]]; then
+    echo "ERROR: QCOW2 image is not readable by $(id -un) ($(stat -c '%a %U:%G' "$OVERLAY_QCOW2" 2>/dev/null || echo 'unknown')): $OVERLAY_QCOW2 (fix with: sudo chmod 0664 $OVERLAY_QCOW2)" >&2
+    exit 1
+fi
 if ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
     echo "ERROR: Container runtime $CONTAINER_RT not found (note: podman is not installed on this host)." >&2
     exit 1

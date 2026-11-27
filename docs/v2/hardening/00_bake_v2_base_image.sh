@@ -11,7 +11,7 @@
 #      - OpenSSH Server (sshd) is PRESENT and set to Auto-start (Start=2).
 #
 # Usage:
-#   1. `prepare-overlay` — Create fresh `/var/lib/libvirt/images/win11_overlay.qcow2` (uid 956:956, 0660) + NVRAM.
+#   1. `prepare-overlay` — Create fresh `/var/lib/libvirt/images/win11_overlay.qcow2` (uid 956:956, 0664) + NVRAM.
 #   2. `build-bake-iso <sysmon64_exe_path> [out_iso]` — Package Install-V2BaseBootstrap.ps1 + Sysmon64.exe into DFIR_BAKE ISO.
 #   3. `seal-and-cache` — After clean maintenance boot shuts down: verify bake in overlay, commit overlay into
 #      win11_base.qcow2 (`qemu-img commit`), verify base image, set 0444 + `chattr +i`, record win11_base.sha256,
@@ -73,7 +73,7 @@ prepare_overlay() {
     fi
     sudo qemu-img create -f qcow2 -F qcow2 -b "$rel_base" "$overlay"
     sudo chown 956:956 "$overlay"
-    sudo chmod 0660 "$overlay"
+    sudo chmod 0664 "$overlay"
 
     if [[ -f "$VARS_BASE" ]]; then
         sudo cp -f "$VARS_BASE" "$VARS_LIVE"

@@ -110,6 +110,7 @@ def test_bake_scripts_exist_and_have_valid_syntax():
     assert "prepare-overlay)" in sh_txt
     assert "qemu-img commit" in sh_txt
     assert "chown 956:956" in sh_txt
+    assert 'chmod 0664 "$overlay"' in sh_txt
     assert "rel_base" in sh_txt
     assert "open_qcow2_target_readonly" in sh_txt
     assert "build_stage_iso" in sh_txt
@@ -1997,11 +1998,13 @@ def test_relative_runs_out_dir_resolves_absolute_iso_and_dac_modes(tmp_path, mon
         }
     ]
 
+    observed_cmds: list[list[str]] = []
     observed_attach_iso: list[str] = []
     observed_extract_out: list[str] = []
     observed_modes: dict[str, int] = {}
 
     def _inspect_cmd(cmd: list[str], _env=None) -> int:
+        observed_cmds.append(list(cmd))
         if len(cmd) >= 6 and cmd[:4] == ["sudo", "virsh", "-c", "qemu:///system"] and cmd[4] == "attach-disk":
             iso_arg = cmd[6]
             observed_attach_iso.append(iso_arg)
@@ -2029,6 +2032,13 @@ def test_relative_runs_out_dir_resolves_absolute_iso_and_dac_modes(tmp_path, mon
     assert len(observed_attach_iso) == 1
     assert observed_attach_iso[0].startswith("/")
     assert observed_attach_iso[0] == str(expected_root / "_staging_iso" / "pilot_ctrl_01" / "run_stage_pilot_ctrl_01.iso")
+    attach_idx = next(i for i, c in enumerate(observed_cmds) if len(c) >= 5 and c[4] == "attach-disk")
+    tb_idx = observed_cmds[attach_idx].index("--targetbus")
+    assert observed_cmds[attach_idx][tb_idx + 1] == "sata"
+    chmod_idx = next(i for i, c in enumerate(observed_cmds) if c[:3] == ["sudo", "chmod", "a+r"])
+    ext_idx = next(i for i, c in enumerate(observed_cmds) if c and c[0].endswith("06_unprivileged_container_runner.sh"))
+    assert chmod_idx < ext_idx
+    assert observed_cmds[chmod_idx][3].endswith("win11_overlay.qcow2")
     assert len(observed_extract_out) == 1 and observed_extract_out[0].startswith("/")
     assert observed_extract_out[0] == str(expected_root / "pilot_ctrl_01")
     assert res[0]["out_dir"] == str(expected_root / "pilot_ctrl_01")

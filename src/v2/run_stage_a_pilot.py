@@ -605,6 +605,7 @@ def execute_stage_a_pilot_batch(
     pending_future: Future[dict[str, Any]] | None = None
 
     def _run_extract_and_cleanup(target_overlay: Path, rdir: Path, spec_obj: StageRunSpec, inet_booted: bool) -> dict[str, Any]:
+        _invoke_cmd(run_cmd, ["sudo", "chmod", "a+r", str(target_overlay)], dry_run=dry_run)
         ext_cmd, ext_env = build_container_extraction_command(
             overlay_qcow2=target_overlay,
             run_out_dir=rdir,
@@ -700,7 +701,8 @@ def execute_stage_a_pilot_batch(
 
             attach_cmd = [
                 "sudo", "virsh", "-c", libvirt_uri, "attach-disk",
-                win_domain, str(iso_path), "sdc", "--type", "cdrom", "--mode", "readonly", "--config",
+                win_domain, str(iso_path), "sdc", "--type", "cdrom", "--mode", "readonly",
+                "--targetbus", "sata", "--config",
             ]
             if _invoke_cmd(run_cmd, attach_cmd, dry_run=dry_run) != 0:
                 raise RuntimeError(f"Failed to attach DFIR_STAGE ISO for run {spec.run_id!r}")

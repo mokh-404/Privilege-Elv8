@@ -40,7 +40,7 @@ Before each run `run_id`:
    - Generates `run_manifest.json`, `benign_workload.ps1`, `Invoke-StagePayload.ps1`, and (for `dormant`/`executed`) `payload.bin` inside `run_stage_<run_id>.iso` (`volume_label = "DFIR_STAGE"`), plus a read-only SATA CD-ROM device snippet (`cdrom_device.xml` with `<readonly/>`).
 3. **Disposable Overlay Boot & Hard Watchdog Termination:**
    - Create fresh CoW overlay `win11_overlay.qcow2` backed by read-only `win11_base.qcow2`.
-   - Attach `run_stage_<run_id>.iso` read-only (`virsh attach-disk win11 .../run_stage_<run_id>.iso sdc --type cdrom --mode readonly --config`).
+   - Attach `run_stage_<run_id>.iso` read-only (`virsh attach-disk win11 .../run_stage_<run_id>.iso sdc --type cdrom --mode readonly --targetbus sata --config`).
    - Launch guest under the host-side wall-clock watchdog ([`04_watchdog_and_base_hash.sh`](04_watchdog_and_base_hash.sh)).
    - Inside the guest, `\DFIR-StageRunner` finds the `DFIR_STAGE` CD-ROM drive:
      - Runs `benign_workload.ps1` (`benign_profile_id`);
