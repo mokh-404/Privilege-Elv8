@@ -414,6 +414,7 @@ exit 0
         FAST_META_FILE=str(fast_meta),
         SKIP_LSATTR_CHECK="1",
         GOLDEN_BASE_SHA256=__import__("hashlib").sha256(b"QCOW2_STUB_BASE_BYTES").hexdigest(),
+        GOLDEN_NVRAM_SHA256=__import__("hashlib").sha256(b"NVRAM_STUB_BYTES").hexdigest(),
         VIRSH_BIN=str(mock_virsh),
         IPTABLES_BIN=str(mock_ipt),
         WATCHDOG_BACKEND="setsid",
@@ -603,7 +604,7 @@ def test_watchdog_golden_base_pin_no_overwrite_backup_and_nvram_warning(tmp_path
     wd_sh = HARDENING_DIR / "04_watchdog_and_base_hash.sh"
     wd_txt = wd_sh.read_text(encoding="utf-8")
     assert 'GOLDEN_BASE_SHA256="${GOLDEN_BASE_SHA256:-d2facced4255e3ae1cb821249d5e6330e380f639cee8a5aae19ef99be690835c}"' in wd_txt
-    assert 'GOLDEN_NVRAM_SHA256="${GOLDEN_NVRAM_SHA256:-}"' in wd_txt
+    assert 'GOLDEN_NVRAM_SHA256="${GOLDEN_NVRAM_SHA256-2aeb86356d8c160607a0f258d8b0044b2e30a592c510992b28cb5f5312dda6be}"' in wd_txt
 
     base_img = tmp_path / "win11_base.qcow2"
     nvram = tmp_path / "win11_VARS.fd.base"

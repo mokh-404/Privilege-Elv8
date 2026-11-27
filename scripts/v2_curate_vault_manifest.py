@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from dataclasses import asdict
 import hashlib
 import importlib.util
 import json
@@ -32,6 +33,7 @@ from src.utils.repro import utc_now_iso, write_json
 from src.v2.pilot_staging import (
     ALLOWED_FAMILIES,
     CANONICAL_ALLOWED_FAMILIES,
+    DORMANT_BATCH_MAX,
     FORBIDDEN_MALWARE_FAMILIES_AND_TAGS,
     PilotStagingError,
     StageRunSpec,
@@ -46,6 +48,9 @@ from src.v2.pilot_staging import (
 MALWAREBAZAAR_API_URL = "https://mb-api.abuse.ch/api/v1/"
 DEFAULT_VAULT_ROOT = Path.home() / ".quarantine_vault_dfir_v2"
 DEFAULT_SETUP_SCRIPT = _REPO_ROOT / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+DEFAULT_EXECUTED_DWELL_SECONDS = 45
+DEFAULT_DORMANT_DWELL_SECONDS = 15
+DEFAULT_CONTROL_DWELL_SECONDS = 15
 
 # Priority non-destructive Windows PE categories & family tags (ZERO ransomware, wipers, or worms;
 # njrat/bladabindi/qakbot/emotet/trickbot excluded pending supervisor decision).
@@ -370,60 +375,140 @@ def _write_clean_sha256_manifest(archives_dir: Path, manifest_path: Path) -> Non
 def build_pilot_batch_specs(
     curated_samples: Sequence[Mapping[str, Any]],
     n_control_boots: int = 3,
-    dwell_seconds: int = 120,
+    dwell_seconds: int = DEFAULT_EXECUTED_DWELL_SECONDS,
+    dormant_dwell_seconds: int = DEFAULT_DORMANT_DWELL_SECONDS,
+    control_dwell_seconds: int = DEFAULT_CONTROL_DWELL_SECONDS,
+    *,
+    dormant_batch_size: int = 1,
+    split_pool: str = "dev",
+    group_executed_runs: bool = True,
 ) -> list[dict[str, Any]]:
-    """Build Gate-0-validated Stage A Pilot batch (`n_control_boots` + executed-first paired `executed` & `dormant` runs)."""
+    """Build Gate-0-validated Stage A/B batch (`control` -> consecutive `executed` -> `dormant`/`dormant_batch`)."""
+    pool = str(split_pool or "dev").strip().lower()
+    if pool not in ("dev", "blind_test"):
+        raise ValueError(f"split_pool must be 'dev' or 'blind_test', got {split_pool!r}")
+    bs = int(dormant_batch_size)
+    if bs < 1 or bs > DORMANT_BATCH_MAX:
+        raise PilotStagingError(f"dormant_batch_size must be in 1..{DORMANT_BATCH_MAX}, got {dormant_batch_size}")
+    if bs > 1 and pool != "dev":
+        raise PilotStagingError(
+            f"dormant_batch_size > 1 is strictly restricted to split_pool='dev' (got {split_pool!r})"
+        )
+
     batch: list[dict[str, Any]] = []
+    n_benign_profiles = 20 if pool == "dev" else 10
+    benign_prefix = "B_dev" if pool == "dev" else "B_test"
     for c_idx in range(1, int(n_control_boots) + 1):
         spec = StageRunSpec(
             run_id=f"pilot_ctrl_{c_idx:02d}",
             stratum="control",
-            benign_profile_id=f"B_dev_{c_idx:02d}",
-            dwell_seconds=dwell_seconds,
+            benign_profile_id=f"{benign_prefix}_{((c_idx - 1) % n_benign_profiles) + 1:02d}",
+            dwell_seconds=int(control_dwell_seconds),
             execute_payload=False,
-            split_pool="dev",
+            split_pool=pool,
         )
         validate_stage_run_spec(spec)
-        batch.append({"spec": spec.__dict__, "vault_file": None})
+        batch.append({"spec": asdict(spec), "vault_file": None})
 
+    prepared: list[dict[str, Any]] = []
     for s_idx, rec in enumerate(curated_samples, start=1):
         fam = str(rec["sample_family"])
         cat = str(rec.get("category") or "")
         tags = tuple(str(t) for t in (rec.get("tags") or ()))
         assert_allowed_malware_policy(sample_family=fam, sample_category=cat, tags=tags, raw_signature=rec.get("raw_signature"))
 
-        sha = str(rec["sample_sha256"])
+        sha = str(rec["sample_sha256"]).lower()
         vault_file = str(rec["vault_archive_path"])
         pair_id = f"pair_pilot_{s_idx:02d}_{fam}"
         staged_path = rf"C:\Users\Public\Downloads\{fam}_updater_{sha[:8]}.exe"
-        benign_profile = f"B_dev_{((s_idx - 1) % 20) + 1:02d}"
+        benign_profile = f"{benign_prefix}_{((s_idx - 1) % n_benign_profiles) + 1:02d}"
+        prepared.append({
+            "s_idx": s_idx,
+            "fam": fam,
+            "cat": cat,
+            "tags": tags,
+            "sha": sha,
+            "vault_file": vault_file,
+            "pair_id": pair_id,
+            "staged_path": staged_path,
+            "benign_profile": benign_profile,
+            "sample_category": rec.get("category"),
+            "near_dup_cluster_id": rec.get("near_dup_cluster_id"),
+            "packer_cluster": rec.get("near_dup_cluster_id") or f"pkr_{fam}",
+        })
 
-        # Executed-first gating: schedule executed before dormant so duds never waste dormant boots
-        for stratum in ("executed", "dormant"):
+    def _make_single_entry(item: Mapping[str, Any], stratum: str, run_dwell: int) -> dict[str, Any]:
+        spec = StageRunSpec(
+            run_id=f"pilot_{item['s_idx']:02d}_{item['fam']}_{stratum}",
+            stratum=stratum,
+            benign_profile_id=item["benign_profile"],
+            dwell_seconds=int(run_dwell),
+            staging_target_path=item["staged_path"],
+            sample_sha256=item["sha"],
+            sample_family=item["fam"],
+            sample_category=item["cat"] or None,
+            sample_tags=item["tags"],
+            pair_group_id=item["pair_id"],
+            execute_payload=(stratum == "executed"),
+            gate0_signed_off=True,
+            dedicated_host_user_verified=True,
+            split_pool=pool,
+        )
+        validate_stage_run_spec(spec)
+        return {
+            "spec": asdict(spec),
+            "vault_file": item["vault_file"],
+            "archive_password": "infected",
+            "sample_category": item["sample_category"],
+            "near_dup_cluster_id": item["near_dup_cluster_id"],
+        }
+
+    executed_entries = [_make_single_entry(item, "executed", dwell_seconds) for item in prepared]
+
+    dormant_entries: list[dict[str, Any]] = []
+    if bs > 1:
+        for b_idx, start in enumerate(range(0, len(prepared), bs), start=1):
+            chunk = prepared[start:start + bs]
+            batch_items = tuple(
+                {
+                    "staging_target_path": it["staged_path"],
+                    "sample_sha256": it["sha"],
+                    "sample_family": it["fam"],
+                    "pair_group_id": it["pair_id"],
+                    "sample_category": it["cat"] or None,
+                    "sample_tags": it["tags"],
+                    "packer_cluster": it["packer_cluster"],
+                }
+                for it in chunk
+            )
             spec = StageRunSpec(
-                run_id=f"pilot_{s_idx:02d}_{fam}_{stratum}",
-                stratum=stratum,
-                benign_profile_id=benign_profile,
-                dwell_seconds=dwell_seconds,
-                staging_target_path=staged_path,
-                sample_sha256=sha,
-                sample_family=fam,
-                sample_category=cat or None,
-                sample_tags=tags,
-                pair_group_id=pair_id,
-                execute_payload=(stratum == "executed"),
+                run_id=f"pilot_dorm_batch_{b_idx:03d}",
+                stratum="dormant_batch",
+                benign_profile_id=chunk[0]["benign_profile"],
+                dwell_seconds=int(dormant_dwell_seconds),
+                execute_payload=False,
                 gate0_signed_off=True,
                 dedicated_host_user_verified=True,
                 split_pool="dev",
+                batch_samples=batch_items,
             )
             validate_stage_run_spec(spec)
-            batch.append({
-                "spec": spec.__dict__,
-                "vault_file": vault_file,
+            dormant_entries.append({
+                "spec": asdict(spec),
+                "vault_files": {it["sha"]: it["vault_file"] for it in chunk},
                 "archive_password": "infected",
-                "sample_category": rec.get("category"),
-                "near_dup_cluster_id": rec.get("near_dup_cluster_id"),
             })
+    else:
+        dormant_entries = [_make_single_entry(item, "dormant", dormant_dwell_seconds) for item in prepared]
+
+    # Executed-first gating + consecutive executed grouping maximizes warm inetsim-vm reuse.
+    if group_executed_runs or bs > 1:
+        batch.extend(executed_entries)
+        batch.extend(dormant_entries)
+    else:
+        for ex_entry, dm_entry in zip(executed_entries, dormant_entries):
+            batch.append(ex_entry)
+            batch.append(dm_entry)
     return batch
 
 
@@ -432,7 +517,11 @@ def curate_pilot_vault_and_batch(
     setup_script: str | Path = DEFAULT_SETUP_SCRIPT,
     target_families: int = 7,
     n_control_boots: int = 3,
-    dwell_seconds: int = 120,
+    dwell_seconds: int = DEFAULT_EXECUTED_DWELL_SECONDS,
+    dormant_dwell_seconds: int = DEFAULT_DORMANT_DWELL_SECONDS,
+    control_dwell_seconds: int = DEFAULT_CONTROL_DWELL_SECONDS,
+    dormant_batch_size: int = 1,
+    split_pool: str = "dev",
     query_limit: int = 40,
     archive_password: str = "infected",
     client: SampleFeedClient | None = None,
@@ -551,6 +640,10 @@ def curate_pilot_vault_and_batch(
         curated_records,
         n_control_boots=n_control_boots,
         dwell_seconds=dwell_seconds,
+        dormant_dwell_seconds=dormant_dwell_seconds,
+        control_dwell_seconds=control_dwell_seconds,
+        dormant_batch_size=dormant_batch_size,
+        split_pool=split_pool,
     )
     batch_payload = {
         "generated_at_utc": utc_now_iso(),
@@ -559,6 +652,11 @@ def curate_pilot_vault_and_batch(
         "n_families": len({r["sample_family"] for r in curated_records}),
         "n_samples": len(curated_records),
         "n_total_runs": len(batch),
+        "dwell_seconds_executed": int(dwell_seconds),
+        "dwell_seconds_dormant": int(dormant_dwell_seconds),
+        "dwell_seconds_control": int(control_dwell_seconds),
+        "dormant_batch_size": int(dormant_batch_size),
+        "split_pool": str(split_pool),
         "runs": batch,
     }
     batch_path = write_json(batch_payload, vroot / "stage_a_pilot_batch.json")
@@ -581,7 +679,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--target-samples", type=int, default=None)
     parser.add_argument("--min-families", type=int, default=6)
     parser.add_argument("--n-control-boots", type=int, default=3)
-    parser.add_argument("--dwell-seconds", type=int, default=120)
+    parser.add_argument(
+        "--dwell-seconds",
+        type=int,
+        default=DEFAULT_EXECUTED_DWELL_SECONDS,
+        help="Dwell seconds for executed runs (default: 45)",
+    )
+    parser.add_argument(
+        "--dormant-dwell-seconds",
+        type=int,
+        default=DEFAULT_DORMANT_DWELL_SECONDS,
+        help="Dwell seconds for dormant and dormant_batch runs (default: 15)",
+    )
+    parser.add_argument(
+        "--control-dwell-seconds",
+        type=int,
+        default=DEFAULT_CONTROL_DWELL_SECONDS,
+        help="Dwell seconds for control / benign-only runs (default: 15)",
+    )
+    parser.add_argument(
+        "--dormant-batch-size",
+        type=int,
+        default=1,
+        help=f"Samples per dev dormant_batch boot (1..{DORMANT_BATCH_MAX}; default: 1)",
+    )
     parser.add_argument("--query-limit", type=int, default=40)
     parser.add_argument("--archive-password", default="infected")
     parser.add_argument("--plan-only", action="store_true", help="Query API metadata and emit plan without downloading archives")
@@ -593,6 +714,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_families=args.target_families,
         n_control_boots=args.n_control_boots,
         dwell_seconds=args.dwell_seconds,
+        dormant_dwell_seconds=args.dormant_dwell_seconds,
+        control_dwell_seconds=args.control_dwell_seconds,
+        dormant_batch_size=args.dormant_batch_size,
         query_limit=args.query_limit,
         archive_password=args.archive_password,
         plan_only=args.plan_only,

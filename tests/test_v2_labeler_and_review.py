@@ -362,21 +362,48 @@ def test_assign_v2_splits_and_training_groups_keep_canonical_aliases_together():
             "artifact_key": r"file|c:\users\public\w2.exe|w2.exe",
             "name": "w2.exe",
             "path": r"C:\Users\Public\w2.exe",
-            config.LABEL_COL: config.POSITIVE_LABEL,
+            "label": config.POSITIVE_LABEL,
             "sample_sha256": "44" * 32,
             "sample_family": "WarzoneRAT",
             "packer_cluster": "p_4",
             "pair_group_id": "pg_4",
             "stratum": "dormant",
         },
+        {
+            "run_id": "r_vidar_1",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\v1.exe|v1.exe",
+            "name": "v1.exe",
+            "path": r"C:\Users\Public\v1.exe",
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "sample_sha256": "55" * 32,
+            "sample_family": "arkei",
+            "packer_cluster": "p_5",
+            "pair_group_id": "pg_5",
+            "stratum": "executed",
+        },
+        {
+            "run_id": "r_vidar_2",
+            "artifact_type": "file",
+            "artifact_key": r"file|c:\users\public\v2.exe|v2.exe",
+            "name": "v2.exe",
+            "path": r"C:\Users\Public\v2.exe",
+            config.LABEL_COL: config.POSITIVE_LABEL,
+            "sample_sha256": "66" * 32,
+            "sample_family": "vidar",
+            "packer_cluster": "p_6",
+            "pair_group_id": "pg_6",
+            "stratum": "dormant",
+        },
     ])
 
     split_df = assign_v2_splits(df, blind_test_families=["LummaStealer"])
     assert set(split_df.loc[[0, 1], "split_pool"]) == {"test"}
-    assert set(split_df.loc[[2, 3], "split_pool"]) == {"dev"}
+    assert set(split_df.loc[[2, 3, 4, 5], "split_pool"]) == {"dev"}
 
     # Canonical aliases share ONE CV cluster group even with distinct hashes/clusters
     groups = build_family_cluster_groups(df)
     assert groups[0] == groups[1]
     assert groups[2] == groups[3]
-    assert groups[0] != groups[2]
+    assert groups[4] == groups[5]
+    assert len({groups[0], groups[2], groups[4]}) == 3

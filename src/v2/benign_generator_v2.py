@@ -249,26 +249,56 @@ def _synth_unsigned_pe_bytes(
     struct.pack_into("<IIII", buf, sec_off + 8, raw_sz, 0x1000, raw_sz, 0x400)
     struct.pack_into("<I", buf, sec_off + 36, 0x60000020)
 
-    ascii_pool = np.frombuffer(
-        b"kernel32.dll\x00advapi32.dll\x00GetSystemTimeAsFileTime\x00RegQueryValueExW\x00BenignCliTool\x00",
-        dtype=np.uint8,
+    ascii_pools = (
+        np.frombuffer(
+            b"kernel32.dll\x00advapi32.dll\x00GetSystemTimeAsFileTime\x00RegQueryValueExW\x00BenignCliTool\x00",
+            dtype=np.uint8,
+        ),
+        np.frombuffer(
+            b"ucrtbase.dll\x00vcruntime140.dll\x00malloc\x00free\x00memcpy\x00fprintf\x00Usage:\x00--version\x00",
+            dtype=np.uint8,
+        ),
+        np.frombuffer(
+            b"PADDING_RES_BLOCK_00\x00\x00\x00\x00CONFIG_SCHEMA_V2\x00\x00\x00\x00DEFAULT_LOCALE_EN_US\x00\x00\x00\x00",
+            dtype=np.uint8,
+        ),
     )
+    ascii_pool = ascii_pools[int(np_rng.integers(0, len(ascii_pools)))]
     if high_entropy:
-        # Packed/compressed benign installer fallback: dense random section (~7.6-7.95 entropy)
-        n_code = int(raw_sz * 0.92)
-        n_str = raw_sz - n_code
-        body = (
-            np_rng.integers(0, 256, size=n_code, dtype=np.uint8).tobytes()
-            + np_rng.choice(ascii_pool, size=n_str, replace=True).tobytes()
-        )
-    else:
-        n_code = int(raw_sz * 0.55)
-        n_str = int(raw_sz * 0.25)
+        # Packed/compressed benign installer fallback: varied high-entropy section (~6.8-7.75 bits/byte)
+        frac_code = float(np_rng.uniform(0.70, 0.86))
+        frac_str = float(np_rng.uniform(0.04, min(0.16, 0.99 - frac_code)))
+        n_code = int(raw_sz * frac_code)
+        n_str = int(raw_sz * frac_str)
         n_pad = raw_sz - n_code - n_str
         body = (
             np_rng.integers(0, 256, size=n_code, dtype=np.uint8).tobytes()
             + np_rng.choice(ascii_pool, size=n_str, replace=True).tobytes()
             + b"\x00" * n_pad
+        )
+    else:
+        # Realistic diverse PE regimes spanning ~4.2..7.75 bits/byte (low resource/padded, native, dense packed)
+        regime = int(seed % 3) if int(np_rng.random() < 0.75) else int(np_rng.integers(0, 3))
+        if regime == 0:
+            # Low-entropy padded / resource-heavy PE (~4.2..5.4 bits/byte)
+            frac_code = float(np_rng.uniform(0.24, 0.34))
+            frac_str = float(np_rng.uniform(0.26, 0.38))
+        elif regime == 1:
+            # Medium-entropy native .text/.rdata PE (~5.4..6.7 bits/byte)
+            frac_code = float(np_rng.uniform(0.36, 0.56))
+            frac_str = float(np_rng.uniform(0.18, 0.36))
+        else:
+            # High-entropy packed / compressed-resource PE (~6.6..7.75 bits/byte)
+            frac_code = float(np_rng.uniform(0.64, 0.84))
+            frac_str = float(np_rng.uniform(0.06, min(0.16, 0.99 - frac_code)))
+        n_code = int(raw_sz * frac_code)
+        n_str = int(raw_sz * frac_str)
+        n_pad = raw_sz - n_code - n_str
+        pad_byte = bytes([int(np_rng.choice([0x00, 0xCC, 0x90]))])
+        body = (
+            np_rng.integers(0, 256, size=n_code, dtype=np.uint8).tobytes()
+            + np_rng.choice(ascii_pool, size=n_str, replace=True).tobytes()
+            + (pad_byte * n_pad)
         )
     buf[0x400:] = body
     return bytes(buf)

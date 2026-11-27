@@ -462,6 +462,7 @@ def execute_stage_a_pilot_batch(
     inetsim_domain: str = "inetsim-vm",
     libvirt_uri: str = "qemu:///system",
     inetsim_wait_seconds: int = 8,
+    keep_inetsim_warm: bool = True,
     watchdog_grace_seconds: int = 180,
     dry_run: bool = False,
     run_cmd: Callable[..., int] | None = None,
@@ -601,8 +602,14 @@ def execute_stage_a_pilot_batch(
         return rec_out
 
     detonate_confirmed = False
+    inetsim_warm = False
     try:
         for run_idx, (spec, entry) in enumerate(pending_entries, start=1):
+            if spec.stratum != "executed" and inetsim_warm:
+                # Tear down warm INetSim before non-executed runs so control/dormant baselines stay isolated.
+                _invoke_cmd(run_cmd, inetsim_cmds["destroy"], dry_run=dry_run)
+                inetsim_warm = False
+
             if canary_mode and not dry_run and spec.stratum == "executed" and not detonate_confirmed:
                 prompt = (
                     f"[CANARY SAFETY CONFIRMATION] About to boot INetSim + Win11 VM and DETONATE malware "
@@ -679,12 +686,31 @@ def execute_stage_a_pilot_batch(
             egress_err_msg: str | None = None
             try:
                 if spec.stratum == "executed":
-                    rc_inet = _invoke_cmd(run_cmd, inetsim_cmds["start"], dry_run=dry_run)
-                    if rc_inet != 0:
-                        raise RuntimeError(f"Failed to start {inetsim_domain} for executed run {spec.run_id!r}")
+                    need_start = True
+                    if keep_inetsim_warm and inetsim_warm:
+                        if run_cmd is None and cmd_output_fn is None and not dry_run:
+                            rc_dom, out_dom = _invoke_cmd_capture(
+                                None, None, inetsim_cmds["domstate"], dry_run=False
+                            )
+                            if rc_dom == 0 and out_dom.strip().lower() == "running":
+                                need_start = False
+                            else:
+                                print(
+                                    f"WARNING: warm {inetsim_domain} state={out_dom.strip()!r} (rc={rc_dom}); restarting cleanly.",
+                                    file=sys.stderr,
+                                )
+                                inetsim_warm = False
+                        else:
+                            need_start = False
+
+                    if need_start:
+                        rc_inet = _invoke_cmd(run_cmd, inetsim_cmds["start"], dry_run=dry_run)
+                        if rc_inet != 0:
+                            raise RuntimeError(f"Failed to start {inetsim_domain} for executed run {spec.run_id!r}")
+                        if not dry_run and inetsim_wait_seconds > 0:
+                            sleep_fn(float(inetsim_wait_seconds))
                     inetsim_started = True
-                    if not dry_run and inetsim_wait_seconds > 0:
-                        sleep_fn(float(inetsim_wait_seconds))
+                    inetsim_warm = bool(keep_inetsim_warm)
 
                 start_win = ["sudo", "virsh", "-c", libvirt_uri, "start", win_domain]
                 if _invoke_cmd(run_cmd, start_win, dry_run=dry_run) != 0:
@@ -699,8 +725,9 @@ def execute_stage_a_pilot_batch(
                 raise
             finally:
                 _invoke_cmd(run_cmd, ["sudo", "virsh", "-c", libvirt_uri, "destroy", win_domain], dry_run=dry_run)
-                if inetsim_started:
+                if (inetsim_started or inetsim_warm) and (run_failed or not keep_inetsim_warm):
                     _invoke_cmd(run_cmd, inetsim_cmds["destroy"], dry_run=dry_run)
+                    inetsim_warm = False
                 _invoke_cmd(run_cmd, ["bash", str(watchdog_script), "disarm-watchdog", str(lease_file)], dry_run=dry_run)
                 _invoke_cmd(
                     run_cmd,
@@ -759,6 +786,9 @@ def execute_stage_a_pilot_batch(
         finally:
             if pool_exec is not None:
                 pool_exec.shutdown(wait=True)
+            if inetsim_warm:
+                _invoke_cmd(run_cmd, inetsim_cmds["destroy"], dry_run=dry_run)
+                inetsim_warm = False
             if pending_entries and not dry_run:
                 rc_end = _invoke_cmd(run_cmd, verify_full_cmd, dry_run=dry_run)
                 if rc_end != 0:
@@ -1123,6 +1153,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--benign-pools-root", type=Path, default=Path("/var/lib/dfir-quarantine-vault/benign_pools"))
     parser.add_argument("--canary-stamp-path", type=Path, default=None)
     parser.add_argument("--inetsim-wait-seconds", type=int, default=8)
+    parser.add_argument(
+        "--keep-inetsim-warm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep inetsim-vm warm across consecutive executed runs to skip redundant restart/wait cycles (default: True)",
+    )
     parser.add_argument("--full-base-hash-every", type=int, default=25)
     parser.add_argument("--stage", choices=("a", "b"), default="a", help="Pipeline stage ('a' allows fallback unless --require-real-pools; 'b' enforces real pools by default)")
     parser.add_argument(
@@ -1149,6 +1185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         base_cache_path=args.base_cache_path,
         vault_root=args.vault_root,
         inetsim_wait_seconds=args.inetsim_wait_seconds,
+        keep_inetsim_warm=args.keep_inetsim_warm,
         dry_run=args.dry_run,
         canary_mode=args.canary,
         require_canary_stamp=(not args.canary and not args.dry_run),

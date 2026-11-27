@@ -1397,6 +1397,8 @@ def test_allowlist_removes_lime_and_canonical_aliases_enforce_split_and_caps(tmp
         ("revenge", ("revenge", "revengerat")),
         ("gh0st", ("gh0st", "ghostrat")),
         ("formbook", ("formbook", "xloader")),
+        ("vidar", ("vidar", "arkei")),
+        ("raccoon", ("raccoon", "raccoonstealer", "recordbreaker")),
     ]
     for expected_canon, variants in alias_groups:
         for v in variants:
@@ -1508,3 +1510,190 @@ def test_stage_b_requires_real_pools_while_stage_a_allows_synthetic_fallback(tmp
         "--no-require-real-pools",
         "--dry-run",
     ]) == 0
+
+
+def test_warm_inetsim_reuse_and_per_stratum_dwell_defaults(tmp_path, monkeypatch):
+    import json
+    import os
+    from scripts import v2_curate_vault_manifest as v2_cur
+    from scripts.v2_curate_vault_manifest import build_pilot_batch_specs, main as curate_main
+    from src.v2.run_stage_a_pilot import main as pilot_main
+
+    # 1. Verify curator CLI & build_pilot_batch_specs per-stratum dwell defaults (45s exec / 15s dormant / 15s ctrl)
+    samples = []
+    vault_dir = tmp_path / "vault_warm"
+    setup_script = Path(__file__).resolve().parent.parent / "docs" / "v2" / "hardening" / "05_quarantine_vault_setup.sh"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(vault_dir)), check=True)
+    marker = vault_dir / "GATE0_SIGNED_OFF"
+    marker.write_text(
+        "SIGNED_BY=Mokh\nDATE=2026-11-26\nSUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\nDEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o400)
+
+    for idx, fam in enumerate(("redline", "asyncrat", "smokeloader")):
+        pe_bytes = _synth_unsigned_pe_bytes(600 + idx, 16384, is_dll=False)
+        sha = hashlib.sha256(pe_bytes).hexdigest()
+        zpath = _make_aes256_zip(tmp_path, f"warm_{fam}", pe_bytes)
+        samples.append({
+            "sample_sha256": sha,
+            "sample_family": fam,
+            "category": "stealer",
+            "vault_archive_path": str(zpath),
+            "near_dup_cluster_id": f"clu_{idx}",
+        })
+
+    default_batch = build_pilot_batch_specs(samples, n_control_boots=2)
+    strata_seq = [r["spec"]["stratum"] for r in default_batch]
+    dwell_seq = [r["spec"]["dwell_seconds"] for r in default_batch]
+    assert strata_seq == ["control", "control", "executed", "executed", "executed", "dormant", "dormant", "dormant"]
+    assert dwell_seq == [15, 15, 45, 45, 45, 15, 15, 15]
+
+    packed_batch = build_pilot_batch_specs(samples, n_control_boots=1, dormant_batch_size=16)
+    assert [r["spec"]["stratum"] for r in packed_batch] == ["control", "executed", "executed", "executed", "dormant_batch"]
+    assert [r["spec"]["dwell_seconds"] for r in packed_batch] == [15, 45, 45, 45, 15]
+    assert len(packed_batch[-1]["spec"]["batch_samples"]) == 3
+
+    with pytest.raises(PilotStagingError, match="blind_test"):
+        build_pilot_batch_specs(samples, dormant_batch_size=2, split_pool="blind_test")
+
+    # 2. Warm inetsim-vm skips redundant start + wait across consecutive executed runs and tears down before dormant/exit
+    warm_cmds: list[list[str]] = []
+    sleeps: list[float] = []
+    res_warm = execute_stage_a_pilot_batch(
+        batch_runs=default_batch,
+        runs_out_dir=tmp_path / "warm_runs_out",
+        vault_root=vault_dir,
+        inetsim_wait_seconds=8,
+        keep_inetsim_warm=True,
+        run_cmd=lambda cmd, _e=None: warm_cmds.append(list(cmd)) or 0,
+        sleep_fn=lambda s: sleeps.append(float(s)),
+    )
+    assert [r["inetsim_booted"] for r in res_warm] == [False, False, True, True, True, False, False, False]
+    inetsim_starts = [i for i, c in enumerate(warm_cmds) if c == ["sudo", "virsh", "-c", "qemu:///system", "start", "inetsim-vm"]]
+    inetsim_destroys = [i for i, c in enumerate(warm_cmds) if c == ["sudo", "virsh", "-c", "qemu:///system", "destroy", "inetsim-vm"]]
+    win_starts = [i for i, c in enumerate(warm_cmds) if c == ["sudo", "virsh", "-c", "qemu:///system", "start", "win11"]]
+    assert len(inetsim_starts) == 1
+    assert len(inetsim_destroys) == 1
+    assert sleeps == [8.0]
+    # Started before 1st executed win11 (index 2), destroyed after 3rd executed win11 (index 4) & before 1st dormant win11 (index 5)
+    assert inetsim_starts[0] < win_starts[2] < win_starts[4] < inetsim_destroys[0] < win_starts[5]
+
+    # Executed-only tail cleans up warm inetsim-vm in outer finally:
+    tail_cmds: list[list[str]] = []
+    tail_sleeps: list[float] = []
+    execute_stage_a_pilot_batch(
+        batch_runs=default_batch[2:4],
+        runs_out_dir=tmp_path / "warm_tail_out",
+        vault_root=vault_dir,
+        inetsim_wait_seconds=8,
+        keep_inetsim_warm=True,
+        run_cmd=lambda cmd, _e=None: tail_cmds.append(list(cmd)) or 0,
+        sleep_fn=lambda s: tail_sleeps.append(float(s)),
+    )
+    assert sum(1 for c in tail_cmds if c[-2:] == ["start", "inetsim-vm"]) == 1
+    assert sum(1 for c in tail_cmds if c[-2:] == ["destroy", "inetsim-vm"]) == 1
+    assert tail_sleeps == [8.0]
+
+    # keep_inetsim_warm=False restores per-run start/sleep/destroy
+    cold_cmds: list[list[str]] = []
+    cold_sleeps: list[float] = []
+    execute_stage_a_pilot_batch(
+        batch_runs=default_batch[2:4],
+        runs_out_dir=tmp_path / "cold_runs_out",
+        vault_root=vault_dir,
+        inetsim_wait_seconds=8,
+        keep_inetsim_warm=False,
+        run_cmd=lambda cmd, _e=None: cold_cmds.append(list(cmd)) or 0,
+        sleep_fn=lambda s: cold_sleeps.append(float(s)),
+    )
+    assert sum(1 for c in cold_cmds if c[-2:] == ["start", "inetsim-vm"]) == 2
+    assert sum(1 for c in cold_cmds if c[-2:] == ["destroy", "inetsim-vm"]) == 2
+    assert cold_sleeps == [8.0, 8.0]
+
+    # Abort on 2nd executed run MUST immediately destroy warm inetsim-vm (never leak across failures)
+    abort_cmds: list[list[str]] = []
+
+    def _fail_second_wd(cmd: list[str], _e=None) -> int:
+        abort_cmds.append(list(cmd))
+        if "watchdog" in cmd and sum(1 for c in abort_cmds if "watchdog" in c) == 2:
+            return 2
+        return 0
+
+    with pytest.raises(RuntimeError, match="Watchdog aborted"):
+        execute_stage_a_pilot_batch(
+            batch_runs=default_batch[2:5],
+            runs_out_dir=tmp_path / "warm_abort_out",
+            vault_root=vault_dir,
+            inetsim_wait_seconds=0,
+            keep_inetsim_warm=True,
+            run_cmd=_fail_second_wd,
+            sleep_fn=lambda _s: None,
+        )
+    assert sum(1 for c in abort_cmds if c[-2:] == ["destroy", "inetsim-vm"]) == 1
+
+    # CLI flags smoke check for --keep-inetsim-warm / --no-keep-inetsim-warm & curate CLI per-stratum dwell defaults
+    bfile = tmp_path / "warm_cli_batch.json"
+    bfile.write_text(json.dumps({"runs": default_batch[:1]}), encoding="utf-8")
+    assert pilot_main([
+        "--batch-json", str(bfile),
+        "--runs-out-dir", str(tmp_path / "warm_cli_out"),
+        "--keep-inetsim-warm",
+        "--dry-run",
+    ]) == 0
+    assert pilot_main([
+        "--batch-json", str(bfile),
+        "--runs-out-dir", str(tmp_path / "warm_cli_cold_out"),
+        "--no-keep-inetsim-warm",
+        "--dry-run",
+    ]) == 0
+
+    cli_vault = tmp_path / "cli_cur_vault"
+    subprocess.run(["bash", str(setup_script), "init"], env=dict(os.environ, VAULT_ROOT=str(cli_vault)), check=True)
+    cli_marker = cli_vault / "GATE0_SIGNED_OFF"
+    cli_marker.write_text(
+        "SIGNED_BY=Mokh\nDATE=2026-11-26\nSUPERVISOR_APPROVAL=Supervisor Marawan (AASTMT) 2026-11-25\n"
+        "CONTAINMENT_CHECKS=NEG-01..NEG-10 PASS\nDEDICATED_USER_VERIFIED=true\n",
+        encoding="utf-8",
+    )
+    os.chmod(cli_marker, 0o400)
+    zbytes_by_sha = {s["sample_sha256"]: Path(s["vault_archive_path"]).read_bytes() for s in samples}
+    fake_rows = [
+        {
+            "sha256_hash": s["sample_sha256"],
+            "signature": s["sample_family"],
+            "file_name": f"{s['sample_family']}.exe",
+            "file_type": "exe",
+            "file_size": 16384,
+            "imphash": f"{idx + 10:032x}",
+            "tags": [s["sample_family"], "stealer"],
+        }
+        for idx, s in enumerate(samples)
+    ]
+
+    class _CliFakeMB:
+        def __init__(self, api_key: str) -> None:
+            assert api_key == "dummy_test_key"
+
+        def query_tag(self, tag: str, limit: int = 40):
+            return fake_rows if tag.lower() == "redline" else []
+
+        def download_sample_zip(self, sha256_hash: str) -> bytes:
+            return zbytes_by_sha[sha256_hash.lower()]
+
+    monkeypatch.setenv("ABUSECH_AUTH_KEY", "dummy_test_key")
+    monkeypatch.setattr(v2_cur, "MalwareBazaarClient", _CliFakeMB)
+    assert curate_main([
+        "--vault-root", str(cli_vault),
+        "--setup-script", str(setup_script),
+        "--target-families", "3",
+        "--min-families", "3",
+        "--n-control-boots", "2",
+    ]) == 0
+    cli_batch = json.loads((cli_vault / "stage_a_pilot_batch.json").read_text(encoding="utf-8"))
+    assert cli_batch["dwell_seconds_executed"] == 45
+    assert cli_batch["dwell_seconds_dormant"] == 15
+    assert cli_batch["dwell_seconds_control"] == 15
+    assert cli_batch["dormant_batch_size"] == 1
+    assert [r["spec"]["dwell_seconds"] for r in cli_batch["runs"]] == [15, 15, 45, 45, 45, 15, 15, 15]

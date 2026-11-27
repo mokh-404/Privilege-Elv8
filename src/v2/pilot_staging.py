@@ -103,6 +103,9 @@ FAMILY_ALIAS_TO_CANONICAL: dict[str, str] = {
     "ghostrat": "gh0st",
     "formbook": "formbook",
     "xloader": "formbook",
+    "arkei": "vidar",
+    "vidar": "vidar",
+    "recordbreaker": "raccoon",
 }
 
 # Reviewed positive allowlist (normalized lowercase alphanumeric slugs).

@@ -536,3 +536,213 @@ def test_patch_stale_large_pe_cache_and_sysmon_evtx_export(tmp_path, monkeypatch
     assert len(ev_lines) == 1 and ev_lines[0]["process_guid"] == "{mal-root}"
     man = json.loads(paths["manifest"].read_text(encoding="utf-8"))
     assert "sysmon_events" not in man  # Full event list stays in sysmon_events.jsonl, not bloated inside manifest
+
+
+def test_decompress_wof_stream_max_out_bytes_and_huge_mft_prefix(monkeypatch):
+    from src.v2 import offline_extractor as oe
+
+    # 4 chunks under algo=2 (8192 B/chunk): uncomp_size = 3*8192 + 500 -> offset table has (4 - 1) = 3 uint32s (12 bytes)
+    chunk_sz = 8192
+    uncomp_size = 3 * chunk_sz + 500
+    c0 = b"A" * chunk_sz  # len == expected -> copied verbatim without LZXPRESS
+    c1 = b"B" * chunk_sz
+    c2_bad = b"\xff" * 40  # would fail if decoded!
+    c3_bad = b"\xee" * 40
+    o1 = len(c0)
+    o2 = o1 + len(c1)
+    o3 = o2 + len(c2_bad)
+    raw_wof = struct.pack("<3I", o1, o2, o3) + c0 + c1 + c2_bad + c3_bad
+
+    # Stopping at 9000 bytes reads the true 12-byte offset table for uncomp_size and breaks right after chunk 1
+    prefix = decompress_wof_stream(raw_wof, uncomp_size=uncomp_size, algo=2, max_out_bytes=9000)
+    assert len(prefix) == 9000
+    assert prefix == (c0 + c1)[:9000]
+    assert decompress_wof_stream(raw_wof, uncomp_size=uncomp_size, algo=2, max_out_bytes=0) == b""
+
+    # Verify _read_mft_file_bytes on > 128 MiB WOF file passes max_out_bytes=MIB and returns leading MIB
+    seen_calls: list[tuple[int, int, int | None]] = []
+
+    def _spy_decomp(buf: bytes, usz: int, alg: int = 2, max_out_bytes: int | None = None) -> bytes:
+        seen_calls.append((usz, alg, max_out_bytes))
+        return b"Z" * (max_out_bytes or MIB)
+
+    monkeypatch.setattr(oe, "decompress_wof_stream", _spy_decomp)
+
+    class _HugeWofStream:
+        def read(self) -> bytes:
+            return b"STUB_WOF"
+
+    class _HugeRpAttr:
+        def data(self) -> bytes:
+            return struct.pack("<6I", 0x80000017, 0, 0, 0, 0, 2)
+
+    class _HugeMftRec:
+        attributes = {0xC0: [_HugeRpAttr()]}
+
+        def size(self, _name: str = "") -> int:
+            return 295 * MIB
+
+        def has_stream(self, name: str) -> bool:
+            return name == "WofCompressedData"
+
+        def open(self, name: str):
+            assert name == "WofCompressedData"
+            return _HugeWofStream()
+
+    fbytes, full_sz, is_wof = oe._read_mft_file_bytes(_HugeMftRec(), max_bytes=oe.MAX_PE_SIGNIFY_BYTES)
+    assert seen_calls == [(295 * MIB, 2, MIB)]
+    assert is_wof is True and full_sz == 295 * MIB and len(fbytes) == MIB
+
+
+def test_gt_128mib_notsigned_cached_entry_hits_cache_with_zero_misses(tmp_path, monkeypatch):
+    from src.v2 import offline_extractor as oe
+
+    cache_path = tmp_path / "base_cache.json.gz"
+    huge_sz = 295 * MIB
+    huge_mtime = 1772840911079985100
+    huge_key = make_base_file_cache_key(8888, 12, huge_sz, huge_mtime)
+    huge_win_path = r"c:\ProgramData\msedge.dll"
+
+    save_base_image_cache(
+        cache_path,
+        base_image_sha256="f" * 64,
+        catroot_digests={"cat1"},
+        file_entries={
+            huge_key: {
+                "path": huge_win_path,
+                "file_size": huge_sz,
+                "signature_status": "NotSigned",
+                "file_sha256": None,
+                "file_head_histogram": [4096] * 256,
+                "wof_compressed": True,
+            }
+        },
+    )
+
+    # 1. patch_stale_large_pe_cache MUST NOT re-decompress > MAX_PE_SIGNIFY_BYTES (295 MiB)
+    monkeypatch.setattr(oe, "open_qcow2_target_readonly", lambda _p: pytest.fail("Should not open qcow2 for >128MiB entry"))
+    res_patch = patch_stale_large_pe_cache(tmp_path / "base.qcow2", cache_path, expected_base_sha256="f" * 64)
+    assert res_patch["stale_candidates"] == 0 and res_patch["patched_entries"] == 0
+
+    # 2. extract_from_qcow2 MUST treat > 128 MiB NotSigned cached entry as an instant hit (base_cache_misses == 0)
+    class _StubNs:
+        name = "WIN32"
+
+    class _StubFnAttr:
+        def filename(self) -> str:
+            return "msedge.dll"
+
+        def namespace(self):
+            return _StubNs()
+
+        def parent(self):
+            return None
+
+    class _StubSi:
+        last_modification_time_ns = huge_mtime
+        file_attributes = 0x20
+
+    class _StubHeader:
+        SequenceNumber = 12
+        Flags = 0x01
+
+    class _StubDataAttr:
+        name = "WofCompressedData"
+
+    class _StubMftRec:
+        segment = 8888
+        header = _StubHeader()
+        attributes = {0x10: [_StubSi()], 0x30: [_StubFnAttr()], 0x80: [_StubDataAttr()], 0xC0: []}
+
+        def is_dir(self) -> bool:
+            return False
+
+        def size(self, _name: str = "") -> int:
+            return huge_sz
+
+        def has_stream(self, name: str) -> bool:
+            return name == "WofCompressedData"
+
+        def datastreams(self):
+            return []
+
+        def open(self, _name: str):
+            raise AssertionError("Should never decompress/read cached > 128 MiB MSEDGE.DLL")
+
+    class _StubMft:
+        def get(self, rel: str):
+            return _StubMftRec() if rel.lower() == r"programdata\msedge.dll" else None
+
+    class _StubNtfs:
+        mft = _StubMft()
+
+    class _StubCfs:
+        ntfs = _StubNtfs()
+
+    class _StubDirEnt:
+        name = "msedge.dll"
+
+        def is_symlink(self) -> bool:
+            return False
+
+        def is_file(self) -> bool:
+            return True
+
+        def is_dir(self) -> bool:
+            return False
+
+        def __str__(self) -> str:
+            return r"c:\ProgramData\msedge.dll"
+
+    class _StubPath:
+        def __init__(self, p: str) -> None:
+            self._p = p.lower()
+
+        def exists(self) -> bool:
+            return self._p in (r"c:\programdata", r"c:\programdata\msedge.dll")
+
+        def is_file(self) -> bool:
+            return self._p == r"c:\programdata\msedge.dll"
+
+        def iterdir(self):
+            return [_StubDirEnt()] if self._p == r"c:\programdata" else []
+
+        def walk(self):
+            return []
+
+        def __str__(self) -> str:
+            return r"c:\ProgramData" if self._p == r"c:\programdata" else self._p
+
+    class _StubFS:
+        mounts = {"c:": _StubCfs()}
+
+        def path(self, p: str):
+            return _StubPath(p)
+
+    class _StubReg:
+        def key(self, _p: str):
+            return None
+
+    class _StubTarget:
+        fs = _StubFS()
+        registry = _StubReg()
+
+        def catroot(self):
+            return []
+
+    monkeypatch.setattr(oe, "open_qcow2_target_readonly", lambda _p: _StubTarget())
+    monkeypatch.setattr(oe, "close_target_safely", lambda _t: None)
+    monkeypatch.setattr(oe, "_extract_sysmon_evtx_events", lambda _t: (False, [], {}))
+
+    recs, summary = oe.extract_from_qcow2(
+        tmp_path / "dummy.qcow2",
+        run_id="cache_hit_test",
+        base_cache_path=cache_path,
+        expected_base_sha256="f" * 64,
+    )
+    assert summary["base_cache_hits"] == 1
+    assert summary["base_cache_misses"] == 0
+    assert len(recs) == 1
+    assert recs[0]["file_size"] == huge_sz
+    assert recs[0]["wof_compressed"] is True
+    assert recs[0]["signature_status"] == "NotSigned"

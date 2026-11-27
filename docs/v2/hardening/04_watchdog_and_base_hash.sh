@@ -20,8 +20,8 @@ FORCE_RECORD="${FORCE_RECORD:-0}"
 
 # Pinned golden SHA-256 of sealed win11_base.qcow2 (refused on mismatch in record-base/verify-base/verify-base-fast)
 GOLDEN_BASE_SHA256="${GOLDEN_BASE_SHA256:-d2facced4255e3ae1cb821249d5e6330e380f639cee8a5aae19ef99be690835c}"
-# Review the SHA-256 printed by `record-base` for win11_VARS.fd.base, then pin it below before unattended collection
-GOLDEN_NVRAM_SHA256="${GOLDEN_NVRAM_SHA256:-}"
+# Pinned golden SHA-256 of sealed win11_VARS.fd.base (verified in v2_base_fast_meta.env and v2_base_hashes.sha256)
+GOLDEN_NVRAM_SHA256="${GOLDEN_NVRAM_SHA256-2aeb86356d8c160607a0f258d8b0044b2e30a592c510992b28cb5f5312dda6be}"
 
 read -r -a VIRSH_CMD <<< "$VIRSH_BIN"
 read -r -a IPTABLES_CMD <<< "$IPTABLES_BIN"

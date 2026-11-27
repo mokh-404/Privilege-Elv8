@@ -343,9 +343,14 @@ def expand_target_like_v1(raw: str | None, c_exists_fn: Any = None, env_map: Map
     return norm
 
 
-def decompress_wof_stream(raw_wof: bytes, uncomp_size: int, algo: int) -> bytes:
+def decompress_wof_stream(
+    raw_wof: bytes,
+    uncomp_size: int,
+    algo: int = 2,
+    max_out_bytes: int | None = None,
+) -> bytes:
     """Decompress Windows 10/11 CompactOS `WofCompressedData` XPRESS/LZX chunks in user space."""
-    if uncomp_size <= 0:
+    if uncomp_size <= 0 or (max_out_bytes is not None and max_out_bytes <= 0):
         return b""
     from dissect.util.compression import lzxpress_huffman, lzxpress  # type: ignore
 
@@ -370,7 +375,10 @@ def decompress_wof_stream(raw_wof: bytes, uncomp_size: int, algo: int) -> bytes:
             out.extend(lzxpress.decompress(cdata)[:expected])
         else:
             out.extend(lzxpress_huffman.decompress(cdata)[:expected])
-    return bytes(out[:uncomp_size])
+        if max_out_bytes is not None and len(out) >= max_out_bytes:
+            break
+    out_limit = min(uncomp_size, max_out_bytes) if max_out_bytes is not None else uncomp_size
+    return bytes(out[:out_limit])
 
 
 def _read_mft_file_bytes(rec: Any, max_bytes: int = MAX_PE_SIGNIFY_BYTES) -> tuple[bytes | None, int, bool]:
@@ -412,7 +420,7 @@ def _read_mft_file_bytes(rec: Any, max_bytes: int = MAX_PE_SIGNIFY_BYTES) -> tup
         except Exception:
             return None, uncomp_size, is_wof
 
-    # Huge WOF binary (> max_bytes): read at least partial chunks up to MIB for histogram
+    # Huge WOF binary (> max_bytes): read only leading MIB prefix for histogram (files > 128 MiB never hash or Authenticode)
     try:
         rp_list = rec.attributes.get(0xC0, [])
         algo = 2
@@ -421,8 +429,8 @@ def _read_mft_file_bytes(rec: Any, max_bytes: int = MAX_PE_SIGNIFY_BYTES) -> tup
             if len(rp_bytes) >= 24:
                 algo = struct.unpack_from("<I", rp_bytes, 20)[0]
         raw_wof = rec.open("WofCompressedData").read()
-        data = decompress_wof_stream(raw_wof, uncomp_size, algo)
-        return data[:max_bytes], uncomp_size, True
+        data = decompress_wof_stream(raw_wof, uncomp_size, algo, max_out_bytes=MIB)
+        return data[:MIB], uncomp_size, True
     except Exception:
         return None, uncomp_size, is_wof
 
@@ -1086,7 +1094,11 @@ def patch_stale_large_pe_cache(
 
     stale_keys = [
         k for k, v in file_entries.items()
-        if int(v.get("file_size") or 0) > 64 * MIB and str(v.get("signature_status") or "") == "NotSigned"
+        if (
+            64 * MIB < int(v.get("file_size") or 0) <= MAX_PE_SIGNIFY_BYTES
+            and str(v.get("signature_status") or "") == "NotSigned"
+            and not v.get("checked_128mib")
+        )
     ]
     if not stale_keys:
         return {
@@ -1145,6 +1157,7 @@ def patch_stale_large_pe_cache(
             entry["file_sha256"] = hashlib.sha256(fbytes).hexdigest() if full_sz <= MAX_PE_SIGNIFY_BYTES else None
             entry["signature_status"] = new_sig
             entry["wof_compressed"] = wof_flag
+            entry["checked_128mib"] = True
             file_entries[ckey] = entry
             patched.append({
                 "cache_key": ckey,
@@ -1305,8 +1318,9 @@ def extract_from_qcow2(
             c_hit_raw = cached_file_entries.get(ckey) if ckey is not None else None
             stale_large_pe_hit = bool(
                 c_hit_raw is not None
-                and fast_sz > 64 * MIB
+                and 64 * MIB < fast_sz <= MAX_PE_SIGNIFY_BYTES
                 and str(c_hit_raw.get("signature_status") or "") == "NotSigned"
+                and not c_hit_raw.get("checked_128mib")
             )
             if c_hit_raw is not None and not stale_large_pe_hit:
                 c_hit = c_hit_raw
@@ -1350,6 +1364,7 @@ def extract_from_qcow2(
                     "file_sha256": info["file_sha256"],
                     "signature_status": info["signature_status"],
                     "wof_compressed": wof_flag,
+                    **({"checked_128mib": True} if 64 * MIB < int(full_sz) <= MAX_PE_SIGNIFY_BYTES else {}),
                 }
             file_meta_cache[low] = info
             return info

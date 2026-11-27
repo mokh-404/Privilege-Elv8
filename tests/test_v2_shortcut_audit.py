@@ -131,6 +131,28 @@ def test_benign_generator_v2_passes_quantization_and_pool_disjointness(tmp_path)
     assert qres["benign_unsigned_pes"] > 0 and qres["benign_services"] > 0 and qres["benign_registry"] > 0
 
 
+def test_synthetic_pe_fallback_entropy_spread(tmp_path):
+    import numpy as np
+
+    empty_pools = tmp_path / "empty_pools"
+    rows, _ = simulate_benign_generator_rows(
+        "dev",
+        n_runs=24,
+        base_seed=5000,
+        benign_pools_root=empty_pools,
+        require_real_pools=False,
+    )
+    feats = pd.DataFrame([row_features(r) for r in rows])
+    pe_feats = feats[
+        (feats["artifact_type"] == "file")
+        & (feats["ext_class"] == "exe")
+    ]
+    ent = pe_feats["file_entropy"].to_numpy(dtype=float)
+    assert len(ent) >= 48
+    assert float(np.std(ent)) >= 0.50
+    assert float(np.max(ent) - np.min(ent)) >= 2.0
+
+
 def test_all_benign_profiles_pass_real_extractor_predicates(tmp_path):
     # Negative extractor predicate checks (must reject unwalked paths, skip dirs, and excess depth)
     assert path_matches_extractor_scan_roots(r"C:\Windows\System32\evil.exe") is False
