@@ -506,6 +506,8 @@ def execute_stage_a_pilot_batch(
     confirm_input_fn: Callable[[str], str] = input,
     stage: str = "a",
     require_real_pools: bool | None = None,
+    inetsim_base_qcow2: str | Path = "/var/lib/libvirt/images/inetsim_base.qcow2",
+    inetsim_overlay_qcow2: str | Path = "/var/lib/libvirt/images/inetsim_overlay.qcow2",
 ) -> list[dict[str, Any]]:
     """Execute or dry-run a Stage A/B batch with detached watchdog, egress checks, base checks & optional pipelining."""
     st_stage = str(stage or "a").strip().lower()
@@ -593,6 +595,13 @@ def execute_stage_a_pilot_batch(
     verify_full_cmd = ["bash", str(watchdog_script), "verify-base"]
     verify_fast_cmd = ["bash", str(watchdog_script), "verify-base-fast"]
     prep_cmd = ["bash", str(bake_script), "prepare-overlay", str(base_qcow2), str(overlay_qcow2)]
+    prep_inetsim_cmd = [
+        "bash",
+        str(bake_script),
+        "prepare-inetsim-overlay",
+        str(inetsim_base_qcow2),
+        str(inetsim_overlay_qcow2),
+    ]
     egress_snap_cmd = ["bash", str(watchdog_script), "check-egress", "snapshot"]
 
     if pending_entries and not dry_run:
@@ -737,6 +746,11 @@ def execute_stage_a_pilot_batch(
                             need_start = False
 
                     if need_start:
+                        rc_inet_prep = _invoke_cmd(run_cmd, prep_inetsim_cmd, dry_run=dry_run)
+                        if rc_inet_prep != 0:
+                            raise RuntimeError(
+                                f"prepare-inetsim-overlay failed for {inetsim_domain} on run {spec.run_id!r} (rc={rc_inet_prep})"
+                            )
                         rc_inet = _invoke_cmd(run_cmd, inetsim_cmds["start"], dry_run=dry_run)
                         if rc_inet != 0:
                             raise RuntimeError(f"Failed to start {inetsim_domain} for executed run {spec.run_id!r}")

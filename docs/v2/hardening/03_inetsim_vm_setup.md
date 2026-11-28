@@ -41,5 +41,6 @@
    ```
    *(Note: directory paths `--report-dir`, `--log-dir`, and `--data-dir` are CLI / init flags in INetSim rather than `inetsim.conf(5)` keys — use standard `/var/log/inetsim/` and `/var/lib/inetsim/data/` defaults.)*
    - On the Windows guest side, because `V2_VIRBR1_IN` drops DHCP (`UDP/67`) to the Linux host, every `DFIR_STAGE` ISO built by [`src/v2/pilot_staging.py`](../../../src/v2/pilot_staging.py) automatically prepends the `netsh` static IP configuration (`192.168.150.50/24`, gateway `192.168.150.10`, DNS `192.168.150.10`) without re-baking `win11_base.qcow2`.
-4. **Reset Between Batches:**
-   - Restore `inetsim-vm` from its clean QCOW2 snapshot (`inetsim_base.qcow2`) or flush `/var/log/inetsim/` cleanly between malware runs so INetSim logs can correlate guest C2 beacons (`inetsim_report_<run_id>.json`) without carrying state across runs.
+4. **Run From a Disposable CoW Overlay (`inetsim_overlay.qcow2` -> Sealed `inetsim_base.qcow2`):**
+   - Seal `/var/lib/libvirt/images/inetsim_base.qcow2` (`chmod 0444` + `chattr +i`) and point `inetsim-vm`'s `<disk>` source to `/var/lib/libvirt/images/inetsim_overlay.qcow2`.
+   - `src/v2/run_stage_a_pilot.py` recreates `/var/lib/libvirt/images/inetsim_overlay.qcow2` automatically before starting `inetsim-vm` via `docs/v2/hardening/00_bake_v2_base_image.sh prepare-inetsim-overlay`, keeping `inetsim_base.qcow2` strictly unmodified (`INETSIM_STAT` unchanged) and isolating C2 beacon state cleanly between runs/batches.

@@ -108,6 +108,7 @@ def test_bake_scripts_exist_and_have_valid_syntax():
     assert sh_path.exists() and ps_path.exists()
     sh_txt = sh_path.read_text(encoding="utf-8")
     assert "prepare-overlay)" in sh_txt
+    assert "prepare-inetsim-overlay)" in sh_txt
     assert "qemu-img commit" in sh_txt
     assert "chown 956:956" in sh_txt
     assert 'chmod 0664 "$overlay"' in sh_txt
@@ -1572,14 +1573,16 @@ def test_warm_inetsim_reuse_and_per_stratum_dwell_defaults(tmp_path, monkeypatch
         sleep_fn=lambda s: sleeps.append(float(s)),
     )
     assert [r["inetsim_booted"] for r in res_warm] == [False, False, True, True, True, False, False, False]
+    inetsim_preps = [i for i, c in enumerate(warm_cmds) if len(c) >= 3 and c[2] == "prepare-inetsim-overlay"]
     inetsim_starts = [i for i, c in enumerate(warm_cmds) if c == ["sudo", "virsh", "-c", "qemu:///system", "start", "inetsim-vm"]]
     inetsim_destroys = [i for i, c in enumerate(warm_cmds) if c == ["sudo", "virsh", "-c", "qemu:///system", "destroy", "inetsim-vm"]]
     win_starts = [i for i, c in enumerate(warm_cmds) if c == ["sudo", "virsh", "-c", "qemu:///system", "start", "win11"]]
+    assert len(inetsim_preps) == 1
     assert len(inetsim_starts) == 1
     assert len(inetsim_destroys) == 1
     assert sleeps == [8.0]
-    # Started before 1st executed win11 (index 2), destroyed after 3rd executed win11 (index 4) & before 1st dormant win11 (index 5)
-    assert inetsim_starts[0] < win_starts[2] < win_starts[4] < inetsim_destroys[0] < win_starts[5]
+    # Prepare overlay -> start inetsim -> 1st executed win11 -> ... -> destroy inetsim before 1st dormant win11
+    assert inetsim_preps[0] < inetsim_starts[0] < win_starts[2] < win_starts[4] < inetsim_destroys[0] < win_starts[5]
 
     # Executed-only tail cleans up warm inetsim-vm in outer finally:
     tail_cmds: list[list[str]] = []
@@ -1593,11 +1596,12 @@ def test_warm_inetsim_reuse_and_per_stratum_dwell_defaults(tmp_path, monkeypatch
         run_cmd=lambda cmd, _e=None: tail_cmds.append(list(cmd)) or 0,
         sleep_fn=lambda s: tail_sleeps.append(float(s)),
     )
+    assert sum(1 for c in tail_cmds if len(c) >= 3 and c[2] == "prepare-inetsim-overlay") == 1
     assert sum(1 for c in tail_cmds if c[-2:] == ["start", "inetsim-vm"]) == 1
     assert sum(1 for c in tail_cmds if c[-2:] == ["destroy", "inetsim-vm"]) == 1
     assert tail_sleeps == [8.0]
 
-    # keep_inetsim_warm=False restores per-run start/sleep/destroy
+    # keep_inetsim_warm=False restores per-run prepare/start/sleep/destroy
     cold_cmds: list[list[str]] = []
     cold_sleeps: list[float] = []
     execute_stage_a_pilot_batch(
@@ -1609,6 +1613,7 @@ def test_warm_inetsim_reuse_and_per_stratum_dwell_defaults(tmp_path, monkeypatch
         run_cmd=lambda cmd, _e=None: cold_cmds.append(list(cmd)) or 0,
         sleep_fn=lambda s: cold_sleeps.append(float(s)),
     )
+    assert sum(1 for c in cold_cmds if len(c) >= 3 and c[2] == "prepare-inetsim-overlay") == 2
     assert sum(1 for c in cold_cmds if c[-2:] == ["start", "inetsim-vm"]) == 2
     assert sum(1 for c in cold_cmds if c[-2:] == ["destroy", "inetsim-vm"]) == 2
     assert cold_sleeps == [8.0, 8.0]

@@ -23,12 +23,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BASE_IMG="${BASE_IMG:-/var/lib/libvirt/images/win11_base.qcow2}"
 OVERLAY_IMG="${OVERLAY_IMG:-/var/lib/libvirt/images/win11_overlay.qcow2}"
+INETSIM_BASE_IMG="${INETSIM_BASE_IMG:-/var/lib/libvirt/images/inetsim_base.qcow2}"
+INETSIM_OVERLAY_IMG="${INETSIM_OVERLAY_IMG:-/var/lib/libvirt/images/inetsim_overlay.qcow2}"
 VARS_BASE="${VARS_BASE:-/var/lib/libvirt/qemu/nvram/win11_VARS.fd.base}"
 VARS_LIVE="${VARS_LIVE:-/var/lib/libvirt/qemu/nvram/win11_VARS.fd}"
 BASE_CACHE="${BASE_CACHE:-/var/lib/dfir-quarantine-vault/win11_base_cache.json.gz}"
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 URI="${LIBVIRT_URI:-qemu:///system}"
 DOMAIN="${DOMAIN:-win11}"
+INETSIM_DOMAIN="${INETSIM_DOMAIN:-inetsim-vm}"
 VIRSH_BIN="${VIRSH_BIN:-sudo virsh}"
 read -r -a VIRSH_CMD <<< "$VIRSH_BIN"
 
@@ -36,23 +39,28 @@ usage() {
     cat <<EOF
 Usage:
   $0 prepare-overlay [base_qcow2] [overlay_qcow2]
+  $0 prepare-inetsim-overlay [inetsim_base_qcow2] [inetsim_overlay_qcow2]
   $0 verify-image [qcow2_path]
   $0 build-bake-iso <path_to_Sysmon64.exe> [out_iso_path]
   $0 seal-and-cache [base_qcow2] [base_cache_path]
 EOF
 }
 
-prepare_overlay() {
-    local base="${1:-$BASE_IMG}"
-    local overlay="${2:-$OVERLAY_IMG}"
+_create_domain_overlay() {
+    local dom="$1"
+    local base="$2"
+    local overlay="$3"
+    local copy_nvram="${4:-0}"
+    local tag="${5:-OVERLAY_READY}"
+
     local dom_state
-    dom_state="$("${VIRSH_CMD[@]}" -c "$URI" domstate "$DOMAIN" 2>/dev/null | tr '[:upper:]' '[:lower:]' | xargs || true)"
+    dom_state="$("${VIRSH_CMD[@]}" -c "$URI" domstate "$dom" 2>/dev/null | tr '[:upper:]' '[:lower:]' | xargs || true)"
     if [[ "$dom_state" == "running" || "$dom_state" == "paused" || "$dom_state" == "in shutdown" ]]; then
-        echo "ERROR: Domain $DOMAIN is active ($dom_state). Shut down $DOMAIN before modifying overlays." >&2
+        echo "ERROR: Domain $dom is active ($dom_state). Shut down $dom before modifying overlays." >&2
         exit 1
     fi
-    if [[ -z "$dom_state" ]] && pgrep -af "qemu-system.*(-name[[:space:]].*${DOMAIN}|${overlay})" >/dev/null 2>&1; then
-        echo "ERROR: Active QEMU process detected for $DOMAIN/$overlay. Shut down running VM before modifying overlays." >&2
+    if [[ -z "$dom_state" ]] && pgrep -af "qemu-system.*(-name[[:space:]].*${dom}|${overlay})" >/dev/null 2>&1; then
+        echo "ERROR: Active QEMU process detected for $dom/$overlay. Shut down running VM before modifying overlays." >&2
         exit 1
     fi
     if [[ ! -f "$base" ]]; then
@@ -75,13 +83,23 @@ prepare_overlay() {
     sudo chown 956:956 "$overlay"
     sudo chmod 0664 "$overlay"
 
-    if [[ -f "$VARS_BASE" ]]; then
+    if [[ "$copy_nvram" == "1" && -f "$VARS_BASE" ]]; then
         sudo cp -f "$VARS_BASE" "$VARS_LIVE"
         sudo chown 956:956 "$VARS_LIVE"
         sudo chmod 0600 "$VARS_LIVE"
+        ls -la "$overlay" "$VARS_LIVE"
+    else
+        ls -la "$overlay"
     fi
-    ls -la "$overlay" "$VARS_LIVE"
-    echo "OVERLAY_READY: $overlay (relative backing: $rel_base -> $base)"
+    echo "${tag}: $overlay (relative backing: $rel_base -> $base)"
+}
+
+prepare_overlay() {
+    _create_domain_overlay "$DOMAIN" "${1:-$BASE_IMG}" "${2:-$OVERLAY_IMG}" 1 "OVERLAY_READY"
+}
+
+prepare_inetsim_overlay() {
+    _create_domain_overlay "$INETSIM_DOMAIN" "${1:-$INETSIM_BASE_IMG}" "${2:-$INETSIM_OVERLAY_IMG}" 0 "INETSIM_OVERLAY_READY"
 }
 
 verify_image_readonly() {
@@ -193,6 +211,9 @@ cmd="${1:-}"
 case "$cmd" in
     prepare-overlay)
         prepare_overlay "${2:-$BASE_IMG}" "${3:-$OVERLAY_IMG}"
+        ;;
+    prepare-inetsim-overlay)
+        prepare_inetsim_overlay "${2:-$INETSIM_BASE_IMG}" "${3:-$INETSIM_OVERLAY_IMG}"
         ;;
     verify-image)
         verify_image_readonly "${2:-$BASE_IMG}"
